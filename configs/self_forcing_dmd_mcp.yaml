@@ -1,0 +1,111 @@
+generator_ckpt: checkpoints/ode_init.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: prompts/vidprom_filtered_extended.txt
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 50
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+memory_gap_blocks: 0
+memory_gap_sample_mode: fixed
+memory_gap_min_blocks: 0
+memory_gap_max_blocks: 0
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+
+# ---------------------------------------------------------------------------
+# Next-Forcing Multi-Chunk Prediction (Step 1: auxiliary supervision only).
+#
+# memory_gap_blocks is 0 here on purpose: this config isolates the effect of MCP
+# supervision on the backbone. Combining MCP with the memory gap is the next step,
+# not this one.
+#
+# Targets come from the frozen Wan2.1-T2V-14B teacher's x0 estimate, which DMD
+# already computes -- there is no video data in this pipeline (data-free DMD).
+# ---------------------------------------------------------------------------
+# MCP spans both stages, exactly as the backbone does:
+#
+#   ODE init (configs/ode_init.yaml, 3000 steps)  -- INITIALIZATION. Real x0, so the
+#     paper's Eq. 4/5/12 hold verbatim and t_k is genuinely drawn under s_mcp=10. The
+#     heads learn the task itself: predict the chunk k ahead.
+#   DMD / Self Forcing (here, 600 steps)          -- TRAINING. The autoregressive
+#     rollout with KV caching, i.e. the distribution the head actually meets at
+#     inference. It adapts the ODE-initialized heads across that gap -- the same gap
+#     the backbone crosses between the same two stages -- and specialises depth-1 to
+#     sigma=1 one-shot drafting, which is its literal job at inference: draft chunk
+#     t+1 from pure noise while the backbone denoises chunk t.
+#
+# Requires ode_init.yaml to have run with MATCHING mcp_num_layers / mcp_tap_layers,
+# so the mcp.* weights in ode_init.pt load into the same shapes. The trainer's
+# checkpoint load tolerates mcp.* keys being absent (ODE ran without MCP) or extra
+# (ODE trained more depths than DMD keeps).
+mcp_num_modules: 3          # train all three depths, as the paper does. Only depth-1
+                            # survives to inference (Sec. 4.6: depth-2/3 "are not used
+                            # in this mode, as their predictions are superseded by the
+                            # main model in the next step") -- depths 2 and 3 exist to
+                            # push gradient into the backbone.
+mcp_num_layers: 3           # Table 2 says 1 block SUPERVISES better (86.5 vs 85.8),
+                            # but the goal here is an accelerated model: depth-1 has to
+                            # actually GENERATE chunk t+1 at inference, which needs the
+                            # capacity. That is why the paper keeps 3 too.
+mcp_tap_layers: [3, 11, 19, 29]
+mcp_depth_weights: [0.5, 0.2, 0.1]
+mcp_loss_weight: 1.0        # scale on the (already depth-weighted) MCP loss. Untuned
+                            # against dmd_loss -- watch both in the logs.
+mcp_lr: 1.0e-04             # blocks are seeded from the backbone's last layers
+                            # (add_mcp_modules -> init_from_backbone), so 600 steps is
+                            # adapting a warm head; proj/time_*/fusion/head are still
+                            # fresh and lr 2e-6 would leave them untrained.
+mcp_target_min_timestep: 0.0  # raise (e.g. 250) to drop low-noise steps where the
+                              # teacher's x0 collapses onto the student's own output.
+                              # The gate is broadcast (model/dmd.py) so it cannot
+                              # desync ranks.
+
+# KNOWN WEAKNESS, unavoidable in a data-free rollout: the MCP target here is the
+# teacher's x0 estimate of the GENERATED video at a random DMD timestep, not a real
+# x0. At low timesteps the teacher barely moves its input, so the target drifts
+# toward the student's own output. Note this is less damaging than it sounds for the
+# DRAFT role -- a speculative head's job IS to predict what the main model would
+# produce -- but it does weaken the supervision role. mcp_target_min_timestep gates
+# the worst of it.

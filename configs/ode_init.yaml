@@ -1,0 +1,169 @@
+# ---------------------------------------------------------------------------
+# ODE initialization (Stage 0) -- reconstructs checkpoints/ode_init.pt.
+#
+# This config does not ship with Self-Forcing. README.md:83 only says the ODE
+# checkpoint is "provided" and that instructions are "identical to the process
+# described in the CausVid repo", and the paper gives exactly one sentence about
+# it (Experiments / Implementation):
+#
+#   "Following CausVid's initialization protocol, we first finetune the base
+#    model with causal attention masking on 16k ODE solution pairs sampled from
+#    the base model."
+#
+# Everything below is reconstructed from three sources:
+#   * scripts/generate_ode_pairs.py  (the shipped generator; hyperparams are
+#     hardcoded there rather than documented)
+#   * model/ode_regression.py        (the objective)
+#   * CausVid's own configs/wan_causal_ode.yaml + README (what Self-Forcing defers to)
+#
+# WHAT THIS STAGE DOES
+#   Regress a CAUSAL 4-step student onto the endpoint of the BIDIRECTIONAL
+#   base model's 48-step CFG ODE trajectory. It does two jobs at once:
+#   bidirectional -> causal, and 48 steps -> 4 steps. CausVid Sec 4.3 motivates
+#   it as "Directly training the causal student model using the DMD loss can be
+#   unstable due to architectural differences", and its Table 4 ablation is
+#   dramatic: frame quality 64.4 with ODE init vs 48.1 without. This stage is
+#   required, not an optional warmup.
+#
+# PIPELINE
+#   1) torchrun --nproc_per_node=8 scripts/generate_ode_pairs.py \
+#        --output_folder ode_pairs/ \
+#        --caption_path prompts/vidprom_filtered_extended.txt \
+#        --guidance_scale 6.0 --timestep_shift 5.0
+#      (paper: 16k pairs -> take the first 16k prompts. CausVid used 1.5K.)
+#   2) python scripts/create_lmdb_iterative.py --data_path ode_pairs/ --lmdb_path ode_lmdb/
+#   3) torchrun --nnodes=8 --nproc_per_node=8 train.py --config_path configs/ode_init.yaml \
+#        --logdir logs/ode_init --disable-wandb --no_visualize
+#
+# !! THE ONE THING THAT WILL SILENTLY RUIN THIS RUN !!
+#   timestep_shift here MUST equal --timestep_shift used to generate the pairs.
+#   model/ode_regression.py gathers ode_latent[:, i] and labels it with
+#   denoising_step_list[i], so the saved trajectory points and the warped
+#   denoising_step_list must be the SAME noise levels. Nothing checks this; a mismatch
+#   just tells the model the wrong timestep for every sample. Verified arithmetic at
+#   shift 5.0, 48 steps, subsample [0, 12, 24, 36, -1]:
+#
+#     trajectory input points   -> t = [1000.0, 937.5, 833.3, 625.0]
+#     warp([1000,750,500,250])  -> t = [1000.0, 937.5, 833.3, 625.0]   MATCH
+#
+#   The [0,12,24,36] indices hold for ANY shift -- they select s = [1.0, 0.75, 0.5, 0.25]
+#   in the pre-shift linspace, exactly where warp maps [1000,750,500,250]. Only the
+#   two shifts have to agree.
+#
+# WHY 5.0 AND NOT UPSTREAM'S 8.0
+#   Upstream's generate_ode_pairs.py built the teacher bare (WanDiffusionWrapper()),
+#   inheriting the wrapper's 8.0 default (utils/wan_wrapper.py:140) -- Wan's default rather
+#   than a deliberate Self-Forcing choice. Every Self-Forcing config
+#   (self_forcing_dmd/sid/memory_gap/mcp) trains at 5.0, so 5.0 keeps ODE init and DMD on
+#   one schedule; the student then sees the same timesteps in both stages.
+#
+#   HONEST UNCERTAINTY: upstream never shipped an ODE config, so which shift produced the
+#   released checkpoints/ode_init.pt is unknown. If it was 8.0, then their pipeline had a
+#   cross-stage shift (ODE init at 8.0, DMD at 5.0) and it evidently worked fine -- the
+#   base model is pretrained on all timesteps and DMD retrains anyway. So 8.0 is not
+#   "wrong"; 5.0 is simply the more consistent choice when the point of the checkpoint is
+#   to feed Self-Forcing. To reproduce upstream's schedule, pass --timestep_shift 8.0 to
+#   generate_ode_pairs.py and set 8.0 in both places below.
+#
+#   The switch is low-risk: both are 48-step solves of the same ODE from the same noise,
+#   and shift only redistributes where the steps land (it governs step PLACEMENT, which
+#   matters for few-step sampling, not for a 48-step solve). shift 5.0 actually spends
+#   more steps at low noise than 8.0 does (8 vs 5 below t=500), which if anything sharpens
+#   the trajectory endpoint that this stage regresses onto.
+#
+#   (For reference, CausVid is self-consistent a different way: 50 steps + [0,36,44,-1]
+#   lands exactly on its literal denoising_step_list [1000,757,522,0], which is why it
+#   sets warp_denoising_step: false.)
+# ---------------------------------------------------------------------------
+
+trainer: ode
+distribution_loss: ode
+
+# Student: causal Wan2.1-T2V-1.3B, initialized from the pretrained bidirectional
+# base weights. No generator_ckpt -- WanDiffusionWrapper loads
+# wan_models/Wan2.1-T2V-1.3B itself, which IS the "base model" the paper samples
+# the ODE pairs from. Set generator_ckpt only to resume.
+model_kwargs:
+  timestep_shift: 5.0    # must match generate_ode_pairs.py --timestep_shift -- see above
+timestep_shift: 5.0      # and must match the DMD stage, which trains at 5.0
+
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true   # 0 must NOT be in denoising_step_list when this is true
+num_frame_per_block: 3
+num_training_frames: 21
+independent_first_frame: false
+i2v: false
+
+# Data: LMDB of ODE trajectories from step 2 above.
+data_path: ode_lmdb
+batch_size: 2               # CausVid's value; ODE training forbids grad accumulation
+                            # (trainer/ode.py:98), so scale via GPU count only.
+# total_batch_size intentionally omitted: trainer/ode.py asserts it equals
+# batch_size * world_size, and omitting it skips the assert. Set it to
+# batch_size * world_size if you want the check.
+
+# Optimizer. CausVid's paper says lr 5e-6 for 3000 iterations with AdamW, but its
+# shipped configs/wan_causal_ode.yaml says 2.0e-06 -- the config wins here since it
+# is what actually produced their released checkpoint. Note beta1 is 0.9, unlike
+# the DMD stage which uses 0.0.
+lr: 2.0e-06
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+
+mixed_precision: true
+gradient_checkpointing: true
+sharding_strategy: hybrid_full
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+seed: 0
+log_iters: 200
+load_raw_video: false
+
+# CausVid trains this stage for 3000 iterations (their released checkpoint is
+# literally named wan_causal_ode_checkpoint_model_003000) on 8 nodes x 8 GPUs.
+# There is no max_iters key -- the loop runs until you stop it, so stop at ~3000.
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+
+# --- Next-Forcing Multi-Chunk Prediction: INITIALIZED here -------------------
+# The MCP heads get the same two-stage treatment as the backbone, for the same
+# reason. CausVid Sec. 4.3 motivates ODE init as "Directly training the causal
+# student model using the DMD loss can be unstable due to architectural
+# differences" -- that argument does not stop applying because the module is small.
+# add_mcp_modules only copies WEIGHTS from the backbone's last layers; the heads have
+# still never been trained on the MCP task, and proj/fusion/head start from scratch.
+# Asking them to learn the task, supply supervision, and adapt to the rollout all
+# inside DMD's 600 steps is exactly the instability ODE init exists to prevent.
+#
+# This stage is also the only place the paper's scheme is implementable verbatim,
+# because ode_latent[:, -1] is a REAL x0:
+#   * Eq. 4   x_0^[k][i] = x_0[min(i+k, F)]         -- a genuine shifted target
+#   * Eq. 5   x_t^[k] = (1-t_k)x_0^[k] + t_k*eps_k  -- needs x0; DMD only has sigma=1
+#   * Eq. 12  target eps_k - x_0^[k]                -- a true target, not the DMD
+#             stage's teacher-x0-at-a-random-timestep estimate
+#
+# Yes, these features are teacher-forced and the DMD rollout's are not. That gap is
+# real -- and it is the same gap the BACKBONE crosses between these two stages. DMD
+# is what closes it, for the heads exactly as for the backbone.
+mcp_num_modules: 3          # next^1 / next^2 / next^3, as the paper
+mcp_num_layers: 3           # 3 transformer blocks per depth; must match the DMD config
+mcp_tap_layers: [3, 11, 19, 29]     # = the paper's {4,12,20,30}, 0-indexed
+mcp_depth_weights: [0.5, 0.2, 0.1]  # Eq. 13 / Sec. 5.1
+mcp_timestep_shift: 10.0    # s_mcp = 10 > s_main = 5. Sec. 4.2: at higher noise the
+                            # MCP input carries less about its own target, so the
+                            # modules must lean on the main model's representations --
+                            # "This pushes the MCP loss gradients into the main model
+                            # rather than letting the lightweight MCP modules absorb
+                            # the supervision themselves." Ablation: 83.2 at s_mcp=5.
+mcp_loss_weight: 1.0
+mcp_lr: 1.0e-04             # blocks are seeded from the backbone's last layers, but
+                            # proj/time_*/fusion/head start fresh and lr 2e-6 is far
+                            # too low for them

@@ -43,18 +43,19 @@ class ODERegression(BaseModel):
         # Step 2: Initialize all hyperparameters
         self.timestep_shift = getattr(args, "timestep_shift", 1.0)
 
-        # Next-Forcing Multi-Chunk Prediction. This stage is the faithful home for it:
-        # ode_latent[:, -1] is the teacher's true ODE solution, so Eq. 4/5/12 can be
-        # implemented exactly (real x0, per-depth timesteps under s_mcp), the forward
-        # is a single teacher-forced pass over the whole sequence like the paper's,
-        # and CausVid runs it for 3000 iterations vs DMD's 600.
+        # Next-Forcing Multi-Chunk Prediction, initialized here the way the BACKBONE
+        # is initialized here: the heads are trained by the same coupled one-step
+        # regression onto the trajectory endpoint (see _prepare_mcp_inputs), shifted
+        # k chunks ahead, and then handed to the DMD stage for distribution matching
+        # (model/dmd.py compute_mcp_loss) -- mirrored distillation in both stages,
+        # NOT the paper's supervised flow-matching recipe, which assumes ground-truth
+        # video this pipeline does not have.
         #
         # Built here rather than in _initialize_models because ODERegression's ctor
         # reconstructs self.generator itself (and may load generator_ckpt into it), so
         # the heads must be attached AFTER that, and before the trainer FSDP-wraps it.
         self.mcp_num_modules = int(getattr(args, "mcp_num_modules", 0))
         self.mcp_loss_weight = float(getattr(args, "mcp_loss_weight", 1.0))
-        self.mcp_timestep_shift = float(getattr(args, "mcp_timestep_shift", 10.0))
         self.mcp_depth_weights = [
             float(w) for w in getattr(args, "mcp_depth_weights", (0.5, 0.2, 0.1))
         ]
@@ -158,7 +159,7 @@ class ODERegression(BaseModel):
         noisy_input, timestep = self._prepare_generator_input(
             ode_latent=ode_latent)
 
-        mcp_inputs = self._prepare_mcp_inputs(target_latent) if self.mcp_num_modules > 0 else None
+        mcp_inputs = self._prepare_mcp_inputs(ode_latent) if self.mcp_num_modules > 0 else None
 
         if mcp_inputs is not None:
             _, pred_image_or_video, mcp_flow_preds = self.generator(
@@ -228,40 +229,56 @@ class ODERegression(BaseModel):
         return mask
 
     @torch.no_grad()
-    def _prepare_mcp_inputs(self, target_latent: torch.Tensor) -> dict:
-        """Build the paper's MCP targets (Eq. 4, 5) from the clean ODE endpoint.
+    def _prepare_mcp_inputs(self, ode_latent: torch.Tensor) -> dict:
+        """Build MCP inputs exactly the way the backbone's own distillation does.
 
-        This is why the ODE stage is the right home for MCP: `target_latent` is the
-        teacher's true ODE solution, so x_0^[k] is real and x_t^[k] can be formed
-        exactly as Eq. 5 prescribes -- with its own timestep per depth, drawn under
-        s_mcp. The DMD rollout has no x0 and is stuck at sigma=1.
+        The backbone's recipe in this stage (`_prepare_generator_input` +
+        `generator_loss`): pick one of the student's noise levels, take the
+        TRAJECTORY'S OWN latent at that level, and one-step regress the x0
+        prediction onto the trajectory endpoint. The heads get the identical
+        treatment, shifted k chunks ahead:
+
+            input   shift_chunks(ode_latent[:, i], k)   trajectory point at level i
+            label   denoising_step_list[i]
+            target  shift_chunks(ode_latent[:, -1], k)  trajectory endpoint
+
+        Because (input, target) lie on the same teacher ODE trajectory they are
+        deterministically coupled, so the ONE-STEP regression is well-posed -- the
+        same argument as ODE init for the backbone (CausVid Sec 4.3). This replaces
+        the paper's Eq. 5 (fresh noise at a random t_k under s_mcp): that recipe
+        trains a multi-step denoiser, the right object in the paper's from-scratch
+        supervised setting, but an UNCOUPLED one-step regression collapses to the
+        conditional mean -- the wrong object for a one-shot drafting head. At level
+        0 the input is the chunk's pure starting noise (sigma = 1), the literal
+        inference-time drafting condition.
         """
-        batch_size, num_frames = target_latent.shape[:2]
-        device, dtype = target_latent.device, target_latent.dtype
+        batch_size, _, num_frames = ode_latent.shape[:3]
+        device, dtype = ode_latent.device, ode_latent.dtype
+        target_latent = ode_latent[:, -1]
 
-        noisy, clean, noises, timesteps, masks, starts = [], [], [], [], [], []
+        num_levels = len(self.denoising_step_list)
+        scheduler_timesteps = self.scheduler.timesteps.to(device)
+        scheduler_sigmas = self.scheduler.sigmas.to(device)
+
+        noisy, clean, timesteps, sigmas, masks, starts = [], [], [], [], [], []
         for k in range(1, self.mcp_num_modules + 1):
-            x0_k = self._shift_chunks(target_latent, k)
+            # One level per sample per depth, mirroring the backbone's random pick.
+            index = torch.randint(0, num_levels, (batch_size,), device=device)
+            x_t = ode_latent[torch.arange(batch_size, device=device), index]
+            t_k = self.denoising_step_list.to(device)[index].float()
 
-            # Eq. 5 with the s_mcp-shifted schedule. Sampled directly from the closed
-            # form rather than via scheduler.set_timesteps, so the MCP schedule stays
-            # independent of the main model's and no argmin snapping is involved.
-            # sigma = s*u / (1 + (s-1)*u) is the same map as utils/scheduler.py:129.
-            u = torch.rand([batch_size, 1, 1, 1, 1], device=device)
-            s = self.mcp_timestep_shift
-            sigma = s * u / (1 + (s - 1) * u)
+            # sigma_t via the same argmin lookup as _convert_flow_pred_to_x0, so the
+            # x0 conversion in the loss is consistent with the wrapper's.
+            timestep_id = torch.argmin(
+                (scheduler_timesteps.unsqueeze(0) - t_k.unsqueeze(1)).abs(), dim=1)
+            sigma_k = scheduler_sigmas[timestep_id].reshape(batch_size, 1, 1, 1, 1)
 
-            eps = torch.randn_like(x0_k)
-            x_t = (1 - sigma) * x0_k + sigma * eps
-
-            # The wrapper needs a [B, F] timestep; sigma is constant across the
-            # sequence for this depth ("its own timestep" is per shifted target).
-            t_k = (sigma.reshape(batch_size, 1) * 1000.0).expand(batch_size, num_frames)
-
-            noisy.append(x_t.to(dtype))
-            clean.append(x0_k)
-            noises.append(eps)
-            timesteps.append(t_k)
+            noisy.append(self._shift_chunks(x_t, k).to(dtype))
+            clean.append(self._shift_chunks(target_latent, k))
+            # The wrapper needs a [B, F] timestep; the level is constant across the
+            # sequence for this depth.
+            timesteps.append(t_k.unsqueeze(1).expand(batch_size, num_frames))
+            sigmas.append(sigma_k)
             masks.append(self._mcp_valid_frame_mask(num_frames, k, device))
             # Eq. 6: RoPE(i + k). A uniform offset of k chunks over the sequence gives
             # every token at frame j the position j + k*M, which is exactly i+k in
@@ -270,25 +287,34 @@ class ODERegression(BaseModel):
             starts.append(k * self.num_frame_per_block)
 
         return {
-            "noisy": noisy, "clean": clean, "noise": noises,
-            "timesteps": timesteps, "masks": masks, "start_frames": starts,
+            "noisy": noisy, "clean": clean, "timesteps": timesteps,
+            "sigmas": sigmas, "masks": masks, "start_frames": starts,
         }
 
     def _compute_mcp_loss(self, mcp_inputs, mcp_flow_preds):
-        """Eq. 12/13: L_k = ||v^[k] - (eps_k - x_0^[k])||^2, combined as sum_k w_k * L_k."""
+        """One-step x0 regression onto the ODE endpoint, mirroring the backbone.
+
+        The head predicts flow; convert with x0 = x_t - sigma_t * v (the identity in
+        WanDiffusionWrapper._convert_flow_pred_to_x0) and take the MSE in x0 space,
+        the space the backbone's own ODE loss above lives in. Combined across depths
+        as sum_k w_k * L_k (Eq. 13, w = [0.5, 0.2, 0.1]).
+        """
         if not mcp_flow_preds:
             return None, {}
 
         mcp_loss = 0.0
         log = {}
         for k, flow_pred in enumerate(mcp_flow_preds):
-            target = mcp_inputs["noise"][k] - mcp_inputs["clean"][k]
             frame_mask = mcp_inputs["masks"][k]
             if not bool(frame_mask.any()):
                 continue
+            x0_pred = (
+                mcp_inputs["noisy"][k].float()
+                - mcp_inputs["sigmas"][k].float() * flow_pred.float()
+            )
             l_k = F.mse_loss(
-                flow_pred[:, frame_mask].float(),
-                target[:, frame_mask].float().detach(),
+                x0_pred[:, frame_mask],
+                mcp_inputs["clean"][k][:, frame_mask].float().detach(),
                 reduction="mean"
             )
             mcp_loss = mcp_loss + self.mcp_depth_weights[k] * l_k

@@ -140,30 +140,28 @@ wandb_project: WANDB_PROJECT
 # differences" -- that argument does not stop applying because the module is small.
 # add_mcp_modules only copies WEIGHTS from the backbone's last layers; the heads have
 # still never been trained on the MCP task, and proj/fusion/head start from scratch.
-# Asking them to learn the task, supply supervision, and adapt to the rollout all
-# inside DMD's 600 steps is exactly the instability ODE init exists to prevent.
+# Asking them to learn the task and adapt to the rollout all inside DMD's 600 steps
+# is exactly the instability ODE init exists to prevent.
 #
-# This stage is also the only place the paper's scheme is implementable verbatim,
-# because ode_latent[:, -1] is a REAL x0:
-#   * Eq. 4   x_0^[k][i] = x_0[min(i+k, F)]         -- a genuine shifted target
-#   * Eq. 5   x_t^[k] = (1-t_k)x_0^[k] + t_k*eps_k  -- needs x0; DMD only has sigma=1
-#   * Eq. 12  target eps_k - x_0^[k]                -- a true target, not the DMD
-#             stage's teacher-x0-at-a-random-timestep estimate
+# The heads are trained EXACTLY like the backbone is in this stage -- mirrored
+# distillation (model/ode_regression.py _prepare_mcp_inputs), NOT the paper's Eq. 5:
+# the input is the trajectory's own latent at one of the 4 student timesteps,
+# shifted k chunks ahead, and the loss is a one-step x0 regression onto the shifted
+# trajectory endpoint. The (input, target) pair lies on one teacher ODE trajectory,
+# so the one-step map is deterministic and the regression cannot collapse to a
+# conditional mean. The paper's fresh-noise-at-random-t_k flow matching trains a
+# multi-step denoiser -- the right object in its from-scratch supervised setting,
+# the wrong one for a one-shot drafting head. At level 0 the input is the chunk's
+# pure starting noise (sigma=1): the literal inference-time drafting condition.
 #
 # Yes, these features are teacher-forced and the DMD rollout's are not. That gap is
 # real -- and it is the same gap the BACKBONE crosses between these two stages. DMD
-# is what closes it, for the heads exactly as for the backbone.
+# closes it for the heads exactly as for the backbone: their DMD-stage loss is
+# distribution matching on draft-substituted videos (see self_forcing_dmd_mcp.yaml).
 mcp_num_modules: 3          # next^1 / next^2 / next^3, as the paper
 mcp_num_layers: 3           # 3 transformer blocks per depth; must match the DMD config
 mcp_tap_layers: [3, 11, 19, 29]     # = the paper's {4,12,20,30}, 0-indexed
 mcp_depth_weights: [0.5, 0.2, 0.1]  # Eq. 13 / Sec. 5.1
-mcp_timestep_shift: 10.0    # s_mcp = 10 > s_main = 5. Sec. 4.2: at higher noise the
-                            # MCP input carries less about its own target, so the
-                            # modules must lean on the main model's representations --
-                            # "This pushes the MCP loss gradients into the main model
-                            # rather than letting the lightweight MCP modules absorb
-                            # the supervision themselves." Ablation: 83.2 at s_mcp=5.
 mcp_loss_weight: 1.0
-mcp_lr: 1.0e-04             # blocks are seeded from the backbone's last layers, but
-                            # proj/time_*/fusion/head start fresh and lr 2e-6 is far
-                            # too low for them
+# No mcp_lr: MCP params train at the shared `lr` above, same as the backbone.
+# (trainer/ode.py never implemented a separate MCP group anyway.)

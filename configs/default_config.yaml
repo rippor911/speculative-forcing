@@ -23,8 +23,6 @@ mcp_depth_weights: [0.5, 0.2, 0.1]
 mcp_loss_weight: 1.0
 mcp_lr: null
 mcp_init_seed: 0
-mcp_timestep_shift: 10.0        # s_mcp; ODE stage only (DMD is stuck at sigma=1)
-mcp_target_min_timestep: 0.0    # DMD stage only
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench

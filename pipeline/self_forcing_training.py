@@ -335,13 +335,14 @@ class SelfForcingTrainingPipeline:
                                 current_start=current_start_frame * self.frame_seq_length
                             )
                     else:
-                        # `is_grad_enabled` is what separates the generator rollout from
-                        # the critic's: DMD.critic_loss runs this whole rollout inside
-                        # torch.no_grad() (model/dmd.py:330) and runs 5x more often than
-                        # the generator (dfake_gen_update_ratio: 5). Without this gate the
-                        # MCP heads would be executed 5x per generator step purely to
-                        # produce records nothing ever reads.
-                        run_mcp = self.mcp_num_modules > 0 and torch.is_grad_enabled()
+                        # Drafts are consumed by BOTH rollout owners: the generator's
+                        # MCP loss substitutes them into the video for distribution
+                        # matching, and the critic trains its fake score on the same
+                        # hybrid construction (model/dmd.py compute_mcp_loss /
+                        # critic_loss). Under the critic's no_grad rollout the head
+                        # forward is cheap and its records come out detached, which
+                        # is exactly what the critic diet needs.
+                        run_mcp = self.mcp_num_modules > 0
                         mcp_noises, mcp_starts = self._mcp_future_chunks(
                             block_index, block_starts, all_num_frames, noise, num_input_frames
                         ) if run_mcp else (None, None)
@@ -519,13 +520,14 @@ class SelfForcingTrainingPipeline:
                                 cache_start=block_cache_start
                             )
                     else:
-                        # `is_grad_enabled` is what separates the generator rollout from
-                        # the critic's: DMD.critic_loss runs this whole rollout inside
-                        # torch.no_grad() (model/dmd.py:330) and runs 5x more often than
-                        # the generator (dfake_gen_update_ratio: 5). Without this gate the
-                        # MCP heads would be executed 5x per generator step purely to
-                        # produce records nothing ever reads.
-                        run_mcp = self.mcp_num_modules > 0 and torch.is_grad_enabled()
+                        # Drafts are consumed by BOTH rollout owners: the generator's
+                        # MCP loss substitutes them into the video for distribution
+                        # matching, and the critic trains its fake score on the same
+                        # hybrid construction (model/dmd.py compute_mcp_loss /
+                        # critic_loss). Under the critic's no_grad rollout the head
+                        # forward is cheap and its records come out detached, which
+                        # is exactly what the critic diet needs.
+                        run_mcp = self.mcp_num_modules > 0
                         mcp_noises, mcp_starts = self._mcp_future_chunks(
                             block_index, block_starts, all_num_frames, noise, num_input_frames
                         ) if run_mcp else (None, None)

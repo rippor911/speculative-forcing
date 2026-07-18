@@ -323,10 +323,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         (flow_pred, pred_x0) contract is unchanged, which matters because ~20 call
         sites unpack exactly two values.
 
-        `mcp_timesteps` supplies the per-depth [B, F] timestep of each noisy target.
-        Omit it to default to sigma=1 (pure noise) -- the only option during the DMD
-        rollout, where no x0 exists to build x_t from. The ODE-init stage HAS the true
-        x0 and passes real timesteps sampled with s_mcp, i.e. the paper's Eq. 5.
+        `mcp_timesteps` supplies the per-depth [B, F] timestep of each noisy input.
+        Omit it to default to sigma=1 (pure noise), the DMD rollout's drafting
+        condition. The ODE-init stage passes the student's denoising timesteps with
+        the trajectory's own latents (model/ode_regression.py), mirroring the
+        backbone's distillation.
 
         Works on both the kv_cache (rollout) and the plain teacher-forced paths.
         """
@@ -451,10 +452,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         forward pass: MCP params are only gathered while the root is running, so
         invoking `generator.mcp(...)` from outside would read sharded garbage.
 
-        With `mcp_timesteps=None` the targets are assumed to be at sigma=1 (pure
-        noise), which is all the DMD rollout can offer: no x0 exists there to build
-        x_t = (1-t)x0 + t*eps from. The ODE-init stage has the true x0 and passes real
-        timesteps sampled with s_mcp (Eq. 5), which is the paper's actual scheme.
+        With `mcp_timesteps=None` the inputs are assumed to be at sigma=1 (pure
+        noise), the DMD rollout's drafting condition: the future chunk is untouched
+        noise at that moment. The ODE-init stage passes the trajectory's own latents
+        at the student's denoising timesteps instead (model/ode_regression.py),
+        mirroring the backbone's distillation.
         """
         # Derive the batch size from the first chunk that is actually present rather
         # than mcp_future_noises[0]: the caller guarantees at least one non-None entry,

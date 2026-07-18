@@ -55,26 +55,30 @@ model_kwargs:
   timestep_shift: 5.0
 
 # ---------------------------------------------------------------------------
-# Next-Forcing Multi-Chunk Prediction (Step 1: auxiliary supervision only).
+# Next-Forcing Multi-Chunk Prediction (Step 1: MCP alongside DMD, no memory gap).
 #
 # memory_gap_blocks is 0 here on purpose: this config isolates the effect of MCP
-# supervision on the backbone. Combining MCP with the memory gap is the next step,
-# not this one.
-#
-# Targets come from the frozen Wan2.1-T2V-14B teacher's x0 estimate, which DMD
-# already computes -- there is no video data in this pipeline (data-free DMD).
+# on the backbone. Combining MCP with the memory gap is the next step, not this one.
 # ---------------------------------------------------------------------------
-# MCP spans both stages, exactly as the backbone does:
+# The heads get the SAME two-stage treatment as the backbone -- mirrored
+# distillation, NOT the paper's supervised flow-matching recipe (which assumes
+# ground-truth video that this data-free pipeline does not have):
 #
-#   ODE init (configs/ode_init.yaml, 3000 steps)  -- INITIALIZATION. Real x0, so the
-#     paper's Eq. 4/5/12 hold verbatim and t_k is genuinely drawn under s_mcp=10. The
-#     heads learn the task itself: predict the chunk k ahead.
-#   DMD / Self Forcing (here, 600 steps)          -- TRAINING. The autoregressive
-#     rollout with KV caching, i.e. the distribution the head actually meets at
-#     inference. It adapts the ODE-initialized heads across that gap -- the same gap
-#     the backbone crosses between the same two stages -- and specialises depth-1 to
-#     sigma=1 one-shot drafting, which is its literal job at inference: draft chunk
-#     t+1 from pure noise while the backbone denoises chunk t.
+#   ODE init (configs/ode_init.yaml, 3000 steps)  -- INITIALIZATION. Coupled
+#     one-step x0 regression onto the shifted trajectory endpoint at the 4 student
+#     timesteps, exactly like the backbone's own ODE loss (see ode_init.yaml).
+#   DMD / Self Forcing (here, 600 steps)          -- DISTRIBUTION MATCHING. The
+#     drafts the heads produce inside the rollout (one-shot from sigma=1 noise,
+#     the literal inference condition) are substituted into the generated video at
+#     alternating chunks -- the joint layout of 2x accelerated inference -- and
+#     scored by the same frozen-teacher/critic KL gradient as the backbone's own
+#     DMD loss. ONE HYBRID VIDEO AND ONE KL PASS PER DEPTH (model/dmd.py
+#     compute_mcp_loss), so all three heads receive direct distribution-matching
+#     gradient every step, mirroring the ODE stage exactly. The critic trains on
+#     the same per-depth hybrids so its score of draft chunks stays
+#     on-distribution (model/dmd.py critic_loss). This is what turned the backbone
+#     from its blurry ODE init into a sharp one-shot generator; a head trained by
+#     regression alone would stay at the conditional mean.
 #
 # Requires ode_init.yaml to have run with MATCHING mcp_num_layers / mcp_tap_layers,
 # so the mcp.* weights in ode_init.pt load into the same shapes. The trainer's
@@ -90,22 +94,20 @@ mcp_num_layers: 3           # Table 2 says 1 block SUPERVISES better (86.5 vs 85
                             # actually GENERATE chunk t+1 at inference, which needs the
                             # capacity. That is why the paper keeps 3 too.
 mcp_tap_layers: [3, 11, 19, 29]
-mcp_depth_weights: [0.5, 0.2, 0.1]
-mcp_loss_weight: 1.0        # scale on the (already depth-weighted) MCP loss. Untuned
-                            # against dmd_loss -- watch both in the logs.
-mcp_lr: 1.0e-04             # blocks are seeded from the backbone's last layers
-                            # (add_mcp_modules -> init_from_backbone), so 600 steps is
-                            # adapting a warm head; proj/time_*/fusion/head are still
-                            # fresh and lr 2e-6 would leave them untrained.
-mcp_target_min_timestep: 0.0  # raise (e.g. 250) to drop low-noise steps where the
-                              # teacher's x0 collapses onto the student's own output.
-                              # The gate is broadcast (model/dmd.py) so it cannot
-                              # desync ranks.
+mcp_depth_weights: [0.5, 0.2, 0.1]  # Eq. 13 / Sec. 5.1: weights on the per-depth
+                            # KL losses, exactly as they weight the ODE stage's
+                            # per-depth regressions.
+mcp_loss_weight: 1.0        # scale on the (already depth-weighted) MCP loss
+                            # relative to dmd_loss -- watch both in the logs.
+# No mcp_lr: MCP params train at the shared `lr` above. The heads arrive here
+# already trained by the ODE stage (3000 steps), so DMD is adaptation, not
+# from-scratch learning. Setting mcp_lr re-enables the separate param group in
+# trainer/distillation.py if the heads ever need to move faster than 2e-6.
 
-# KNOWN WEAKNESS, unavoidable in a data-free rollout: the MCP target here is the
-# teacher's x0 estimate of the GENERATED video at a random DMD timestep, not a real
-# x0. At low timesteps the teacher barely moves its input, so the target drifts
-# toward the student's own output. Note this is less damaging than it sounds for the
-# DRAFT role -- a speculative head's job IS to predict what the main model would
-# produce -- but it does weaken the supervision role. mcp_target_min_timestep gates
-# the worst of it.
+# COST NOTE (deliberate quality-over-compute choice): the MCP loss adds one full
+# KL-grad pass PER DEPTH per generator step (each = 2 frozen-teacher CFG forwards
+# + 1 critic forward, all no_grad), and the critic diet adds one fake_score pass
+# per depth per critic step. With 3 depths the score-model cost of a generator
+# step is ~4x the plain-DMD one; drop depths (mcp_num_modules) to trade quality
+# for speed. The old teacher-x0 regression was far cheaper but regressed onto a
+# (circular) point target -- it could not sharpen the drafts' distribution.

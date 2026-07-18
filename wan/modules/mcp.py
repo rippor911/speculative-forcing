@@ -294,13 +294,18 @@ class MCPStack(nn.Module):
     Two deliberate departures from the paper, both forced by this repo being a
     data-free DMD distillation rather than teacher-forced supervised training:
 
-    1. Targets come from the frozen Wan2.1-T2V-14B teacher's x0 estimate rather
-       than ground-truth video (there is no video data; see `model/dmd.py`).
-    2. The future chunk is always fed at sigma=1 (pure noise, timestep=1000),
-       because during the Self-Forcing rollout the future chunk genuinely IS
-       untouched noise at the moment the current chunk is denoised. This also
-       matches the MCP-accelerated inference mode, where the head must draft the
-       next chunk from noise while the backbone denoises the current one.
+    1. The heads are TRAINED the way the backbone is trained here, not the way the
+       paper trains its heads: coupled one-step x0 regression onto the ODE
+       trajectory endpoint in the ODE-init stage (model/ode_regression.py), then
+       distribution matching on draft-substituted videos in the DMD stage
+       (model/dmd.py compute_mcp_loss). There is no ground-truth video to run the
+       paper's Eq. 5/12 against, and a one-shot drafting head trained by uncoupled
+       regression collapses to the conditional mean of the future.
+    2. During the DMD rollout the future chunk is always fed at sigma=1 (pure
+       noise, timestep=1000), because at that moment it genuinely IS untouched
+       noise. This also matches the MCP-accelerated inference mode, where the head
+       must draft the next chunk from noise while the backbone denoises the
+       current one; the head's one-step draft there is x0 = eps - v.
     """
 
     def __init__(

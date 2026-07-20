@@ -46,10 +46,11 @@ class ODERegression(BaseModel):
         # Next-Forcing Multi-Chunk Prediction, initialized here the way the BACKBONE
         # is initialized here: the heads are trained by the same coupled one-step
         # regression onto the trajectory endpoint (see _prepare_mcp_inputs), shifted
-        # k chunks ahead, and then handed to the DMD stage for distribution matching
-        # (model/dmd.py compute_mcp_loss) -- mirrored distillation in both stages,
-        # NOT the paper's supervised flow-matching recipe, which assumes ground-truth
-        # video this pipeline does not have.
+        # k chunks ahead. The DMD stage then trains them through the accelerated
+        # rollout itself (pipeline/self_forcing_training.py, the drafts are part of
+        # the emitted video) -- mirrored distillation in both stages, NOT the
+        # paper's supervised flow-matching recipe, which assumes ground-truth video
+        # this pipeline does not have.
         #
         # Built here rather than in _initialize_models because ODERegression's ctor
         # reconstructs self.generator itself (and may load generator_ckpt into it), so

@@ -709,6 +709,26 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         return block_mask
 
+    def _embed_mcp_chunks(self, mcp_patch_inputs):
+        """Embed MCP target chunks with the shared patch_embedding, INSIDE this
+        module's forward. This is the only place the shared conv's parameters are
+        guaranteed gathered and mixed-precision cast under FSDP -- borrowing the
+        module after this forward returns would read fp32 / re-sharded storage.
+        Sharing (Sec. 4.3) is preserved: gradient flows into patch_embedding
+        through the returned tokens.
+        """
+        embeds, grids = [], []
+        for chunk in mcp_patch_inputs:
+            if chunk is None:
+                embeds.append(None)
+                grids.append(None)
+                continue
+            e = [self.patch_embedding(v.unsqueeze(0)) for v in chunk]
+            grids.append(torch.stack(
+                [torch.tensor(v.shape[2:], dtype=torch.long) for v in e]))
+            embeds.append(torch.cat([v.flatten(2).transpose(1, 2) for v in e]))
+        return embeds, grids
+
     def _forward_inference(
         self,
         x,
@@ -721,7 +741,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         crossattn_cache: dict = None,
         current_start: int = 0,
         cache_start: int = 0,
-        return_features: tuple = None
+        return_features: tuple = None,
+        mcp_patch_inputs: list = None
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -773,6 +794,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
         x = torch.cat(x)
+
+        mcp_embeds = mcp_grid_sizes = None
+        if mcp_patch_inputs is not None:
+            mcp_embeds, mcp_grid_sizes = self._embed_mcp_chunks(mcp_patch_inputs)
         """
         torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
@@ -865,7 +890,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             # MCP heads carry no cross-attention (see wan/modules/mcp.py), so the
             # tapped hidden states are all an auxiliary head needs: they already
             # encode the text conditioning that every block cross-attended to.
-            aux = {"features": features}
+            aux = {
+                "features": features,
+                "mcp_embeds": mcp_embeds,
+                "mcp_grid_sizes": mcp_grid_sizes,
+            }
             return torch.stack(x), aux
         return torch.stack(x)
 
@@ -879,6 +908,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        mcp_patch_inputs: list = None,
         return_features: tuple = None,
     ):
         r"""
@@ -958,6 +988,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
                       dim=1) for u in x
         ])
+
+        mcp_embeds = mcp_grid_sizes = None
+        if mcp_patch_inputs is not None:
+            mcp_embeds, mcp_grid_sizes = self._embed_mcp_chunks(mcp_patch_inputs)
 
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
@@ -1049,7 +1083,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     f"return_features={return_features} requested but only {len(features)} of "
                     f"{len(self.blocks)} blocks matched; indices must be < num_layers."
                 )
-            return torch.stack(x), {"features": features}
+            return torch.stack(x), {
+                "features": features,
+                "mcp_embeds": mcp_embeds,
+                "mcp_grid_sizes": mcp_grid_sizes,
+            }
         return torch.stack(x)
 
     def forward(

@@ -67,18 +67,20 @@ model_kwargs:
 #   ODE init (configs/ode_init.yaml, 3000 steps)  -- INITIALIZATION. Coupled
 #     one-step x0 regression onto the shifted trajectory endpoint at the 4 student
 #     timesteps, exactly like the backbone's own ODE loss (see ode_init.yaml).
-#   DMD / Self Forcing (here, 600 steps)          -- DISTRIBUTION MATCHING. The
-#     drafts the heads produce inside the rollout (one-shot from sigma=1 noise,
-#     the literal inference condition) are substituted into the generated video at
-#     alternating chunks -- the joint layout of 2x accelerated inference -- and
-#     scored by the same frozen-teacher/critic KL gradient as the backbone's own
-#     DMD loss. ONE HYBRID VIDEO AND ONE KL PASS PER DEPTH (model/dmd.py
-#     compute_mcp_loss), so all three heads receive direct distribution-matching
-#     gradient every step, mirroring the ODE stage exactly. The critic trains on
-#     the same per-depth hybrids so its score of draft chunks stays
-#     on-distribution (model/dmd.py critic_loss). This is what turned the backbone
-#     from its blurry ODE init into a sharp one-shot generator; a head trained by
-#     regression alone would stay at the conditional mean.
+#   DMD / Self Forcing (here, 600 steps)          -- DISTRIBUTION MATCHING, via the
+#     ROLLOUT ITSELF. Self Forcing's principle is "simulate the inference process
+#     during training"; the inference being trained for is the MCP-accelerated one,
+#     so the rollout simulates exactly that loop (pipeline/self_forcing_training.py
+#     _inference_with_trajectory_mcp_accelerated): the backbone denoises only the
+#     ANCHOR chunks (0, 4, ...), the heads one-shot draft the following chunks from
+#     their pure noise (draft = eps - v, the literal inference condition), and
+#     anchor + drafts are committed to the KV cache so the next anchor conditions
+#     on the drafts, exactly as deployed. The emitted video IS the deployed
+#     distribution -- with all 3 heads: (main, d1, d2, d3, main, d1, d2) -- so the
+#     completely unmodified DMD and critic losses train backbone and heads jointly.
+#     There is NO auxiliary MCP loss in this stage. Distribution matching is what
+#     turned the backbone from its blurry ODE init into a sharp one-shot generator;
+#     a head trained by regression alone would stay at the conditional mean.
 #
 # Requires ode_init.yaml to have run with MATCHING mcp_num_layers / mcp_tap_layers,
 # so the mcp.* weights in ode_init.pt load into the same shapes. The trainer's
@@ -94,20 +96,25 @@ mcp_num_layers: 3           # Table 2 says 1 block SUPERVISES better (86.5 vs 85
                             # actually GENERATE chunk t+1 at inference, which needs the
                             # capacity. That is why the paper keeps 3 too.
 mcp_tap_layers: [3, 11, 19, 29]
-mcp_depth_weights: [0.5, 0.2, 0.1]  # Eq. 13 / Sec. 5.1: weights on the per-depth
-                            # KL losses, exactly as they weight the ODE stage's
-                            # per-depth regressions.
-mcp_loss_weight: 1.0        # scale on the (already depth-weighted) MCP loss
-                            # relative to dmd_loss -- watch both in the logs.
+mcp_depth_weights: [0.5, 0.2, 0.1]  # Eq. 13 / Sec. 5.1 -- ODE stage only. The DMD
+                            # stage has no per-depth weighting: every drafted chunk
+                            # in the accelerated rollout is a FINAL output chunk.
+mcp_accel_depths: 3         # how many heads deploy at inference; the rollout
+                            # advances this + 1 chunks per autoregressive step.
+                            # 3 -> 4x (main, d1, d2, d3, ...); 1 -> the paper's 2x
+                            # mode. Depths beyond this still run in the chain
+                            # (they are its trunk) but emit nothing and get no
+                            # DMD-stage gradient.
+mcp_loss_weight: 1.0        # ODE stage only (no separate MCP loss exists here).
 # No mcp_lr: MCP params train at the shared `lr` above. The heads arrive here
 # already trained by the ODE stage (3000 steps), so DMD is adaptation, not
 # from-scratch learning. Setting mcp_lr re-enables the separate param group in
 # trainer/distillation.py if the heads ever need to move faster than 2e-6.
 
-# COST NOTE (deliberate quality-over-compute choice): the MCP loss adds one full
-# KL-grad pass PER DEPTH per generator step (each = 2 frozen-teacher CFG forwards
-# + 1 critic forward, all no_grad), and the critic diet adds one fake_score pass
-# per depth per critic step. With 3 depths the score-model cost of a generator
-# step is ~4x the plain-DMD one; drop depths (mcp_num_modules) to trade quality
-# for speed. The old teacher-x0 regression was far cheaper but regressed onto a
-# (circular) point target -- it could not sharpen the drafts' distribution.
+# COST NOTE: this config trains CHEAPER than plain self_forcing_dmd. The rollout
+# denoises only the anchor chunks (2 of 7 blocks with 4x), so backbone forwards
+# per rollout drop from 35 to 15 (+ two lightweight head chains); the DMD/critic
+# losses are unchanged in count and price. The earlier designs (teacher-x0
+# regression, then draft-substituted hybrid KL passes) are gone: the rollout
+# itself now carries the drafts, which is both the cheapest and the most
+# deployment-faithful formulation.

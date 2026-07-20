@@ -197,15 +197,6 @@ class SelfForcingModel(BaseModel):
         else:
             gradient_mask = None
 
-        # MCP records the frames it predicted in ROLLOUT coordinates, but every
-        # teacher-derived target is indexed against the returned (possibly sliced)
-        # last-21 window. Stash the offset so DMD can realign them. With the shipped
-        # configs num_training_frames == 21, so no slicing happens and this is 0.
-        self._mcp_frame_offset = pred_image_or_video.shape[1] - pred_image_or_video_last_21.shape[1]
-        # When slicing did occur the first chunk was replaced by a re-encoded image
-        # latent rather than a rollout output, so it is not a valid MCP target.
-        self._mcp_first_valid_frame = 0 if self._mcp_frame_offset == 0 else self.num_frame_per_block
-
         pred_image_or_video_last_21 = pred_image_or_video_last_21.to(self.dtype)
         return pred_image_or_video_last_21, gradient_mask, denoised_timestep_from, denoised_timestep_to
 
@@ -253,5 +244,6 @@ class SelfForcingModel(BaseModel):
             memory_gap_sample_mode=getattr(self.args, "memory_gap_sample_mode", "fixed"),
             memory_gap_min_blocks=getattr(self.args, "memory_gap_min_blocks", 0),
             memory_gap_max_blocks=getattr(self.args, "memory_gap_max_blocks", 0),
-            mcp_num_modules=getattr(self.args, "mcp_num_modules", 0)
+            mcp_num_modules=getattr(self.args, "mcp_num_modules", 0),
+            mcp_accel_depths=getattr(self.args, "mcp_accel_depths", None) or 0
         )

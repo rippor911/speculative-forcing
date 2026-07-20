@@ -352,6 +352,23 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         logits = None
         mcp_flow_preds = None
+        # [B, F, C, H, W] -> [B, C, F, H, W], matching the main path's permute. The
+        # chunks are embedded by the backbone INSIDE its own forward (see
+        # CausalWanModel._embed_mcp_chunks for why), so they must be handed to the
+        # model call rather than to the heads directly.
+        mcp_patch_inputs = None
+        mcp_kwargs = {}
+        if run_mcp:
+            mcp_patch_inputs = [
+                None if c is None else c.permute(0, 2, 1, 3, 4)
+                for c in mcp_future_noises
+            ]
+            # Only the causal backbone knows these kwargs; the bidirectional score
+            # models (WanModel) must not receive them at all.
+            mcp_kwargs = {
+                "return_features": self.mcp_tap_layers,
+                "mcp_patch_inputs": mcp_patch_inputs,
+            }
         # X0 prediction
         if kv_cache is not None:
             out = self.model(
@@ -362,7 +379,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
                 cache_start=cache_start,
-                return_features=self.mcp_tap_layers if run_mcp else None
+                **mcp_kwargs
             )
             if run_mcp:
                 flow_pred, aux = out
@@ -384,7 +401,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
-                    return_features=self.mcp_tap_layers if run_mcp else None
+                    **mcp_kwargs
                 )
                 if run_mcp:
                     flow_pred, aux = out
@@ -415,7 +432,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
                         seq_len=self.seq_len,
-                        return_features=self.mcp_tap_layers if run_mcp else None
+                        **mcp_kwargs
                     )
                     if run_mcp:
                         # The ODE-init path: one teacher-forced forward over the whole
@@ -463,15 +480,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         # but not that it is the first one.
         first = next(c for c in mcp_future_noises if c is not None)
         batch_size = first.shape[0]
-        noises, starts, timesteps = [], [], []
+        starts, timesteps = [], []
         for k, (chunk, start) in enumerate(zip(mcp_future_noises, mcp_future_start_frames)):
             if chunk is None:
-                noises.append(None)
                 starts.append(None)
                 timesteps.append(None)
                 continue
-            # [B, F, C, H, W] -> [B, C, F, H, W], matching the main path's permute.
-            noises.append(chunk.permute(0, 2, 1, 3, 4))
             starts.append(start)
             if mcp_timesteps is not None:
                 timesteps.append(mcp_timesteps[k])
@@ -485,13 +499,17 @@ class WanDiffusionWrapper(torch.nn.Module):
                     )
                 )
 
+        # The chunk tokens were embedded by the backbone inside its own forward
+        # (CausalWanModel._embed_mcp_chunks) so the shared patch_embedding was in
+        # FSDP-gathered, mixed-precision-cast state. freqs is a buffer (never
+        # flat-sharded), so reading it here is safe.
         flow_preds = self.mcp(
             features=aux["features"],
-            future_noises=noises,
+            future_embeds=aux["mcp_embeds"],
+            future_grid_sizes=aux["mcp_grid_sizes"],
             future_start_frames=starts,
             timesteps=timesteps,
             freqs=self.model.freqs,
-            patch_embedding=self.model.patch_embedding
         )
         # [B, C, F, H, W] -> [B, F, C, H, W]
         return [p.permute(0, 2, 1, 3, 4) for p in flow_preds]

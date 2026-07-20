@@ -242,26 +242,28 @@ class MCPModule(nn.Module):
         # (bias is already zeroed by the generic Linear loop above.)
         nn.init.zeros_(self.head.head.weight)
 
-    def forward(self, upstream, future_noise, start_frame, timestep, freqs, patch_embedding):
+    def forward(self, upstream, future_tokens, grid_sizes, start_frame, timestep, freqs):
         """
         Args:
             upstream (Tensor): [B, L, dim] fused backbone feature (module 1) or the
                 previous module's transformer output (modules 2..K).
-            future_noise (Tensor): [B, C_in, F, H, W] noisy latent of the target chunk.
+            future_tokens (Tensor): [B, L, dim] the target chunk's noisy latent,
+                ALREADY embedded by the backbone's shared patch_embedding -- inside
+                the backbone's own forward (causal_model.py), because that is the
+                only place where the shared conv's parameters are guaranteed
+                gathered and mixed-precision cast under FSDP. The sharing itself
+                (Sec. 4.3) is unchanged: gradient still flows into the backbone's
+                patch_embedding through these tokens.
+            grid_sizes (Tensor): [B, 3] patchified (F, H, W) of the target chunk,
+                for RoPE and unpatchify.
             start_frame (int): absolute frame index of the target chunk (for RoPE).
-            timestep (Tensor): [B, F] diffusion timestep of `future_noise`.
-            patch_embedding (nn.Module): the BACKBONE's patch embedding, shared per
-                Sec. 4.3. Passed in rather than owned, so the parameter stays
-                registered once (on the backbone) and MCP's gradient flows into it.
+            timestep (Tensor): [B, F] diffusion timestep of the target chunk.
         Returns:
             flow_pred (Tensor): [B, C_out, F, H, W] flow-matching prediction.
             hidden (Tensor): [B, L, dim] this module's transformer output, to be
                 chained into the next module.
         """
-        # Embed the noisy future chunk -> [B, L, dim]
-        x = [patch_embedding(u.unsqueeze(0)) for u in future_noise]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = torch.cat([u.flatten(2).transpose(1, 2) for u in x])
+        x = future_tokens
 
         if x.shape[1] != upstream.shape[1]:
             raise ValueError(
@@ -297,10 +299,12 @@ class MCPStack(nn.Module):
     1. The heads are TRAINED the way the backbone is trained here, not the way the
        paper trains its heads: coupled one-step x0 regression onto the ODE
        trajectory endpoint in the ODE-init stage (model/ode_regression.py), then
-       distribution matching on draft-substituted videos in the DMD stage
-       (model/dmd.py compute_mcp_loss). There is no ground-truth video to run the
-       paper's Eq. 5/12 against, and a one-shot drafting head trained by uncoupled
-       regression collapses to the conditional mean of the future.
+       distribution matching in the DMD stage, where the rollout itself simulates
+       the MCP-accelerated inference and the drafts are part of the emitted video
+       scored by the unmodified DMD loss (pipeline/self_forcing_training.py
+       _inference_with_trajectory_mcp_accelerated). There is no ground-truth video
+       to run the paper's Eq. 5/12 against, and a one-shot drafting head trained
+       by uncoupled regression collapses to the conditional mean of the future.
     2. During the DMD rollout the future chunk is always fed at sigma=1 (pure
        noise, timestep=1000), because at that moment it genuinely IS untouched
        noise. This also matches the MCP-accelerated inference mode, where the head
@@ -392,19 +396,21 @@ class MCPStack(nn.Module):
                 dst.modulation.copy_(src.modulation)
         return self
 
-    def forward(self, features, future_noises, future_start_frames, timesteps, freqs, patch_embedding):
+    def forward(self, features, future_embeds, future_grid_sizes, future_start_frames, timesteps, freqs):
         """
         Args:
             features (List[Tensor]): tapped backbone hidden states, each [B, L, dim],
                 in the order of `self.tap_layers`.
-            future_noises (List[Optional[Tensor]]): per-module noisy target chunk,
-                [B, C_in, F, H, W]. A `None` entry (target chunk runs past the end of
-                the video) stops the chain there -- the paper instead pads by
-                replicating the last chunk and excludes it from the loss (Eq. 4, 12),
-                which comes to the same thing.
+            future_embeds (List[Optional[Tensor]]): per-module target chunk tokens
+                [B, L, dim], embedded by the backbone's shared patch_embedding
+                inside the backbone's own forward (causal_model.py). A `None` entry
+                (target chunk runs past the end of the video) stops the chain there
+                -- the paper instead pads by replicating the last chunk and excludes
+                it from the loss (Eq. 4, 12), which comes to the same thing.
+            future_grid_sizes (List[Optional[Tensor]]): per-module patchified
+                (F, H, W) of the target chunk.
             future_start_frames (List[int]): absolute start frame of each target chunk.
             timesteps (List[Tensor]): per-module [B, F] timestep of the noisy chunk.
-            patch_embedding (nn.Module): the backbone's shared patch embedding.
         Returns:
             List[Tensor]: flow predictions [B, C_out, F, H, W], one per module that ran.
         """
@@ -418,15 +424,15 @@ class MCPStack(nn.Module):
 
         flow_preds = []
         for k, module in enumerate(self.mcp_modules):
-            if k >= len(future_noises) or future_noises[k] is None:
+            if k >= len(future_embeds) or future_embeds[k] is None:
                 break
             flow_pred, upstream = module(
                 upstream=upstream,
-                future_noise=future_noises[k],
+                future_tokens=future_embeds[k],
+                grid_sizes=future_grid_sizes[k],
                 start_frame=future_start_frames[k],
                 timestep=timesteps[k],
                 freqs=freqs,
-                patch_embedding=patch_embedding,
             )
             flow_preds.append(flow_pred)
         return flow_preds

@@ -5,3 +5,19 @@ wan_models
 checkpoints
 
 reference
+
+logs/
+wandb/
+outputs/
+ode_pairs/
+ode_lmdb/
+.env
+*.pt
+*.pth
+*.ckpt
+*.tar
+*.tar.gz
+*.log
+
+videos/*
+!videos/.gitkeep

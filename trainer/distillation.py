@@ -8,6 +8,11 @@ from utils.misc import (
     set_seed,
     merge_dict_list
 )
+from utils.checkpoint import (
+    extract_generator_state_dict,
+    load_state_dict_allowing_mcp_mismatch,
+    normalize_state_key,
+)
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD
@@ -103,11 +108,7 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
-        rename_param = (
-            lambda name: name.replace("_fsdp_wrapped_module.", "")
-            .replace("_checkpoint_wrapped_module.", "")
-            .replace("_orig_mod.", "")
-        )
+        rename_param = normalize_state_key
 
         trainable_generator_params = [
             (rename_param(n), p) for n, p in self.model.generator.named_parameters()
@@ -189,11 +190,8 @@ class Trainer:
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
         if getattr(config, "generator_ckpt", False):
             print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
+            checkpoint = torch.load(config.generator_ckpt, map_location="cpu")
+            state_dict = extract_generator_state_dict(checkpoint)
             if getattr(config, "mcp_num_modules", 0) > 0:
                 # The mcp.* keys may legitimately not line up with the checkpoint:
                 #   missing    -> ode_init.pt was produced with mcp_num_modules: 0,
@@ -203,18 +201,9 @@ class Trainer:
                 # re-assert strictness over the rest rather than swallowing it all.
                 # (A shape mismatch still raises inside load_state_dict, which is what
                 # we want if mcp_num_layers/mcp_tap_layers differ between stages.)
-                missing, unexpected = self.model.generator.load_state_dict(
-                    state_dict, strict=False
+                missing, unexpected = load_state_dict_allowing_mcp_mismatch(
+                    self.model.generator, state_dict
                 )
-                is_mcp = lambda k: rename_param(k).startswith("mcp.")
-                non_mcp_missing = [k for k in missing if not is_mcp(k)]
-                non_mcp_unexpected = [k for k in unexpected if not is_mcp(k)]
-                if non_mcp_missing or non_mcp_unexpected:
-                    raise RuntimeError(
-                        f"Unexpected generator checkpoint mismatch.\n"
-                        f"  missing (non-MCP): {non_mcp_missing}\n"
-                        f"  unexpected (non-MCP): {non_mcp_unexpected}"
-                    )
                 if missing:
                     print(f"MCP: {len(missing)} params not in checkpoint, "
                           f"kept from init_from_backbone")

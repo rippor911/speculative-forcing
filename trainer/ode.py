@@ -100,17 +100,10 @@ class Trainer:
 
         self.step = 0
 
-        ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")[
-                'generator']
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
-
-        ##############################################################################################################
+        # ODERegression loads generator_ckpt once, after attaching MCP and before
+        # this trainer FSDP-wraps the generator. Do not load it a second time here:
+        # strict loading would reject backbone-only checkpoints when MCP is enabled,
+        # and would also make MCP checkpoint resume depend on constructor order.
 
         self.max_grad_norm = 10.0
         self.previous_time = None
@@ -181,6 +174,19 @@ class Trainer:
             stats["loss_at_time_" + key_t] = sum(loss_breakdown[key_t]) / \
                 len(loss_breakdown[key_t])
 
+        # ODERegression already returns the depth-wise MCP losses, but the old
+        # trainer discarded them. Average the scalar diagnostics across ranks so a
+        # run can distinguish depth-1 learning from deeper-head collapse.
+        mcp_stats = {}
+        for key, value in log_dict.items():
+            if not key.startswith("mcp_") or not torch.is_tensor(value) or value.numel() != 1:
+                continue
+            reduced = value.detach().float().clone()
+            if self.world_size > 1:
+                dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+                reduced /= self.world_size
+            mcp_stats[key] = reduced.item()
+
         self.generator_optimizer.zero_grad()
         generator_loss.backward()
         generator_grad_norm = self.model.generator.clip_grad_norm_(
@@ -213,7 +219,8 @@ class Trainer:
             wandb_loss_dict = {
                 "generator_loss": generator_loss.item(),
                 "generator_grad_norm": generator_grad_norm.item(),
-                **stats
+                **stats,
+                **mcp_stats,
             }
             wandb.log(wandb_loss_dict, step=self.step)
 

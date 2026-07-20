@@ -3,6 +3,10 @@ from typing import Tuple
 import torch
 
 from model.base import BaseModel
+from utils.checkpoint import (
+    extract_generator_state_dict,
+    load_state_dict_allowing_mcp_mismatch,
+)
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
@@ -21,13 +25,6 @@ class ODERegression(BaseModel):
 
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
-        if getattr(args, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
-                'generator']
-            self.generator.load_state_dict(
-                state_dict, strict=True
-            )
 
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
 
@@ -75,6 +72,27 @@ class ODERegression(BaseModel):
                     num_modules=self.mcp_num_modules,
                     num_layers=int(getattr(args, "mcp_num_layers", 3)),
                     tap_layers=tuple(getattr(args, "mcp_tap_layers", (3, 11, 19, 29)))
+                )
+
+        # Attach MCP before loading. A backbone-only ODE checkpoint then leaves the
+        # freshly initialized mcp.* parameters missing, while an MCP checkpoint can
+        # restore them exactly. Loading here (before FSDP wrapping) also avoids the
+        # trainer's previous second, strict load of the same file.
+        if getattr(args, "generator_ckpt", False):
+            print(f"Loading pretrained generator from {args.generator_ckpt}")
+            checkpoint = torch.load(args.generator_ckpt, map_location="cpu")
+            state_dict = extract_generator_state_dict(checkpoint)
+            missing, unexpected = load_state_dict_allowing_mcp_mismatch(
+                self.generator, state_dict
+            )
+            if missing:
+                print(
+                    f"MCP: {len(missing)} params not in checkpoint; "
+                    "kept from init_from_backbone"
+                )
+            if unexpected:
+                print(
+                    f"MCP: {len(unexpected)} checkpoint params unused by this config"
                 )
 
     def _initialize_models(self, args, device):

@@ -1,7 +1,7 @@
-# MCP Adapter Runtime State
+# MCP Adapter
 
-This document freezes Milestone 2A: the generic runtime state transaction layer
-used by future Self-Forcing MCP adapters.
+This document records Milestone 2A runtime state primitives and Milestone 2B1
+thin wrapper boundaries for future Self-Forcing MCP adapters.
 
 ## Scope
 
@@ -16,12 +16,23 @@ It can snapshot and restore:
 
 It does not call Wan, MCP, ImageReward, checkpoints, VAE, or any real generator.
 
+Milestone 2B1 adds only protocol wrappers in
+`speculative/adapters/self_forcing_mcp.py`:
+
+- `SelfForcingMCPProposalSource`;
+- `SelfForcingMCPFallbackGenerator`;
+- `SelfForcingMCPCommitter`.
+
+These wrappers are a stateless delegation layer. They hold one shared runtime
+object and expose the existing controller protocols without owning generation
+state.
+
 ## Non-Goals
 
 The runtime state layer does not compute Wan touched ranges. It does not know
 which K/V slices a model forward will write, whether attention will append,
 overwrite, or roll local cache content, or which output block is being committed.
-Those decisions belong to the future `SelfForcingMCPRuntime` in Milestone 2B.
+Those decisions belong to the future `SelfForcingMCPRuntime` in Milestone 2B2.
 
 The layer also does not clone a whole real KV cache. Callers must provide exact
 regions that need protection.
@@ -29,6 +40,55 @@ regions that need protection.
 It also does not reason about different tensor views sharing storage. Conflict
 checks use tensor object identity. If two distinct tensor objects alias the same
 storage, the future runtime must avoid conflicting specs itself.
+
+Milestone 2B1 also does not implement the real `SelfForcingMCPRuntime`, does not
+add `inference_speculative.py`, and does not connect Wan, checkpoints,
+ImageReward, VAE, or real fallback scoring. The real runtime state owner is
+Milestone 2B2 work.
+
+## Milestone 2B1 Thin Wrappers
+
+The 2B1 adapter shape is:
+
+```text
+SpeculativeController
+  -> thin wrapper
+  -> shared SelfForcingMCPRuntime
+```
+
+All three wrappers must be constructed with the same runtime object. The
+wrappers do not own KV cache, output buffers, source noise, rollout plans,
+commit bookkeeping, transaction snapshots, or RNG state. Those states belong to
+the future shared `SelfForcingMCPRuntime`.
+
+The 2B1 runtime protocol is intentionally narrow and names runtime operations
+by controller-window role:
+
+- `propose_window(request) -> ProposalBatch`;
+- `generate_target_fallback(candidate) -> FallbackResult`;
+- `begin_window()`;
+- `commit_block(request)`;
+- `complete_window()`;
+- `rollback_window()`.
+
+The public wrapper APIs remain the existing controller protocols:
+
+- `SelfForcingMCPProposalSource.propose(request)`;
+- `SelfForcingMCPFallbackGenerator.generate(rejected)`;
+- `SelfForcingMCPCommitter.begin()`;
+- `SelfForcingMCPCommitter.commit(request)`;
+- `SelfForcingMCPCommitter.complete()`;
+- `SelfForcingMCPCommitter.rollback()`.
+
+The wrapper methods pass through the same request or candidate objects they
+receive and return the same objects produced by the runtime. They do not copy or
+replace latents, source noise, `BlockRef`, or metadata. They also do not create
+transactions, maintain a second active flag, retry failed calls, or alter the
+controller rollback behavior.
+
+The wrappers must not call pipeline private methods directly. Private pipeline
+helpers remain behind the future runtime boundary, where state ownership and
+rollback behavior can be reviewed in one place.
 
 ## Tensor Safety
 
@@ -149,9 +209,9 @@ after restore failure.
 
 ## Future Runtime Example
 
-Milestone 2B should wrap this layer inside `SelfForcingMCPRuntime`; protocol
-wrappers should not call these low-level specs directly unless the runtime owns
-the state selection.
+Milestone 2B2 should wrap this layer inside `SelfForcingMCPRuntime`; protocol
+wrappers should not call these low-level specs directly because the runtime
+owns the state selection.
 
 Example shape:
 

@@ -1,7 +1,8 @@
-"""Adapter-side runtime state utilities for speculative decoding.
+"""Adapter-side utilities for speculative decoding.
 
-Milestone 2A exposes only generic snapshot/restore primitives. Real
-Self-Forcing, Wan, MCP, and evaluator adapters are intentionally out of scope.
+Milestone 2A exposes generic snapshot/restore primitives. Milestone 2B1 adds
+thin Self-Forcing MCP protocol wrappers while the real runtime remains future
+work.
 """
 
 from speculative.adapters.runtime_state import (
@@ -17,6 +18,12 @@ from speculative.adapters.runtime_state import (
     TensorValueSnapshot,
     TorchRNGSnapshot,
 )
+from speculative.adapters.self_forcing_mcp import (
+    SelfForcingMCPCommitter,
+    SelfForcingMCPFallbackGenerator,
+    SelfForcingMCPProposalSource,
+    SelfForcingMCPRuntimeProtocol,
+)
 
 __all__ = [
     "ObjectStateSnapshot",
@@ -30,4 +37,8 @@ __all__ = [
     "TensorRegionSpec",
     "TensorValueSnapshot",
     "TorchRNGSnapshot",
+    "SelfForcingMCPCommitter",
+    "SelfForcingMCPFallbackGenerator",
+    "SelfForcingMCPProposalSource",
+    "SelfForcingMCPRuntimeProtocol",
 ]

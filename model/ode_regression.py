@@ -3,6 +3,10 @@ from typing import Tuple
 import torch
 
 from model.base import BaseModel
+from utils.checkpoint import (
+    extract_generator_state_dict,
+    load_state_dict_allowing_mcp_mismatch,
+)
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
@@ -21,13 +25,6 @@ class ODERegression(BaseModel):
 
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
-        if getattr(args, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
-                'generator']
-            self.generator.load_state_dict(
-                state_dict, strict=True
-            )
 
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
 
@@ -53,8 +50,8 @@ class ODERegression(BaseModel):
         # this pipeline does not have.
         #
         # Built here rather than in _initialize_models because ODERegression's ctor
-        # reconstructs self.generator itself (and may load generator_ckpt into it), so
-        # the heads must be attached AFTER that, and before the trainer FSDP-wraps it.
+        # reconstructs self.generator itself, so the heads must be attached AFTER
+        # that, before loading generator_ckpt and before the trainer FSDP-wraps it.
         self.mcp_num_modules = int(getattr(args, "mcp_num_modules", 0))
         self.mcp_loss_weight = float(getattr(args, "mcp_loss_weight", 1.0))
         self.mcp_depth_weights = [
@@ -75,6 +72,23 @@ class ODERegression(BaseModel):
                     num_modules=self.mcp_num_modules,
                     num_layers=int(getattr(args, "mcp_num_layers", 3)),
                     tap_layers=tuple(getattr(args, "mcp_tap_layers", (3, 11, 19, 29)))
+                )
+
+        if getattr(args, "generator_ckpt", False):
+            print(f"Loading pretrained generator from {args.generator_ckpt}")
+            checkpoint = torch.load(args.generator_ckpt, map_location="cpu")
+            state_dict = extract_generator_state_dict(checkpoint)
+            missing, unexpected = load_state_dict_allowing_mcp_mismatch(
+                self.generator, state_dict
+            )
+            if missing:
+                print(
+                    f"MCP: {len(missing)} params not in checkpoint; "
+                    "kept from initialization"
+                )
+            if unexpected:
+                print(
+                    f"MCP: {len(unexpected)} checkpoint params unused by this config"
                 )
 
     def _initialize_models(self, args, device):
@@ -109,26 +123,28 @@ class ODERegression(BaseModel):
             - timestep: a tensor containing the corresponding timestep [batch_size].
         """
         batch_size, num_denoising_steps, num_frames, num_channels, height, width = ode_latent.shape
+        latent_device = ode_latent.device
+        denoising_steps = self.denoising_step_list.to(latent_device)
 
         # Step 1: Randomly choose a timestep for each frame
         index = self._get_timestep(
             0,
-            len(self.denoising_step_list),
+            len(denoising_steps),
             batch_size,
             num_frames,
             self.num_frame_per_block,
             uniform_timestep=False
-        )
+        ).to(latent_device)
         if self.args.i2v:
-            index[:, 0] = len(self.denoising_step_list) - 1
+            index[:, 0] = len(denoising_steps) - 1
 
         noisy_input = torch.gather(
             ode_latent, dim=1,
             index=index.reshape(batch_size, 1, num_frames, 1, 1, 1).expand(
-                -1, -1, -1, num_channels, height, width).to(self.device)
+                -1, -1, -1, num_channels, height, width)
         ).squeeze(1)
 
-        timestep = self.denoising_step_list[index].to(self.device)
+        timestep = denoising_steps[index].to(self.device)
 
         # if self.extra_noise_step > 0:
         #     random_timestep = torch.randint(0, self.extra_noise_step, [
@@ -257,7 +273,8 @@ class ODERegression(BaseModel):
         device, dtype = ode_latent.device, ode_latent.dtype
         target_latent = ode_latent[:, -1]
 
-        num_levels = len(self.denoising_step_list)
+        denoising_steps = self.denoising_step_list.to(device)
+        num_levels = len(denoising_steps)
         scheduler_timesteps = self.scheduler.timesteps.to(device)
         scheduler_sigmas = self.scheduler.sigmas.to(device)
 
@@ -266,7 +283,7 @@ class ODERegression(BaseModel):
             # One level per sample per depth, mirroring the backbone's random pick.
             index = torch.randint(0, num_levels, (batch_size,), device=device)
             x_t = ode_latent[torch.arange(batch_size, device=device), index]
-            t_k = self.denoising_step_list.to(device)[index].float()
+            t_k = denoising_steps[index].float()
 
             # sigma_t via the same argmin lookup as _convert_flow_pred_to_x0, so the
             # x0 conversion in the loss is consistent with the wrapper's.

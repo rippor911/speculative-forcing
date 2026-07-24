@@ -84,7 +84,8 @@ class SelfForcingTrainingPipeline:
         else:
             indices = torch.empty(num_blocks, dtype=torch.long, device=device)
 
-        dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
+        if dist.is_initialized():
+            dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
         return indices.tolist()
 
     def sample_memory_gap_blocks(self, device):

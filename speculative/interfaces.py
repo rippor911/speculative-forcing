@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, Sequence, TYPE_CHECKING
 
 from speculative.types import (
     CommitRequest,
@@ -11,6 +11,42 @@ from speculative.types import (
     FallbackResult,
     ProposalBatch,
 )
+
+if TYPE_CHECKING:
+    from speculative.evaluation import DecodedCandidate
+    from speculative.scoring import RawScoreResult
+
+
+class CandidateDecoder(Protocol):
+    """Converts a draft candidate into scorer input.
+
+    It must not score, decide, call fallback, call generators, or mutate
+    persistent generation state.
+    """
+
+    def decode(self, candidate: DraftCandidate) -> "DecodedCandidate":
+        ...
+
+
+class CandidateScorer(Protocol):
+    """Produces raw scores from decoder output without aggregation or policy."""
+
+    def score(self, decoded: "DecodedCandidate") -> "RawScoreResult":
+        ...
+
+
+class ScoreAggregator(Protocol):
+    """Aggregates raw finite scores into one block score.
+
+    It must not read thresholds, decide acceptance, or mutate generation state.
+    """
+
+    @property
+    def name(self) -> str:
+        ...
+
+    def aggregate(self, scores: Sequence[float]) -> float:
+        ...
 
 
 class ProposalSource(Protocol):

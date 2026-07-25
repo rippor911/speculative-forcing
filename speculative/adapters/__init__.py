@@ -2,8 +2,8 @@
 
 Milestone 2A exposes generic snapshot/restore primitives. Milestone 2B1 adds
 thin Self-Forcing MCP protocol wrappers. Milestone 2B2A adds runtime
-orchestration with an injectable backend; the real Wan backend remains future
-work.
+orchestration with an injectable backend. Milestone F2A adds the minimal Wan
+MCP backend binding.
 """
 
 from speculative.adapters.runtime_state import (
@@ -34,6 +34,7 @@ from speculative.adapters.self_forcing_mcp import (
     SelfForcingMCPProposalSource,
     SelfForcingMCPRuntimeProtocol,
 )
+from speculative.adapters.self_forcing_wan_backend import SelfForcingWanMCPBackend
 
 __all__ = [
     "ObjectStateSnapshot",
@@ -58,4 +59,5 @@ __all__ = [
     "SelfForcingMCPFallbackGenerator",
     "SelfForcingMCPProposalSource",
     "SelfForcingMCPRuntimeProtocol",
+    "SelfForcingWanMCPBackend",
 ]

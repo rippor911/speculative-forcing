@@ -1,8 +1,8 @@
 # MCP Adapter
 
 This document records Milestone 2A runtime state primitives, Milestone 2B1 thin
-wrapper boundaries, and Milestone 2B2A runtime orchestration for future
-Self-Forcing MCP adapters.
+wrapper boundaries, Milestone 2B2A runtime orchestration, and Milestone 2B2B1
+Wan source-level mutation planning for future Self-Forcing MCP adapters.
 
 ## Scope
 
@@ -42,10 +42,15 @@ It also does not reason about different tensor views sharing storage. Conflict
 checks use tensor object identity. If two distinct tensor objects alias the same
 storage, the future runtime must avoid conflicting specs itself.
 
-Milestone 2B2A implements `SelfForcingMCPRuntime` as an orchestration layer, but
-does not add `inference_speculative.py` and does not connect Wan, checkpoints,
-ImageReward, VAE, or real fallback scoring. The real Wan backend and K/V
-touched-range planner remain Milestone 2B2B work.
+Milestone 2B2A implements `SelfForcingMCPRuntime` as an orchestration layer and
+has passed the server-side 159-test validation baseline. It does not add
+`inference_speculative.py` and does not connect Wan, checkpoints, ImageReward,
+VAE, or real fallback scoring.
+
+Milestone 2B2B1 adds the source-level Wan mutation audit and a pure
+touched-range planner only. It does not call the real Wan generator, does not
+own tensors, does not load checkpoints, and does not claim parity or speedup.
+The executable `SelfForcingWanMCPBackend` remains Milestone 2B2B2 work.
 
 ## Milestone 2B1 Thin Wrappers
 
@@ -212,9 +217,88 @@ these rules without copying the latent object.
 
 Milestone 2B2A still does not implement the real Wan backend, real K/V
 touched-range planning, checkpoint loading, ImageReward, VAE, or scoring.
-Milestone 2B2B should implement the Wan backend and touched-range planner behind
-`RuntimeBackendProtocol`. Milestone 2B2C should add `inference_speculative.py`
-and server GPU parity against frozen `inference_mcp.py`.
+Milestone 2B2B1 adds the pure touched-range planner. Milestone 2B2B2 should
+implement the Wan backend behind `RuntimeBackendProtocol`. Milestone 2B2C should
+add `inference_speculative.py` and server GPU parity against frozen
+`inference_mcp.py`.
+
+## Milestone 2B2B1 Wan Audit And Pure Planner
+
+Milestone 2B2B1 records the exact Wan backend state mutation evidence in
+`docs/speculative/WAN_BACKEND_AUDIT.md` and adds
+`speculative/adapters/wan_state_planner.py`.
+
+The planner is descriptor-only. It accepts immutable layout and operation
+inputs such as `BlockRef`, `RuntimeWindowDescriptor`, `frame_seq_length`,
+`num_frame_per_block`, `local_attn_size`, and cache capacity. It returns
+immutable descriptors for:
+
+- `backend_tensor_ranges`: per-layer self-attention K/V token ranges and live
+  cross-attention K/V prompt-token ranges;
+- `backend_tensor_value_names`: per-layer `global_end_index` and
+  `local_end_index` scalar tensor changes;
+- `backend_python_value_names`: backend Python values such as live
+  cross-attention `is_init`;
+- `output_ranges`: runtime-owned output frame intervals, kept separate from
+  backend tensor descriptors;
+- `operation_ranges`: immutable source-derived touched-range formula evidence;
+- CPU and CUDA RNG capture requirements.
+
+The planner deliberately does not create `TensorRegionSpec`, hold real tensors,
+hold a model, hold a pipeline, hold a runtime, hold mutable cache objects, or
+maintain a frame cursor. The future backend is responsible for binding only the
+planner `backend_*` fields to actual borrowed tensors, scalar index values, and
+small backend Python values. Output regions and committed-block bookkeeping
+continue to be selected and bound by `SelfForcingMCPRuntime`.
+
+`current_start` remains derived only as:
+
+```text
+BlockRef.start_frame * frame_seq_length
+```
+
+No second mutable cursor is introduced.
+
+The prepare path is split into two pure plans. `plan_prepare_cross_attention()`
+describes persistent live prompt-cache state only: live cross-attention `k/v`
+are backend tensor ranges, while live `is_init` is a backend Python value.
+`plan_prepare_scratch(block)` describes temporary block-0 self-attention
+scratch state only: the block must have `index == 0` and `start_frame == 0`,
+the schedule remains `[1000]`, no MCP futures are passed, no output range is
+declared, and no commit RNG capture is requested.
+
+Milestone 2B2B1 supports only the currently verified Self-Forcing MCP
+configuration:
+
+- T2V, batch size 1, no CFG-expanded batch;
+- latent layout `[B, F, C, H, W]` with frame dimension 1;
+- denoising schedule `[1000]`;
+- current causal KV cache list-of-dicts layout;
+- both global and local index tensors present in each layer cache;
+- cross-attention cache list-of-dicts layout with `k`, `v`, and `is_init`;
+- cross-attention prepare uses a staging cache, then in-place `copy_` into
+  stable live `k/v` tensors, then sets live `is_init=True`;
+- model `freqs` has already been idempotently migrated to the model device
+  before runtime construction, so no first-forward migration occurs inside a
+  proposal, fallback, commit, or prepare transaction;
+- `local_attn_size` is `-1` or a positive integer, never `0`;
+- `sink_size > 0` is valid only with positive `local_attn_size`;
+- MCP effective depth 0 through 3;
+- no real Wan forward, checkpoint restore, VAE, ImageReward, or GPU parity.
+
+Unsupported cache layouts, attention modes, batch layouts, or integer-like
+values such as `bool`, `float`, or `str` must fail fast. Oversized
+`BlockRef.num_frames`, explicit proposal windows deeper than either
+`ControlRequest.max_depth` or planner `mcp_depth`, and negative tensor
+dimensions also fail fast. Local rolling-cache formulas are documented and
+unit-tested at descriptor level, but a real backend must not enable an
+unvalidated runtime attention/cache mode silently.
+
+Milestone 2B2B2 should implement `SelfForcingWanMCPBackend` behind
+`RuntimeBackendProtocol`, converting planner descriptors to 2A state specs and
+wrapping the audited private pipeline helpers. Milestone 2B2C should add
+`inference_speculative.py` and run server GPU parity against frozen
+`inference_mcp.py`.
 
 ## Tensor Safety
 

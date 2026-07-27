@@ -99,6 +99,7 @@ class _ActiveOwnerRecord:
     model_id: int
     model_ref: weakref.ReferenceType[object]
     transaction_ref: weakref.ReferenceType["WanVAECacheTransaction"]
+    poisoned: bool = False
 
 
 _ACTIVE_OWNERS: dict[int, _ActiveOwnerRecord] = {}
@@ -120,6 +121,12 @@ def _check_owner_available_locked(model_id: int) -> None:
     if model is None:
         _ACTIVE_OWNERS.pop(model_id, None)
         return
+
+    if record.poisoned:
+        raise RuntimeError(
+            "Wan VAE cache transaction was abandoned/poisoned for this live model; "
+            "rebuild the VAE model before reuse."
+        )
 
     owner = record.transaction_ref()
     if owner is not None:
@@ -224,13 +231,17 @@ class WanVAECacheTransaction:
             if snapshot_model_id != model_id:
                 _check_owner_available_locked(snapshot_model_id)
 
+            model_ref = _model_weakref(snapshot.model)
+            transaction_ref = weakref.ref(self)
+            owner_record = _ActiveOwnerRecord(
+                model_id=snapshot_model_id,
+                model_ref=model_ref,
+                transaction_ref=transaction_ref,
+            )
+
             self._snapshot = snapshot
             self._model_id = snapshot_model_id
-            _ACTIVE_OWNERS[snapshot_model_id] = _ActiveOwnerRecord(
-                model_id=snapshot_model_id,
-                model_ref=_model_weakref(snapshot.model),
-                transaction_ref=weakref.ref(self),
-            )
+            _ACTIVE_OWNERS[snapshot_model_id] = owner_record
             self._state = self.ACTIVE
         return self
 
@@ -247,14 +258,14 @@ class WanVAECacheTransaction:
         try:
             snapshot.restore()
         except WanVAECacheRestoreError:
-            self._state = self.FAILED
+            self._fail_rollback()
             raise
         except Exception as error:
-            self._state = self.FAILED
-            raise WanVAECacheRestoreError([error]) from error
+            restore_error = WanVAECacheRestoreError([error])
+            self._fail_rollback()
+            raise restore_error from error
         else:
             self._state = self.ROLLED_BACK
-        finally:
             self._snapshot = None
             self._release_owner()
 
@@ -284,9 +295,34 @@ class WanVAECacheTransaction:
         with _ACTIVE_OWNER_LOCK:
             record = _ACTIVE_OWNERS.get(model_id)
             owner = record.transaction_ref() if record is not None else None
-            if owner is self:
+            if owner is self and not record.poisoned:
                 _ACTIVE_OWNERS.pop(model_id, None)
         self._model_id = None
+
+    def _mark_owner_poisoned(self) -> None:
+        model_id = self._model_id
+        if model_id is None:
+            return
+        with _ACTIVE_OWNER_LOCK:
+            record = _ACTIVE_OWNERS.get(model_id)
+            owner = record.transaction_ref() if record is not None else None
+            if owner is self:
+                _ACTIVE_OWNERS[model_id] = _ActiveOwnerRecord(
+                    model_id=record.model_id,
+                    model_ref=record.model_ref,
+                    transaction_ref=record.transaction_ref,
+                    poisoned=True,
+                )
+        self._model_id = None
+
+    def _fail_rollback(self) -> None:
+        self._state = self.FAILED
+        self._snapshot = None
+        try:
+            self._mark_owner_poisoned()
+        except Exception:
+            # Leave the original owner record in place; it still prevents reuse.
+            pass
 
 
 def _tensor_finite(tensor: torch.Tensor, attr_name: str, index: int) -> bool:

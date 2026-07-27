@@ -35,8 +35,27 @@ class FakeModel:
         self._enc_feat_map: list[object] = []
 
 
+class NonWeakrefFakeModel:
+    __slots__ = (
+        "_conv_idx",
+        "_feat_map",
+        "_conv_num",
+        "_enc_conv_num",
+        "_enc_conv_idx",
+        "_enc_feat_map",
+    )
+
+    def __init__(self) -> None:
+        self._conv_idx = [0]
+        self._feat_map = [None]
+        self._conv_num = len(self._feat_map)
+        self._enc_conv_num = 0
+        self._enc_conv_idx = [0]
+        self._enc_feat_map: list[object] = []
+
+
 class FakeWrapper:
-    def __init__(self, model: FakeModel) -> None:
+    def __init__(self, model: object) -> None:
         self.model = model
 
 
@@ -49,6 +68,11 @@ class FailingSliceList(list):
 
 def make_wrapper(*, feat_map: list[object] | None = None) -> FakeWrapper:
     return FakeWrapper(FakeModel(feat_map=feat_map))
+
+
+def clear_owner_record(model: FakeModel) -> None:
+    with transaction_module._ACTIVE_OWNER_LOCK:
+        transaction_module._ACTIVE_OWNERS.pop(id(model), None)
 
 
 def mutate_like_cached_decode(model: FakeModel) -> None:
@@ -209,17 +233,23 @@ class WanVAECacheTransactionTest(unittest.TestCase):
 
         self.assertIs(wrapper.model._feat_map[0], tensor)
 
-    def test_body_exception_plus_restore_exception_preserves_both(self) -> None:
+    def test_body_exception_plus_restore_exception_preserves_both_and_poisons_model(self) -> None:
         wrapper = FakeWrapper(FakeModel(conv_idx=FailingSliceList([0]), feat_map=[None]))
+        original_model = wrapper.model
 
-        with self.assertRaises(WanVAECacheRollbackError) as raised:
-            with WanVAECacheTransaction(wrapper):
-                wrapper.model._conv_idx = [9]
-                raise ValueError("body failed")
+        try:
+            with self.assertRaises(WanVAECacheRollbackError) as raised:
+                with WanVAECacheTransaction(wrapper):
+                    wrapper.model._conv_idx = [9]
+                    raise ValueError("body failed")
 
-        self.assertIsInstance(raised.exception.original_exception, ValueError)
-        self.assertIsInstance(raised.exception.restore_exception, WanVAECacheRestoreError)
-        self.assertIn("body failed", str(raised.exception))
+            self.assertIsInstance(raised.exception.original_exception, ValueError)
+            self.assertIsInstance(raised.exception.restore_exception, WanVAECacheRestoreError)
+            self.assertIn("body failed", str(raised.exception))
+            with self.assertRaisesRegex(RuntimeError, "abandoned/poisoned"):
+                WanVAECacheTransaction(FakeWrapper(original_model)).begin()
+        finally:
+            clear_owner_record(original_model)
 
     def test_with_explicit_complete_does_not_rollback_on_normal_exit(self) -> None:
         tensor = torch.tensor([1.0])
@@ -300,6 +330,24 @@ class WanVAECacheTransactionTest(unittest.TestCase):
         tx = WanVAECacheTransaction(wrapper).begin()
         tx.rollback()
 
+    def test_begin_weakref_failure_is_exception_atomic(self) -> None:
+        model = NonWeakrefFakeModel()
+        wrapper = FakeWrapper(model)
+        tx = WanVAECacheTransaction(wrapper)
+
+        with self.assertRaisesRegex(TypeError, "weak references"):
+            tx.begin()
+
+        self.assertEqual(tx.state, WanVAECacheTransaction.NEW)
+        self.assertIsNone(tx._snapshot)
+        self.assertIsNone(tx._model_id)
+        with transaction_module._ACTIVE_OWNER_LOCK:
+            self.assertNotIn(id(model), transaction_module._ACTIVE_OWNERS)
+
+        wrapper.model = FakeModel()
+        tx.begin()
+        tx.rollback()
+
     def test_gc_abandoned_active_transaction_poisons_live_model(self) -> None:
         wrapper = make_wrapper()
         tx = WanVAECacheTransaction(wrapper).begin()
@@ -318,18 +366,68 @@ class WanVAECacheTransactionTest(unittest.TestCase):
             with transaction_module._ACTIVE_OWNER_LOCK:
                 transaction_module._ACTIVE_OWNERS.pop(model_id, None)
 
-    def test_rollback_failure_releases_active_owner(self) -> None:
+    def test_rollback_failure_poisons_live_model(self) -> None:
         wrapper = make_wrapper()
         original_model = wrapper.model
+        tx = WanVAECacheTransaction(wrapper).begin()
+        wrapper.model = FakeModel()
+
+        try:
+            with self.assertRaises(WanVAECacheRestoreError):
+                tx.rollback()
+
+            self.assertEqual(tx.state, WanVAECacheTransaction.FAILED)
+            self.assertIsNone(tx._snapshot)
+            with self.assertRaisesRegex(RuntimeError, "abandoned/poisoned"):
+                WanVAECacheTransaction(FakeWrapper(original_model)).begin()
+        finally:
+            clear_owner_record(original_model)
+
+    def test_rollback_failure_then_transaction_gc_keeps_live_model_poisoned(self) -> None:
+        wrapper = make_wrapper()
+        original_model = wrapper.model
+        tx = WanVAECacheTransaction(wrapper).begin()
+        wrapper.model = FakeModel()
+
+        try:
+            with self.assertRaises(WanVAECacheRestoreError):
+                tx.rollback()
+            tx_ref = weakref.ref(tx)
+            del tx
+            gc.collect()
+
+            self.assertIsNone(tx_ref())
+            with self.assertRaisesRegex(RuntimeError, "abandoned/poisoned"):
+                WanVAECacheTransaction(FakeWrapper(original_model)).begin()
+        finally:
+            clear_owner_record(original_model)
+
+    def test_gc_poisoned_model_stale_record_can_be_cleared_and_other_model_is_unaffected(self) -> None:
+        wrapper = make_wrapper()
+        original_model = wrapper.model
+        model_id = id(original_model)
+        model_ref = weakref.ref(original_model)
         tx = WanVAECacheTransaction(wrapper).begin()
         wrapper.model = FakeModel()
 
         with self.assertRaises(WanVAECacheRestoreError):
             tx.rollback()
 
-        wrapper.model = original_model
-        next_tx = WanVAECacheTransaction(wrapper).begin()
-        next_tx.rollback()
+        del original_model
+        gc.collect()
+
+        try:
+            self.assertIsNone(model_ref())
+            with transaction_module._ACTIVE_OWNER_LOCK:
+                transaction_module._check_owner_available_locked(model_id)
+                self.assertNotIn(model_id, transaction_module._ACTIVE_OWNERS)
+
+            other = make_wrapper()
+            other_tx = WanVAECacheTransaction(other).begin()
+            other_tx.rollback()
+        finally:
+            with transaction_module._ACTIVE_OWNER_LOCK:
+                transaction_module._ACTIVE_OWNERS.pop(model_id, None)
 
     def test_rollback_clears_snapshot_reference(self) -> None:
         wrapper = make_wrapper()
@@ -342,14 +440,18 @@ class WanVAECacheTransactionTest(unittest.TestCase):
 
     def test_rollback_failure_clears_snapshot_reference(self) -> None:
         wrapper = make_wrapper()
+        original_model = wrapper.model
         tx = WanVAECacheTransaction(wrapper).begin()
         wrapper.model = FakeModel()
 
-        with self.assertRaises(WanVAECacheRestoreError):
-            tx.rollback()
+        try:
+            with self.assertRaises(WanVAECacheRestoreError):
+                tx.rollback()
 
-        self.assertIsNone(tx._snapshot)
-        self.assertIsNone(tx._model_id)
+            self.assertIsNone(tx._snapshot)
+            self.assertIsNone(tx._model_id)
+        finally:
+            clear_owner_record(original_model)
 
     def test_complete_allows_same_model_immediate_new_transaction(self) -> None:
         wrapper = make_wrapper()
@@ -401,14 +503,41 @@ class WanVAECacheTransactionTest(unittest.TestCase):
                 feat_map=FailingSliceList([None]),
             )
         )
+        original_model = wrapper.model
         tx = WanVAECacheTransaction(wrapper).begin()
         wrapper.model._conv_idx = [7]
         wrapper.model._feat_map = [torch.tensor([1.0])]
 
-        with self.assertRaises(WanVAECacheRestoreError) as raised:
-            tx.rollback()
+        try:
+            with self.assertRaises(WanVAECacheRestoreError) as raised:
+                tx.rollback()
 
-        self.assertEqual(len(raised.exception.errors), 2)
+            self.assertEqual(len(raised.exception.errors), 2)
+            with self.assertRaisesRegex(RuntimeError, "abandoned/poisoned"):
+                WanVAECacheTransaction(FakeWrapper(original_model)).begin()
+        finally:
+            clear_owner_record(original_model)
+
+    def test_rollback_failure_releases_snapshot_old_tensor_reference(self) -> None:
+        old_tensor = torch.tensor([1.0], dtype=torch.float32)
+        old_ref = weakref.ref(old_tensor)
+        wrapper = make_wrapper(feat_map=[old_tensor])
+        original_model = wrapper.model
+        tx = WanVAECacheTransaction(wrapper).begin()
+        original_model._feat_map[0] = torch.tensor([2.0], dtype=torch.float32)
+        wrapper.model = FakeModel()
+
+        del old_tensor
+        gc.collect()
+        self.assertIsNotNone(old_ref())
+
+        try:
+            with self.assertRaises(WanVAECacheRestoreError):
+                tx.rollback()
+            gc.collect()
+            self.assertIsNone(old_ref())
+        finally:
+            clear_owner_record(original_model)
 
     def test_model_binding_replaced_restore_is_rejected(self) -> None:
         wrapper = make_wrapper()

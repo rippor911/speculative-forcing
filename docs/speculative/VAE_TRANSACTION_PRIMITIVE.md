@@ -71,21 +71,28 @@ Cloning old Tensor entries would break identity equality and `data_ptr`
 equality. That would make the primitive unable to test whether wrapper-level
 rollback preserves the exact pre-call cache identity.
 
-The remaining blocking question is GPU-only:
+F4B2 answered the GPU-only rollback question for the validated configuration:
 
 ```text
-Does the real CUDA cached-decode path ever mutate an old cache Tensor in place?
+A100-SXM4-80GB
+MCP_COMPLETE_STRICT_RESTORE
+172 MCP tensors
+bfloat16
+3 latent frames/block
 ```
 
-F4B2 must answer that with A100 Path A / Path B fingerprints. If an old Tensor's
-object id and `data_ptr` stay the same but its digest changes during rejected
-draft decode, then shallow rollback is insufficient and clone-based numerical
-backup must be reconsidered.
+In that configuration:
 
-F4B2 must also measure CUDA `allocated` and `reserved` memory across repeated
-reject/rollback cycles. F4B1 CPU garbage-collection tests only prove that closed
-transactions no longer hold Python snapshot references; they do not prove CUDA
-allocator behavior for the real VAE path.
+- 32 old cache Tensor entries did not show in-place mutation;
+- target and following pixel max absolute difference was `0`;
+- 20 rollback rounds returned allocated memory to the stable baseline with
+  allocated delta `0`.
+
+This evidence covers only the verified configuration. It is not a guarantee for
+all devices, dtypes, model versions, block shapes, or future Wan VAE cache
+implementations. If a future path mutates old cache Tensor entries in place,
+shallow rollback is insufficient and clone-based numerical backup must be
+reconsidered.
 
 ## Fingerprint Equality
 
@@ -151,7 +158,8 @@ Rules:
 - one model may have only one active transaction at a time.
 - different model objects may have simultaneous active transactions.
 - active ownership is recorded only after capture succeeds.
-- active ownership is released even if rollback fails.
+- successful rollback releases active ownership.
+- restore failure marks the original live model owner record as poisoned.
 
 Active ownership is tracked as:
 
@@ -160,9 +168,11 @@ model object id -> active owner record
 ```
 
 Each active owner record stores the model object id, a weak reference to the
-model, and a weak reference to the owning transaction. The registry is protected
-by a lock. `begin()` handles existing records while holding the lock:
+model, a weak reference to the owning transaction, and a poisoned flag. The
+registry is protected by a lock. `begin()` handles existing records while
+holding the lock:
 
+- poisoned record with live model: reject as abandoned/poisoned state;
 - live transaction: reject as an already-active transaction for that model;
 - dead transaction with live model: reject as abandoned/poisoned state;
 - dead model: delete the expired record;
@@ -173,21 +183,27 @@ infer that the cache is clean merely because the transaction object was garbage
 collected; the model may still contain temporary cache mutations. It therefore
 fails closed instead of continuing on an unknown cache state.
 
-Only explicit `complete()` or `rollback()` normally deletes the current owner.
-Release removes a registry entry only when the current record's transaction
-weak reference still resolves to the releasing transaction, so delayed cleanup
-from an old transaction cannot delete a newer owner. There is no `__del__`,
-weakref callback, or garbage-collection finalizer that attempts automatic
-rollback.
+Only explicit `complete()` or successful `rollback()` deletes the current
+owner. Release removes a registry entry only when the current record's
+transaction weak reference still resolves to the releasing transaction and the
+record is not poisoned, so delayed cleanup from an old transaction cannot delete
+a newer or poisoned owner. There is no `__del__`, weakref callback, or
+garbage-collection finalizer that attempts automatic rollback.
 
 Closed transactions immediately release snapshot references. `complete()` drops
 `self._snapshot` after closing and keeping current cache state. `rollback()`
 keeps the snapshot until restore has been attempted, then drops
-`self._snapshot` whether restore succeeds or fails. Both paths clear the stored
-model id after releasing active ownership. This matters because the snapshot
-contains shallow references to the original `_feat_map` entries; keeping it
-alive after close could keep old cache Tensor objects, and on GPU their CUDA
-storage, alive longer than intended.
+`self._snapshot` whether restore succeeds or fails. Successful rollback clears
+the stored model id after releasing active ownership. Restore failure clears
+the snapshot and marks the original live model's owner record as poisoned
+without keeping a strong model reference. That owner gate is not released into a
+reusable state. Only after the original model object dies can the stale weakref
+record be cleaned. Continuing safely after rollback failure requires rebuilding
+the VAE model.
+
+This matters because the snapshot contains shallow references to the original
+`_feat_map` entries; keeping it alive after close could keep old cache Tensor
+objects, and on GPU their CUDA storage, alive longer than intended.
 
 Context-manager semantics:
 
@@ -223,10 +239,11 @@ F4B1 does not:
 - claim quality equivalence;
 - claim speedup.
 
-The unresolved integration questions remain exactly the F4A gate items:
+The remaining integration questions are now narrower:
 
-- evaluator return-time handling of candidate VAE state;
-- accept/fallback permanent VAE cache owner;
-- whether controller window rollback covers VAE;
-- Transformer commit and VAE commit atomicity;
-- whether accepted candidates may be decoded twice.
+- evaluator return-time handling of temporary VAE preview state has a local
+  F4B3A solution;
+- production composite committer for accepted draft and fallback VAE commits is
+  not implemented;
+- Transformer/VAE atomic commit ordering is not resolved;
+- real control-chain integration is not wired.

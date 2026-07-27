@@ -13,6 +13,93 @@ Baseline:
 - This audit supports only the current verified Self-Forcing MCP shape. It does
   not claim parity or acceleration.
 
+## Real Checkpoint Validation
+
+Milestone F2B added a server-only real checkpoint smoke for the completed
+`SelfForcingWanMCPBackend` and `SelfForcingMCPRuntime` integration. This
+section records that validation without changing the earlier checkpoint-free
+mutation audit evidence.
+
+Command:
+
+```bash
+cd /home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing
+
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 \
+/home/dataset-assist-0/luojy/efficiency/rippor/envs/speculative-forcing/bin/python \
+  scripts/smoke_speculative_wan_backend_real.py \
+  --config configs/ode_init.yaml \
+  --checkpoint logs/ode_cont3_301/checkpoint_model_000300/model.pt \
+  --prompt "A small boat moves slowly across a calm lake." \
+  --seed 0 \
+  --num_frames 6 \
+  --mcp_depth 1 \
+  --device cuda:0 \
+  2>&1 | tee /tmp/speculative_f2b_real_smoke.txt
+```
+
+Configuration and checkpoint:
+
+- Validation branch: `feat/speculative-wan-backend`.
+- F2A backend commit:
+  `11574b26dff7a16df0b7217720c4de9b726c3654`.
+- F2B validation commit:
+  `ffc6589013ee391daa904c01ce7d8b1594bb91d1`.
+- GPU: NVIDIA A100-SXM4-80GB.
+- Checkpoint:
+  `logs/ode_cont3_301/checkpoint_model_000300/model.pt`.
+- Checkpoint restore mode: `MCP_COMPLETE_STRICT_RESTORE`.
+- MCP tensor count: 172.
+- `num_frames`: 6.
+- `mcp_depth`: 1.
+
+Observed smoke results:
+
+- `prepare=PASS`.
+- `proposal_rollback=PASS`.
+- `fallback_rollback=PASS`.
+- `window_rollback=PASS`.
+- `window_complete=PASS`.
+- Cross-attention identity preserved: `True`.
+- Same-noise fallback: `True`.
+- CUDA RNG rollback: `True`.
+- Final committed blocks: `[0, 1]`.
+- Final KV index: `global_end_index == local_end_index == 9360`.
+- Peak allocated CUDA memory: 18.437 GiB.
+
+The peak memory value is diagnostic only. It includes other components loaded
+during `ODERegression` initialization, including VAE, and must not be treated
+as a backend memory result, speed result, or performance claim.
+
+Validated support scope:
+
+- T2V.
+- Batch size 1.
+- Denoising schedule `[1000]`.
+- MCP depth 1/2/3 is supported by code.
+- This real checkpoint smoke validated depth 1.
+- Global attention with `local_attn_size == -1`.
+- No local rolling.
+
+Not validated by this smoke:
+
+- Real smoke for `mcp_depth` 2 or 3.
+- Multiple prompts.
+- Full controller inference entrypoint.
+- Output video parity.
+- Quality metrics.
+- Speed metrics.
+- ImageReward.
+- VAE verifier.
+
+Warnings observed and considered non-blocking for F2B:
+
+- `torch.load` `FutureWarning` is not a blocker for this milestone.
+- `sink_size` config attribute deprecation warning is not a blocker for this
+  milestone.
+- The smoke script does not call VAE decode, but `ODERegression` construction
+  loads VAE as part of the existing model object.
+
 ## Source Evidence
 
 Read sources:

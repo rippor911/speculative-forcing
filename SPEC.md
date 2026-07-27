@@ -3,7 +3,7 @@
 > 状态：Canonical / 项目唯一主线规范  
 > 适用仓库：`rippor911/speculative-forcing`  
 > 集成基线：`feat/speculative-mcp-adapter @ a5c8270`  
-> 当前实现阶段：Milestone F1 complete / F2 next  
+> 当前实现阶段：Milestone F2 complete / F3 next
 > 研究目标：以 Self-Forcing + MCP/Next-Forcing 为基础，实现可插拔 verifier 的视频 speculative decoding 框架，并验证质量—速度折中  
 > 论文目标：面向 CVPR 2027 的研究原型与实验体系  
 > 最高优先级约束：**任何开发任务都必须直接服务于主线，不得为了通用性、抽象完整性或测试数量而脱离研究目标。**
@@ -580,6 +580,44 @@ result.source_noise is candidate.source_noise
 - 209 tests；
 - A100 全部通过。
 
+## 6.7 Milestone F2：Real Wan backend
+
+状态：complete。
+
+已完成：
+
+- Milestone F2A：CPU fake contract tests complete；
+- Milestone F2B：real A100 checkpoint smoke complete。
+
+F2B 证据摘要：
+
+```text
+commit: ffc6589013ee391daa904c01ce7d8b1594bb91d1
+GPU: NVIDIA A100-SXM4-80GB
+checkpoint_restore: MCP_COMPLETE_STRICT_RESTORE
+MCP tensor count: 172
+num_frames: 6
+mcp_depth: 1
+prepare: PASS
+proposal rollback: PASS
+fallback rollback: PASS
+window rollback: PASS
+window complete: PASS
+cross-attention identity preserved: True
+same-noise fallback: True
+CUDA RNG rollback: True
+final committed blocks: [0, 1]
+final global/local index: 9360
+peak allocated CUDA memory: 18.437 GiB
+```
+
+显存说明：峰值显存包含 `ODERegression` 初始化过程中加载的其他组件，
+包括 VAE。该数字仅为 smoke 诊断，不能作为 backend 显存或性能结论。
+
+非结论：F2B 不声明质量等价、推理加速或性能收益；不表示
+ImageReward、VAE verifier、新 verifier、mcp_depth 2/3 真实 smoke、
+完整 controller inference 或 output video parity 已完成。
+
 ---
 
 # 7. 后续里程碑
@@ -634,6 +672,13 @@ fake decoder
 完整闭环可通过配置切换，不修改 controller。
 
 ## Milestone F2：真实 Self-Forcing MCP adapter/backend
+
+### 状态
+
+Complete。F2A CPU fake contract tests 已完成；F2B real A100 checkpoint
+smoke 已完成。该状态只冻结真实 backend/runtime 行为验证，不声明质量等价、
+推理加速或性能收益，也不表示 VAE verifier、ImageReward 或新 verifier
+已完成。
 
 ### 目标
 
@@ -856,7 +901,16 @@ threshold: null
 
 当前唯一下一阶段：
 
-> **Milestone F2：真实 Self-Forcing MCP adapter/backend。**
+> **Milestone F3：`inference_speculative.py` + scripted GPU parity。**
+
+F3 第一阶段目标：
+
+- 新增独立 `inference_speculative.py`；
+- 先验证 scripted policies：`always_accept`、`always_reject`、
+  `reject_at_depth`；
+- 以 `inference_mcp.py` 为 frozen MCP reference oracle；
+- 不在 F3 开始时接 ImageReward、VAE verifier 或新 verifier；
+- 不声明质量等价、推理加速或性能收益。
 
 本阶段不得直接跳到：
 
@@ -865,11 +919,11 @@ threshold: null
 - learned verifier；
 - 大规模实验；
 - local rolling；
-- `inference_speculative.py` scripted parity；
 - 阈值标定；
 - 继续横向扩展 verifier framework。
 
-完成 F2 后，进入 F3 scripted parity，将框架接到真实 MCP Next-Forcing 推理闭环。
+F3 完成 scripted parity 后，才进入后续 VAE transaction / ImageReward /
+verifier baseline 工作。
 
 ---
 
@@ -1276,8 +1330,8 @@ MCP thin wrappers                            完成
 SelfForcingMCPRuntime orchestration           完成
 Wan mutation audit + pure planner            完成并冻结
 Pluggable evaluator stack                    完成
-Real Wan backend                             下一步
-inference_speculative.py                     未完成
+Real Wan backend                             完成
+inference_speculative.py                     下一步
 Scripted GPU parity                          未完成
 VAE cache audit/transaction                  未完成
 ImageReward baseline                         未完成
@@ -1290,19 +1344,17 @@ Formal quality-speed experiments             未完成
 
 # 18. 下一步任务边界
 
-下一任务只能做 Milestone F2。
+下一任务只能做 Milestone F3。
 
 允许：
 
-- `SelfForcingWanMCPBackend`；
-- planner descriptor 到 2A state specs 的绑定；
-- `model.freqs` 静态迁移；
-- staging cross-attention prepare；
-- proposal；
-- fallback；
-- commit；
-- 当前 KV layout；
-- no local rolling。
+- 新增独立 `inference_speculative.py`；
+- 接入已经完成的 `SelfForcingWanMCPBackend` 和 `SelfForcingMCPRuntime`；
+- 先验证 scripted policies：`always_accept`、`always_reject`、
+  `reject_at_depth`；
+- 与 frozen `inference_mcp.py` 做 scripted GPU parity；
+- 记录 anchor/draft/fallback/commit trace；
+- 保持 longest-prefix、same-noise fallback、runtime transaction 语义不变。
 
 禁止：
 
@@ -1310,16 +1362,17 @@ Formal quality-speed experiments             未完成
 - 修改 frozen controller semantics；
 - 修改 runtime transaction；
 - 修改 Wan planner；
+- 修改 F2 backend ownership 边界；
 - 接 VAE；
 - 接 ImageReward；
-- 加 checkpoint；
-- 用 GPU；
 - 实现 learned verifier；
 - 扩展 local rolling；
 - 继续扩展 F1 verifier framework；
+- 声明质量等价、推理加速或性能收益；
 - commit/push/merge，除非审查后明确授权。
 
-完成后必须立即进入 scripted parity，不再横向扩展 framework。
+完成 F3 scripted parity 后，再进入 VAE transaction / ImageReward /
+verifier baseline，不再横向扩展 framework。
 
 ---
 

@@ -11,6 +11,15 @@ DEFAULT_S_MCP = 10.0
 DEFAULT_NUM_TRAIN_TIMESTEPS = 1000
 
 
+def make_generator(seed: int, device: torch.device | str) -> torch.Generator:
+    device = torch.device(device)
+    if device.type not in ("cpu", "cuda"):
+        raise ValueError("NF-SF random sampling supports CPU and CUDA tensors only")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    return generator
+
+
 @dataclass(frozen=True)
 class FutureChunkTarget:
     depth: int
@@ -34,9 +43,7 @@ class NFSFTensorInputs:
 
 
 def make_cpu_generator(seed: int) -> torch.Generator:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(seed))
-    return generator
+    return make_generator(seed, "cpu")
 
 
 def shift_future_chunks(
@@ -327,8 +334,8 @@ def _validate_random_device(
     device: torch.device,
     generator: torch.Generator | None,
 ) -> None:
-    if device.type != "cpu":
-        raise ValueError("NF-SF M1 random sampling supports CPU tensors only")
+    if device.type not in ("cpu", "cuda"):
+        raise ValueError("NF-SF random sampling supports CPU and CUDA tensors only")
     if generator is not None:
         if not isinstance(generator, torch.Generator):
             raise TypeError("generator must be a torch.Generator")

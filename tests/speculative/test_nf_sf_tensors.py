@@ -6,6 +6,7 @@ from utils.nf_sf_tensors import (
     DEFAULT_S_MCP,
     future_valid_mask,
     flow_match_shift_timesteps,
+    make_generator,
     make_cpu_generator,
     prepare_nf_sf_tensor_inputs,
     sample_nf_sf_noise_and_timesteps,
@@ -249,12 +250,30 @@ def test_dtype_and_cpu_device_are_preserved() -> None:
 def test_random_sampling_rejects_non_cpu_target_chunks() -> None:
     target_chunk = torch.empty((1, 2, 1, 1, 1), dtype=torch.float32, device="meta")
 
-    with pytest.raises(ValueError, match="CPU tensors only"):
+    with pytest.raises(ValueError, match="CPU and CUDA"):
         sample_nf_sf_noise_and_timesteps(
             target_chunk,
             chunk_frames=2,
             generator=make_cpu_generator(1),
         )
+
+
+def test_make_generator_matches_cpu_helper() -> None:
+    target_chunk = torch.zeros((1, 2, 1, 1, 1), dtype=torch.float32)
+
+    from_generic = sample_nf_sf_noise_and_timesteps(
+        target_chunk,
+        chunk_frames=2,
+        generator=make_generator(7, target_chunk.device),
+    )
+    from_cpu_helper = sample_nf_sf_noise_and_timesteps(
+        target_chunk,
+        chunk_frames=2,
+        generator=make_cpu_generator(7),
+    )
+
+    assert torch.equal(from_generic.epsilon_main, from_cpu_helper.epsilon_main)
+    assert torch.equal(from_generic.timestep_main, from_cpu_helper.timestep_main)
 
 
 def test_random_sampling_rejects_wrong_generator_type() -> None:

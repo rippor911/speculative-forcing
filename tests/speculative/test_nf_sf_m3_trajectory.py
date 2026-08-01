@@ -47,6 +47,8 @@ class RecordingGenerator(nn.Module):
         flow_bias: float = 0.0,
         assert_dtype: torch.dtype | None = None,
         nonfinite: bool = False,
+        mcp_output_count: int = 1,
+        top_level_output_count: int = 3,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
@@ -55,6 +57,8 @@ class RecordingGenerator(nn.Module):
         self.flow_bias = float(flow_bias)
         self.assert_dtype = assert_dtype
         self.nonfinite = bool(nonfinite)
+        self.mcp_output_count = int(mcp_output_count)
+        self.top_level_output_count = int(top_level_output_count)
         self.calls = []
 
     def get_scheduler(self):
@@ -87,11 +91,18 @@ class RecordingGenerator(nn.Module):
                 flow = torch.full_like(future, float("inf"))
             else:
                 flow = flow + self.flow_bias
-            return (
-                torch.zeros_like(current),
-                torch.zeros_like(current),
-                [flow, torch.zeros_like(future), torch.zeros_like(future)],
+            mcp_outputs = [flow]
+            mcp_outputs.extend(
+                torch.zeros_like(future)
+                for _ in range(max(0, self.mcp_output_count - 1))
             )
+            mcp_outputs = mcp_outputs[: max(0, self.mcp_output_count)]
+            top_level_outputs = (
+                torch.zeros_like(current),
+                torch.zeros_like(current),
+                mcp_outputs,
+            )
+            return top_level_outputs[: self.top_level_output_count]
 
         self.calls.append(call)
         flow = self.main_flow.to(device=current.device, dtype=current.dtype)
@@ -279,6 +290,88 @@ def test_mcp_teacher_forced_current_condition_and_future_start_frame_are_fixed()
             mcp_timesteps=mcp_scheduler.timesteps,
             mode="teacher_forced",
             future_start_frame=9,
+        )
+
+
+def test_mcp_output_contract_accepts_one_requested_future_chunk_one_flow() -> None:
+    tensors = _inputs()
+    main_scheduler = _scheduler(5.0)
+    mcp_scheduler = _scheduler(10.0)
+    mcp_flow = tensors["epsilon_future"] - tensors["next1_target"]
+    generator = RecordingGenerator(mcp_flow=mcp_flow, mcp_output_count=1)
+
+    records = diag.run_mcp1_trajectory(
+        generator,
+        conditional_dict=tensors["conditional_dict"],
+        clean_history=tensors["clean_history"],
+        current_target=tensors["current_target"],
+        next1_target=tensors["next1_target"],
+        epsilon_main=tensors["epsilon_main"],
+        epsilon_future=tensors["epsilon_future"],
+        current_condition_scheduler=main_scheduler,
+        future_scheduler=mcp_scheduler,
+        main_timesteps=main_scheduler.timesteps,
+        mcp_timesteps=mcp_scheduler.timesteps,
+        mode="teacher_forced",
+    )
+
+    assert len(records) == 4
+    assert len(generator.calls) == 4
+
+
+@pytest.mark.parametrize("mcp_output_count", [0, 2, 3])
+def test_mcp_output_contract_rejects_wrong_mcp_flow_count(mcp_output_count: int) -> None:
+    tensors = _inputs()
+    main_scheduler = _scheduler(5.0)
+    mcp_scheduler = _scheduler(10.0)
+    mcp_flow = tensors["epsilon_future"] - tensors["next1_target"]
+    generator = RecordingGenerator(
+        mcp_flow=mcp_flow,
+        mcp_output_count=mcp_output_count,
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one MCP flow output"):
+        diag.run_mcp1_trajectory(
+            generator,
+            conditional_dict=tensors["conditional_dict"],
+            clean_history=tensors["clean_history"],
+            current_target=tensors["current_target"],
+            next1_target=tensors["next1_target"],
+            epsilon_main=tensors["epsilon_main"],
+            epsilon_future=tensors["epsilon_future"],
+            current_condition_scheduler=main_scheduler,
+            future_scheduler=mcp_scheduler,
+            main_timesteps=main_scheduler.timesteps,
+            mcp_timesteps=mcp_scheduler.timesteps,
+            mode="teacher_forced",
+        )
+
+
+def test_mcp_output_contract_rejects_non_triple_top_level_outputs() -> None:
+    tensors = _inputs()
+    main_scheduler = _scheduler(5.0)
+    mcp_scheduler = _scheduler(10.0)
+    mcp_flow = tensors["epsilon_future"] - tensors["next1_target"]
+    generator = RecordingGenerator(
+        mcp_flow=mcp_flow,
+        mcp_output_count=1,
+        top_level_output_count=2,
+    )
+
+    with pytest.raises(RuntimeError, match="exactly three generator outputs"):
+        diag.run_mcp1_trajectory(
+            generator,
+            conditional_dict=tensors["conditional_dict"],
+            clean_history=tensors["clean_history"],
+            current_target=tensors["current_target"],
+            next1_target=tensors["next1_target"],
+            epsilon_main=tensors["epsilon_main"],
+            epsilon_future=tensors["epsilon_future"],
+            current_condition_scheduler=main_scheduler,
+            future_scheduler=mcp_scheduler,
+            main_timesteps=main_scheduler.timesteps,
+            mcp_timesteps=mcp_scheduler.timesteps,
+            mode="teacher_forced",
         )
 
 

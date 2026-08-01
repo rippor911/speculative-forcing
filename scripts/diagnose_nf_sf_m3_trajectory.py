@@ -571,8 +571,12 @@ def _call_mcp1_generator(
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 3:
         raise RuntimeError("MCP-1 diagnostic expected exactly three generator outputs")
     mcp_outputs = outputs[2]
-    if not isinstance(mcp_outputs, (tuple, list)) or len(mcp_outputs) != 3:
-        raise RuntimeError("MCP-1 diagnostic expected exactly three MCP flow outputs")
+    if not isinstance(mcp_outputs, (tuple, list)) or len(mcp_outputs) != 1:
+        actual_count = "non-sequence" if not isinstance(mcp_outputs, (tuple, list)) else len(mcp_outputs)
+        raise RuntimeError(
+            "MCP-1 diagnostic expected exactly one MCP flow output "
+            f"for one requested future chunk, got {actual_count}"
+        )
     return mcp_outputs[0]
 
 

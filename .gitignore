@@ -21,3 +21,16 @@ ode_lmdb/
 
 videos/*
 !videos/.gitkeep
+
+# Local experiment artifacts; experiment source files remain trackable.
+experiments/*_outputs/
+experiments/**/outputs/
+experiments/**/artifacts/
+experiments/**/videos/
+experiments/**/*.pt
+experiments/**/*.pth
+experiments/**/*.ckpt
+experiments/**/*.mp4
+experiments/**/*.log
+experiments/**/*.tar.gz
+experiments/**/*.zip

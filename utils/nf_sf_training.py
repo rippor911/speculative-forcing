@@ -247,10 +247,13 @@ def configure_nf_sf_optimizer_plan(
     generator,
     *,
     mode: NFSFTrainMode,
-    lr: float,
+    lr: float | None = None,
+    group_lrs: dict[str, float] | None = None,
 ) -> NFSFOptimizerPlan:
     if mode not in ("frozen", "joint"):
         raise ValueError("mode must be 'frozen' or 'joint'")
+    if lr is None and group_lrs is None:
+        raise ValueError("either lr or group_lrs must be provided")
     if getattr(generator, "mcp", None) is None:
         raise ValueError("generator must have MCP modules attached")
 
@@ -271,7 +274,13 @@ def configure_nf_sf_optimizer_plan(
             param.requires_grad_(requires_grad)
         if requires_grad:
             params = [param for _, param in named_params]
-            optimizer_param_groups.append({"name": name, "params": params, "lr": lr})
+            optimizer_param_groups.append(
+                {
+                    "name": name,
+                    "params": params,
+                    "lr": _optimizer_group_lr(name, lr, group_lrs),
+                }
+            )
             optimizer_param_ids.update(id(param) for param in params)
 
     audits = []
@@ -305,6 +314,24 @@ def configure_nf_sf_optimizer_plan(
         optimizer_param_groups=optimizer_param_groups,
         audits=tuple(audits),
     )
+
+
+def _optimizer_group_lr(
+    name: str,
+    lr: float | None,
+    group_lrs: dict[str, float] | None,
+) -> float:
+    if group_lrs is None:
+        if lr is None:
+            raise ValueError("lr must be provided when group_lrs is absent")
+        return float(lr)
+    if name in group_lrs:
+        return float(group_lrs[name])
+    if name.startswith("mcp_depth") and "mcp" in group_lrs:
+        return float(group_lrs["mcp"])
+    if name == "mcp_fusion" and "mcp" in group_lrs:
+        return float(group_lrs["mcp"])
+    raise ValueError(f"missing optimizer lr for parameter group {name!r}")
 
 
 def collect_nf_sf_parameter_groups(

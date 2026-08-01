@@ -236,6 +236,62 @@ class Trainer:
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+
+        self.save_iters = int(
+            getattr(config, "save_iters", config.log_iters)
+        )
+        if self.save_iters <= 0:
+            raise ValueError("save_iters must be greater than zero")
+
+        max_iters = getattr(config, "max_iters", None)
+        self.max_iters = int(max_iters) if max_iters is not None else None
+        if self.max_iters is not None and self.max_iters <= 0:
+            raise ValueError("max_iters must be greater than zero")
+
+        self.keep_last_checkpoints = int(
+            getattr(config, "keep_last_checkpoints", 0)
+        )
+        if self.keep_last_checkpoints < 0:
+            raise ValueError("keep_last_checkpoints must not be negative")
+
+        self.keep_milestone_iters = {
+            int(step)
+            for step in getattr(config, "keep_milestone_iters", [])
+        }
+        per_micro_batch_global = int(config.batch_size) * self.world_size
+        configured_total_batch_size = getattr(
+            config, "total_batch_size", None
+        )
+        self.total_batch_size = (
+            per_micro_batch_global
+            if configured_total_batch_size is None
+            else int(configured_total_batch_size)
+        )
+
+        if self.total_batch_size <= 0:
+            raise ValueError("total_batch_size must be greater than zero")
+        if self.total_batch_size % per_micro_batch_global != 0:
+            raise ValueError(
+                "total_batch_size must be divisible by "
+                "batch_size * world_size: "
+                f"{self.total_batch_size} vs {per_micro_batch_global}"
+            )
+
+        self.grad_accum_steps = (
+            self.total_batch_size // per_micro_batch_global
+        )
+        if self.grad_accum_steps < 1:
+            raise ValueError("grad_accum_steps must be at least one")
+
+        if self.is_main_process:
+            print(
+                "Gradient accumulation configured: "
+                f"per_device_batch={int(config.batch_size)}, "
+                f"world_size={self.world_size}, "
+                f"total_batch_size={self.total_batch_size}, "
+                f"grad_accum_steps={self.grad_accum_steps}"
+            )
+
         self.previous_time = None
 
     def save(self):
@@ -257,13 +313,69 @@ class Trainer:
                 "critic": critic_state_dict,
             }
 
+        checkpoint_dir = os.path.join(
+            self.output_path,
+            f"checkpoint_model_{self.step:06d}",
+        )
+        final_path = os.path.join(checkpoint_dir, "model.pt")
+        temporary_path = os.path.join(checkpoint_dir, "model.pt.tmp")
+
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+            # Preserve previous valid checkpoints if the new write fails.
+            torch.save(state_dict, temporary_path)
+            os.replace(temporary_path, final_path)
+            print("Model saved to", final_path)
+
+            # Remove old checkpoints only after the new one is complete.
+            self.cleanup_old_checkpoints()
+
+        # Other ranks wait until rank 0 finishes saving and cleaning up.
+        dist.barrier()
+
+    def cleanup_old_checkpoints(self):
+        if self.keep_last_checkpoints <= 0:
+            return
+
+        import shutil
+
+        prefix = "checkpoint_model_"
+        checkpoints = []
+
+        for name in os.listdir(self.output_path):
+            path = os.path.join(self.output_path, name)
+
+            if not os.path.isdir(path) or not name.startswith(prefix):
+                continue
+
+            step_text = name[len(prefix):]
+            if not step_text.isdigit():
+                continue
+
+            model_path = os.path.join(path, "model.pt")
+            if not os.path.isfile(model_path):
+                continue
+
+            checkpoints.append((int(step_text), path))
+
+        checkpoints.sort(key=lambda item: item[0])
+
+        recent_steps = {
+            step
+            for step, _ in checkpoints[-self.keep_last_checkpoints:]
+        }
+        keep_steps = recent_steps | self.keep_milestone_iters
+
+        for step, checkpoint_path in checkpoints:
+            if step in keep_steps:
+                continue
+
+            print("Removing old checkpoint:", checkpoint_path)
+            shutil.rmtree(checkpoint_path)
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -309,12 +421,20 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
 
-            generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
+            scaled_generator_loss = (
+                generator_loss / self.grad_accum_steps
+            )
+            scaled_generator_loss.backward()
 
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": generator_grad_norm})
+            generator_log_dict = {
+                key: value.detach()
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in generator_log_dict.items()
+            }
+            generator_log_dict["generator_loss"] = (
+                generator_loss.detach()
+            )
 
             return generator_log_dict
         else:
@@ -329,12 +449,16 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
-        critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
+        scaled_critic_loss = critic_loss / self.grad_accum_steps
+        scaled_critic_loss.backward()
 
-        critic_log_dict.update({"critic_loss": critic_loss,
-                                "critic_grad_norm": critic_grad_norm})
+        critic_log_dict = {
+            key: value.detach()
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in critic_log_dict.items()
+        }
+        critic_log_dict["critic_loss"] = critic_loss.detach()
 
         return critic_log_dict
 
@@ -368,43 +492,124 @@ class Trainer:
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
         return current_video
 
+    def log_cuda_memory(self, stage):
+        if not getattr(self.config, "debug_cuda_memory", False):
+            return
+
+        mib = 1024 ** 2
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+
+        print(
+            "CUDA_MEM "
+            f"rank={dist.get_rank()} "
+            f"step={self.step} "
+            f"stage={stage} "
+            f"allocated_mib={torch.cuda.memory_allocated(self.device) / mib:.1f} "
+            f"reserved_mib={torch.cuda.memory_reserved(self.device) / mib:.1f} "
+            f"max_allocated_mib={torch.cuda.max_memory_allocated(self.device) / mib:.1f} "
+            f"max_reserved_mib={torch.cuda.max_memory_reserved(self.device) / mib:.1f} "
+            f"free_mib={free_bytes / mib:.1f} "
+            f"total_mib={total_bytes / mib:.1f}",
+            flush=True,
+        )
+
     def train(self):
         start_step = self.step
 
         while True:
+            iteration_start_time = time.time()
+
+            if getattr(self.config, "debug_cuda_memory", False):
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+            self.log_cuda_memory("outer_step_start")
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
 
             # Train the generator
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
-                batch = next(self.dataloader)
-                extra = self.fwdbwd_one_step(batch, True)
-                extras_list.append(extra)
+
+                for micro_index in range(self.grad_accum_steps):
+                    batch = next(self.dataloader)
+                    extra = self.fwdbwd_one_step(batch, True)
+                    extras_list.append(extra)
+                    self.log_cuda_memory(
+                        f"generator_backward_{micro_index + 1:02d}"
+                        f"_of_{self.grad_accum_steps:02d}"
+                    )
+
+                generator_grad_norm = (
+                    self.model.generator.clip_grad_norm_(
+                        self.max_grad_norm_generator
+                    )
+                )
+                self.log_cuda_memory("generator_after_clip")
                 generator_log_dict = merge_dict_list(extras_list)
+                generator_log_dict["generator_grad_norm"] = (
+                    generator_grad_norm.detach()
+                    if isinstance(generator_grad_norm, torch.Tensor)
+                    else generator_grad_norm
+                )
+
                 self.generator_optimizer.step()
+                self.log_cuda_memory("generator_after_optimizer_step")
+
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
 
             # Train the critic
+            self.log_cuda_memory("critic_start")
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
+
+            for micro_index in range(self.grad_accum_steps):
+                batch = next(self.dataloader)
+                extra = self.fwdbwd_one_step(batch, False)
+                extras_list.append(extra)
+                self.log_cuda_memory(
+                    f"critic_backward_{micro_index + 1:02d}"
+                    f"_of_{self.grad_accum_steps:02d}"
+                )
+
+            critic_grad_norm = self.model.fake_score.clip_grad_norm_(
+                self.max_grad_norm_critic
+            )
+            self.log_cuda_memory("critic_after_clip")
             critic_log_dict = merge_dict_list(extras_list)
+            critic_log_dict["critic_grad_norm"] = (
+                critic_grad_norm.detach()
+                if isinstance(critic_grad_norm, torch.Tensor)
+                else critic_grad_norm
+            )
+
             self.critic_optimizer.step()
+            self.log_cuda_memory("critic_after_optimizer_step")
 
             # Increment the step since we finished gradient update
             self.step += 1
+            self.log_cuda_memory("outer_step_end")
 
             # Create EMA params (if not already created)
             if (self.step >= self.config.ema_start_step) and \
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
 
-            # Save the model
-            if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
+            reached_max_iters = (
+                self.max_iters is not None
+                and self.step >= self.max_iters
+            )
+            should_save = (
+                self.step % self.save_iters == 0
+                or reached_max_iters
+            )
+
+            # Save the model.
+            if (
+                not self.config.no_save
+                and (self.step - start_step) > 0
+                and should_save
+            ):
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
@@ -445,3 +650,43 @@ class Trainer:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+            if self.is_main_process:
+                iteration_elapsed = time.time() - iteration_start_time
+                critic_loss_value = (
+                    critic_log_dict["critic_loss"].mean().item()
+                )
+                critic_grad_norm_value = (
+                    critic_log_dict["critic_grad_norm"].mean().item()
+                )
+
+                log_parts = [
+                    f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%S')}",
+                    f"step={self.step}",
+                    f"train_generator={int(TRAIN_GENERATOR)}",
+                    f"critic_loss={critic_loss_value:.8f}",
+                    f"critic_grad_norm={critic_grad_norm_value:.8f}",
+                    f"elapsed_sec={iteration_elapsed:.3f}",
+                ]
+
+                if TRAIN_GENERATOR:
+                    generator_loss_value = (
+                        generator_log_dict["generator_loss"].mean().item()
+                    )
+                    generator_grad_norm_value = (
+                        generator_log_dict["generator_grad_norm"].mean().item()
+                    )
+                    log_parts.extend([
+                        f"generator_loss={generator_loss_value:.8f}",
+                        f"generator_grad_norm={generator_grad_norm_value:.8f}",
+                    ])
+
+                print("TRAIN_STEP " + " ".join(log_parts), flush=True)
+
+            if reached_max_iters:
+                if self.is_main_process:
+                    print(
+                        f"Reached max_iters={self.max_iters}. "
+                        "Training finished."
+                    )
+                break

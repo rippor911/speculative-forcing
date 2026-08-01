@@ -7,6 +7,7 @@ from utils.checkpoint import (
     extract_generator_state_dict,
     load_state_dict_allowing_mcp_mismatch,
 )
+from utils.nf_sf_tensors import future_valid_mask, shift_future_chunks
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
@@ -222,28 +223,20 @@ class ODERegression(BaseModel):
 
         `latent` is [B, num_frames, C, H, W]; chunks are num_frame_per_block frames.
         """
-        m = self.num_frame_per_block
-        num_frames = latent.shape[1]
-        if num_frames % m != 0:
-            raise ValueError(
-                f"MCP chunk shifting needs num_frames ({num_frames}) divisible by "
-                f"num_frame_per_block ({m})"
-            )
-        num_chunks = num_frames // m
-        pieces = []
-        for i in range(num_chunks):
-            j = min(i + k, num_chunks - 1)
-            pieces.append(latent[:, j * m:(j + 1) * m])
-        return torch.cat(pieces, dim=1)
+        return shift_future_chunks(
+            latent,
+            chunk_frames=self.num_frame_per_block,
+            depth=k,
+        ).target
 
     def _mcp_valid_frame_mask(self, num_frames: int, k: int, device) -> torch.Tensor:
         """Eq. 12: "the last k padded chunks are excluded from the loss computation"."""
-        m = self.num_frame_per_block
-        num_chunks = num_frames // m
-        mask = torch.zeros(num_frames, dtype=torch.bool, device=device)
-        valid_chunks = max(num_chunks - k, 0)
-        mask[: valid_chunks * m] = True
-        return mask
+        return future_valid_mask(
+            num_frames=num_frames,
+            chunk_frames=self.num_frame_per_block,
+            depth=k,
+            device=device,
+        )
 
     @torch.no_grad()
     def _prepare_mcp_inputs(self, ode_latent: torch.Tensor) -> dict:

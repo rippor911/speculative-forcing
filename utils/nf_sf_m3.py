@@ -1426,6 +1426,29 @@ def solver_schedule_to_json(schedule: M3SolverSchedule) -> dict[str, Any]:
     }
 
 
+def _scheduler_step_preserve_sample_dtype(
+    scheduler,
+    *,
+    model_output: torch.Tensor,
+    timestep: torch.Tensor,
+    sample: torch.Tensor,
+) -> torch.Tensor:
+    sample_shape = tuple(sample.shape)
+    sample_dtype = sample.dtype
+    sample_device = sample.device
+    next_sample = scheduler.step(
+        model_output,
+        timestep,
+        sample,
+    )
+    if tuple(next_sample.shape) != sample_shape:
+        raise RuntimeError(
+            "M3 scheduler step shape mismatch: "
+            f"{tuple(next_sample.shape)} != {sample_shape}"
+        )
+    return next_sample.to(device=sample_device, dtype=sample_dtype)
+
+
 def reconstruct_main_current(
     generator,
     *,
@@ -1467,10 +1490,12 @@ def reconstruct_main_current(
                 aug_t=torch.zeros_like(timestep),
             )
             flow_pred = outputs[0]
-            current = scheduler.step(
-                flow_pred.flatten(0, 1),
-                timestep.flatten(0, 1),
-                current.flatten(0, 1),
+            flat_current = current.flatten(0, 1)
+            current = _scheduler_step_preserve_sample_dtype(
+                scheduler,
+                model_output=flow_pred.flatten(0, 1),
+                timestep=timestep.flatten(0, 1),
+                sample=flat_current,
             ).unflatten(0, current.shape[:2])
     return M3ReconstructionResult(latent=current.detach(), solver_schedule=schedule)
 
@@ -1526,10 +1551,12 @@ def reconstruct_mcp1_next(
                 mcp_timesteps=[timestep],
             )
             mcp_flow = outputs[2][0]
-            next_state = scheduler.step(
-                mcp_flow.flatten(0, 1),
-                timestep.flatten(0, 1),
-                next_state.flatten(0, 1),
+            flat_next_state = next_state.flatten(0, 1)
+            next_state = _scheduler_step_preserve_sample_dtype(
+                scheduler,
+                model_output=mcp_flow.flatten(0, 1),
+                timestep=timestep.flatten(0, 1),
+                sample=flat_next_state,
             ).unflatten(0, next_state.shape[:2])
     return M3ReconstructionResult(latent=next_state.detach(), solver_schedule=schedule)
 

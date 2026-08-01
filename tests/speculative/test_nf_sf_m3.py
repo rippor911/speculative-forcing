@@ -849,6 +849,42 @@ class ZeroMCPFlowGenerator(nn.Module):
         return torch.zeros_like(noisy), torch.zeros_like(noisy), [torch.zeros_like(future)]
 
 
+class BF16MainFlowGenerator(ZeroMainFlowGenerator):
+    def forward(self, **kwargs):
+        noisy = kwargs["noisy_image_or_video"]
+        assert noisy.dtype == torch.bfloat16
+        self.calls.append(float(kwargs["timestep"][0, 0].item()))
+        return torch.zeros_like(noisy), torch.zeros_like(noisy), []
+
+
+class BF16MCPFlowGenerator(ZeroMCPFlowGenerator):
+    def forward(self, **kwargs):
+        noisy = kwargs["noisy_image_or_video"]
+        future = kwargs["mcp_future_noises"][0]
+        assert noisy.dtype == torch.bfloat16
+        assert future.dtype == torch.bfloat16
+        self.calls.append(
+            {
+                "main_timestep": float(kwargs["timestep"][0, 0].item()),
+                "mcp_timestep": float(kwargs["mcp_timesteps"][0][0, 0].item()),
+                "future_start_frame": int(kwargs["mcp_future_start_frames"][0]),
+            }
+        )
+        return torch.zeros_like(noisy), torch.zeros_like(noisy), [torch.zeros_like(future)]
+
+
+class BadShapeScheduler(FlowMatchScheduler):
+    def step(self, model_output, timestep, sample, to_final=False):
+        _ = super().step(model_output, timestep, sample, to_final=to_final)
+        return sample[:1]
+
+
+class BadShapeMainFlowGenerator(ZeroMainFlowGenerator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scheduler = BadShapeScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+
+
 def test_main_reconstruction_uses_payload_solver_timestep_order() -> None:
     state = _state()
     generator = ZeroMainFlowGenerator()
@@ -873,6 +909,34 @@ def test_main_reconstruction_uses_payload_solver_timestep_order() -> None:
     assert result.solver_schedule.warped_denoising_steps == pytest.approx(
         payload["warped_denoising_steps"],
     )
+
+
+def test_main_reconstruction_preserves_bf16_state_across_solver_steps() -> None:
+    state = select_m3_selected_state(_latent(15, dtype=torch.bfloat16))
+    generator = BF16MainFlowGenerator()
+    result = reconstruct_main_current(
+        generator,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        state=state,
+        initial_noise=torch.ones_like(state.current_target),
+        teacher_payload=_solver_payload(num_steps=4),
+    )
+
+    assert len(generator.calls) == 4
+    assert result.latent.dtype == torch.bfloat16
+
+
+def test_scheduler_step_shape_mismatch_is_rejected() -> None:
+    state = _state()
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        reconstruct_main_current(
+            BadShapeMainFlowGenerator(),
+            conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+            state=state,
+            initial_noise=torch.ones_like(state.current_target),
+            teacher_payload=_solver_payload(num_steps=4),
+        )
 
 
 def test_solver_schedule_mismatch_rejects() -> None:
@@ -950,3 +1014,19 @@ def test_standalone_mcp1_reconstruction_uses_payload_schedule_and_teacher_forcin
             timestep.flatten(0, 1),
         ).unflatten(0, state.current_target.shape[:2])
         assert torch.allclose(call["noisy_current"], expected_noisy)
+
+
+def test_standalone_mcp1_reconstruction_preserves_bf16_state_across_solver_steps() -> None:
+    state = select_m3_selected_state(_latent(15, dtype=torch.bfloat16))
+    generator = BF16MCPFlowGenerator()
+    result = reconstruct_mcp1_next(
+        generator,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        state=state,
+        next_initial_noise=torch.ones_like(state.future_targets[0]),
+        current_condition_noise=torch.full_like(state.current_target, 2.0),
+        teacher_payload=_solver_payload(num_steps=4),
+    )
+
+    assert len(generator.calls) == 4
+    assert result.latent.dtype == torch.bfloat16

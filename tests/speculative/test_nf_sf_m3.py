@@ -83,21 +83,24 @@ def _teacher_manifest_and_payload(*, num_frames: int = 15):
         "mcp_depth": 3,
         "raw_denoising_steps": [1000, 750, 500, 250],
         "warped_denoising_steps": [1000.0, 750.0, 500.0, 250.0],
-        "writer_git_head": "abc",
+        "writer_git_head": TEST_GIT_SHA,
     }
     manifest = {
         "status": "PASS",
         "experiment": "E0208C_teacher_rollout_formal",
         "format": "self_forcing_teacher_manifest_v2",
         "writer_format": "e0208_teacher_writer_v1",
+        "writer_git_head": TEST_GIT_SHA,
         "checkpoint": {
             "path": "checkpoints/self_forcing_dmd.pt",
             "sha256": M3_REFERENCE_CHECKPOINT_SHA256,
         },
         "generation": {
-            "num_samples": 2304,
-            "num_train": 2048,
-            "num_validation": 256,
+            "num_samples": 1,
+            "num_completed": 1,
+            "num_train": 1,
+            "num_validation": 0,
+            "num_reserve": 0,
             "num_frames": num_frames,
             "num_frame_per_block": 3,
             "num_blocks": num_frames // 3,
@@ -108,6 +111,7 @@ def _teacher_manifest_and_payload(*, num_frames: int = 15):
         },
         "samples": [
             {
+                "status": "GENERATED",
                 "sample_index": 0,
                 "sample_id": "sample-train-0",
                 "split": "train",
@@ -125,6 +129,23 @@ def _teacher_manifest_and_payload(*, num_frames: int = 15):
         ],
     }
     return manifest, payload
+
+
+def _merged_manifest_from(manifest: dict) -> dict:
+    merged = json.loads(json.dumps(manifest))
+    merged["format"] = "self_forcing_teacher_manifest_v2_merged"
+    merged.pop("writer_format", None)
+    merged.pop("writer_git_head", None)
+    merged["shards"] = [
+        {
+            "shard_id": 0,
+            "split": "train",
+            "count": len(merged["samples"]),
+            "path": "/dataset/shard_000_manifest.json",
+            "sha256": "b" * 64,
+        }
+    ]
+    return merged
 
 
 def _load_teacher_with_monkeypatch(monkeypatch, manifest, payload):
@@ -265,6 +286,81 @@ def test_teacher_sample_audit_reads_manifest_payload_and_metadata(monkeypatch) -
     assert sample.metadata["latent_frame_count"] == 15
     assert sample.metadata["chunk_aligned"] is True
     assert sample.metadata["has_minimum_15_latent_frames"] is True
+
+
+def test_teacher_sample_accepts_shard_v2_manifest(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    sample = _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
+
+    assert sample.metadata["manifest_format"] == "self_forcing_teacher_manifest_v2"
+
+
+def test_teacher_sample_accepts_merged_v2_manifest(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    merged = _merged_manifest_from(manifest)
+    sample = _load_teacher_with_monkeypatch(monkeypatch, merged, payload)
+
+    assert sample.metadata["manifest_format"] == "self_forcing_teacher_manifest_v2_merged"
+
+
+def test_teacher_sample_rejects_unknown_manifest_format(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    manifest["format"] = "self_forcing_teacher_manifest_v2_future"
+
+    with pytest.raises(RuntimeError, match="self_forcing_teacher_manifest_v2_future"):
+        _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
+
+
+def test_teacher_sample_rejects_merged_split_count_mismatch(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    merged = _merged_manifest_from(manifest)
+    merged["generation"]["num_train"] = 0
+
+    with pytest.raises(RuntimeError, match="num_train"):
+        _load_teacher_with_monkeypatch(monkeypatch, merged, payload)
+
+
+def test_teacher_sample_rejects_merged_sample_count_mismatch(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    merged = _merged_manifest_from(manifest)
+    merged["generation"]["num_samples"] = 2
+
+    with pytest.raises(RuntimeError, match="num_samples"):
+        _load_teacher_with_monkeypatch(monkeypatch, merged, payload)
+
+
+def test_teacher_sample_rejects_duplicate_sample_index(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    duplicate = dict(manifest["samples"][0])
+    duplicate["split_index"] = 1
+    manifest["samples"].append(duplicate)
+    manifest["generation"]["num_samples"] = 2
+    manifest["generation"]["num_completed"] = 2
+    manifest["generation"]["num_train"] = 2
+
+    with pytest.raises(RuntimeError, match="duplicate sample_index"):
+        _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
+
+
+def test_teacher_sample_rejects_duplicate_split_index(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    duplicate = dict(manifest["samples"][0])
+    duplicate["sample_index"] = 1
+    manifest["samples"].append(duplicate)
+    manifest["generation"]["num_samples"] = 2
+    manifest["generation"]["num_completed"] = 2
+    manifest["generation"]["num_train"] = 2
+
+    with pytest.raises(RuntimeError, match="duplicate split/split_index"):
+        _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
+
+
+def test_teacher_sample_rejects_shard_writer_format_mismatch(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    manifest["writer_format"] = "wrong_writer"
+
+    with pytest.raises(RuntimeError, match="writer_format"):
+        _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
 
 
 def test_teacher_sample_rejects_payload_num_frames_manifest_mismatch(monkeypatch) -> None:

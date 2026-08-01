@@ -25,6 +25,11 @@ M3_DEPTH_WEIGHTS = (0.5, 0.2, 0.1)
 M3_MIN_LATENT_FRAMES = 15
 
 M3_TEACHER_MANIFEST_FORMAT = "self_forcing_teacher_manifest_v2"
+M3_TEACHER_MERGED_MANIFEST_FORMAT = "self_forcing_teacher_manifest_v2_merged"
+M3_TEACHER_MANIFEST_FORMATS = (
+    M3_TEACHER_MANIFEST_FORMAT,
+    M3_TEACHER_MERGED_MANIFEST_FORMAT,
+)
 M3_TEACHER_PAYLOAD_FORMAT = "self_forcing_teacher_v1"
 M3_REFERENCE_CHECKPOINT_SHA256 = (
     "a0413986d9734e02c09504e1520f5697"
@@ -69,6 +74,7 @@ M3_PARAMETER_GROUP_NAMES = (
 )
 
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -358,26 +364,243 @@ def load_m3_teacher_sample(
 
 
 def _validate_teacher_manifest(manifest: Mapping[str, Any]) -> None:
+    manifest_format = str(manifest.get("format"))
+    if manifest_format not in M3_TEACHER_MANIFEST_FORMATS:
+        raise RuntimeError(
+            "unsupported teacher manifest format "
+            f"{manifest_format!r}; expected one of {M3_TEACHER_MANIFEST_FORMATS}"
+        )
+    generation, samples = _validate_teacher_manifest_common(
+        manifest,
+        manifest_format=manifest_format,
+    )
+    if manifest_format == M3_TEACHER_MANIFEST_FORMAT:
+        _validate_teacher_shard_manifest(
+            manifest,
+            generation=generation,
+            samples=samples,
+            manifest_format=manifest_format,
+        )
+        return
+    if manifest_format == M3_TEACHER_MERGED_MANIFEST_FORMAT:
+        _validate_teacher_merged_manifest(
+            manifest,
+            generation=generation,
+            samples=samples,
+            manifest_format=manifest_format,
+        )
+        return
+    raise AssertionError("unreachable manifest format branch")
+
+
+def _validate_teacher_manifest_common(
+    manifest: Mapping[str, Any],
+    *,
+    manifest_format: str,
+) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
     if manifest.get("status") != "PASS":
-        raise RuntimeError("teacher manifest is not PASS")
-    if manifest.get("format") != M3_TEACHER_MANIFEST_FORMAT:
-        raise RuntimeError("teacher manifest format is not the formal v2 format")
+        raise RuntimeError(f"teacher manifest {manifest_format} is not PASS")
     generation = manifest.get("generation")
     if not isinstance(generation, Mapping):
-        raise RuntimeError("teacher manifest has no generation block")
-    if int(generation.get("num_train", -1)) != 2048:
-        raise RuntimeError("teacher manifest train sample count is not 2048")
-    if int(generation.get("num_validation", -1)) != 256:
-        raise RuntimeError("teacher manifest validation sample count is not 256")
-    if int(generation.get("num_frames", -1)) < M3_MIN_LATENT_FRAMES:
-        raise RuntimeError("teacher manifest has fewer than 15 latent frames")
-    if int(generation.get("num_frame_per_block", -1)) != M3_CHUNK_FRAMES:
-        raise RuntimeError("teacher manifest chunk_frames is not 3")
-    if int(generation.get("mcp_depth", -1)) != len(M3_DEPTHS):
-        raise RuntimeError("teacher manifest mcp_depth is not 3")
+        raise RuntimeError(f"teacher manifest {manifest_format} has no generation block")
+    checkpoint = manifest.get("checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError(f"teacher manifest {manifest_format} has no checkpoint block")
     samples = manifest.get("samples")
-    if not isinstance(samples, list) or not samples:
-        raise RuntimeError("teacher manifest has no samples list")
+    if not isinstance(samples, list):
+        raise RuntimeError(f"teacher manifest {manifest_format} has no samples list")
+
+    sample_count = len(samples)
+    num_samples = _manifest_int(
+        generation,
+        "num_samples",
+        manifest_format=manifest_format,
+    )
+    num_completed = _manifest_int(
+        generation,
+        "num_completed",
+        manifest_format=manifest_format,
+    )
+    if num_samples != sample_count:
+        raise RuntimeError(
+            "teacher manifest "
+            f"{manifest_format} generation.num_samples={num_samples} "
+            f"differs from len(samples)={sample_count}"
+        )
+    if num_completed != sample_count:
+        raise RuntimeError(
+            "teacher manifest "
+            f"{manifest_format} generation.num_completed={num_completed} "
+            f"differs from len(samples)={sample_count}"
+        )
+    num_frames = _manifest_int(
+        generation,
+        "num_frames",
+        manifest_format=manifest_format,
+    )
+    if num_frames <= 0:
+        raise RuntimeError(f"teacher manifest {manifest_format} num_frames must be positive")
+    chunk_frames = _manifest_int(
+        generation,
+        "num_frame_per_block",
+        manifest_format=manifest_format,
+    )
+    if chunk_frames != M3_CHUNK_FRAMES:
+        raise RuntimeError(f"teacher manifest {manifest_format} chunk_frames is not 3")
+    if num_frames % chunk_frames != 0:
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} num_frames is not chunk-aligned"
+        )
+    checkpoint_sha = str(checkpoint.get("sha256", ""))
+    if not _SHA256_RE.fullmatch(checkpoint_sha):
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} checkpoint.sha256 is not a 64-char hex SHA256"
+        )
+
+    sample_indices = []
+    split_identities = []
+    allowed_splits = {"train", "validation", "reserve"}
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, Mapping):
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} sample {index} is not a mapping"
+            )
+        missing = {"sample_index", "split", "split_index", "status"} - sample.keys()
+        if missing:
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} sample {index} "
+                f"missing fields: {sorted(missing)}"
+            )
+        if sample.get("status") != "GENERATED":
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} sample {index} status is not GENERATED"
+            )
+        split = str(sample.get("split"))
+        if split not in allowed_splits:
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} sample {index} has invalid split {split!r}"
+            )
+        try:
+            sample_index = int(sample["sample_index"])
+            split_index = int(sample["split_index"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} sample {index} "
+                "sample_index/split_index must be integers"
+            ) from exc
+        sample_indices.append(sample_index)
+        split_identities.append((split, split_index))
+    if len(sample_indices) != len(set(sample_indices)):
+        raise RuntimeError(f"teacher manifest {manifest_format} has duplicate sample_index")
+    if len(split_identities) != len(set(split_identities)):
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} has duplicate split/split_index"
+        )
+    return generation, [dict(sample) for sample in samples]
+
+
+def _manifest_int(
+    mapping: Mapping[str, Any],
+    field: str,
+    *,
+    manifest_format: str,
+) -> int:
+    try:
+        return int(mapping[field])
+    except KeyError as exc:
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} missing generation.{field}"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} generation.{field} must be an integer"
+        ) from exc
+
+
+def _split_counts(samples: list[Mapping[str, Any]]) -> dict[str, int]:
+    counts = {"train": 0, "validation": 0, "reserve": 0}
+    for sample in samples:
+        counts[str(sample["split"])] += 1
+    return counts
+
+
+def _validate_generation_split_counts(
+    generation: Mapping[str, Any],
+    samples: list[Mapping[str, Any]],
+    *,
+    manifest_format: str,
+) -> dict[str, int]:
+    counts = _split_counts(samples)
+    expected_fields = {
+        "train": "num_train",
+        "validation": "num_validation",
+        "reserve": "num_reserve",
+    }
+    for split, field in expected_fields.items():
+        generation_count = _manifest_int(
+            generation,
+            field,
+            manifest_format=manifest_format,
+        )
+        if generation_count != counts[split]:
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} {field}={generation_count} "
+                f"differs from counted {split} samples={counts[split]}"
+            )
+    if sum(counts.values()) != len(samples):
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} split counts do not sum to len(samples)"
+        )
+    return counts
+
+
+def _validate_teacher_shard_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    generation: Mapping[str, Any],
+    samples: list[Mapping[str, Any]],
+    manifest_format: str,
+) -> None:
+    if manifest.get("writer_format") != "e0208_teacher_writer_v1":
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} writer_format is not e0208_teacher_writer_v1"
+        )
+    writer_git_head = str(manifest.get("writer_git_head", ""))
+    if not _GIT_SHA_RE.fullmatch(writer_git_head):
+        raise RuntimeError(
+            f"teacher manifest {manifest_format} writer_git_head is not a 40-char Git SHA"
+        )
+    _validate_generation_split_counts(
+        generation,
+        samples,
+        manifest_format=manifest_format,
+    )
+    if _manifest_int(generation, "mcp_depth", manifest_format=manifest_format) != len(M3_DEPTHS):
+        raise RuntimeError(f"teacher manifest {manifest_format} mcp_depth is not 3")
+
+
+def _validate_teacher_merged_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    generation: Mapping[str, Any],
+    samples: list[Mapping[str, Any]],
+    manifest_format: str,
+) -> None:
+    shards = manifest.get("shards")
+    if not isinstance(shards, list) or not shards:
+        raise RuntimeError(f"teacher manifest {manifest_format} has no shards list")
+    for index, shard in enumerate(shards):
+        if not isinstance(shard, Mapping):
+            raise RuntimeError(
+                f"teacher manifest {manifest_format} shard {index} is not a mapping"
+            )
+    _validate_generation_split_counts(
+        generation,
+        samples,
+        manifest_format=manifest_format,
+    )
+    if _manifest_int(generation, "mcp_depth", manifest_format=manifest_format) != len(M3_DEPTHS):
+        raise RuntimeError(f"teacher manifest {manifest_format} mcp_depth is not 3")
 
 
 def select_manifest_record(

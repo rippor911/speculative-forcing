@@ -1,27 +1,22 @@
 # SPEC.md — Self-Forcing MCP Next-Forcing 视频生成加速项目规范
 
-> 状态：Canonical / 项目唯一主线规范  
-> 适用仓库：`rippor911/speculative-forcing`  
-> 集成基线：`feat/speculative-mcp-adapter @ a5c8270`  
-> 当前实现阶段：Milestone F2 complete / F3 next
-> 研究目标：以 Self-Forcing + MCP/Next-Forcing 为基础，实现可插拔 verifier 的视频 speculative decoding 框架，并验证质量—速度折中  
-> 论文目标：面向 CVPR 2027 的研究原型与实验体系  
-> 最高优先级约束：**任何开发任务都必须直接服务于主线，不得为了通用性、抽象完整性或测试数量而脱离研究目标。**
+> 主线声明：当前项目主线为 NF-SF v1。与 NF-SF v1 冲突的旧 verifier/speculative-first 表述均视为历史背景，不作为当前施工依据。
+> 锁定计划：`docs/NF_SF_V1_LOCKED_PLAN.md`。
+> 当前实现阶段：NF-SF v1 specification lock / M1 next
+> 冻结资产：`inference_mcp.py`、speculative controller state machine、longest-prefix acceptance、first-rejection、same-noise fallback、transaction/rollback、commit ordering、KV index validation、trace 基本结构。
+> 当前唯一下一步：M1 纯 CPU tensor tests，仅包括 `chunk_frames` 参数化、next1/2/3 shift、independent noise、independent timestep、valid mask、`s_main`/`s_mcp` 采样接口。
+>
+> 详细架构、数据流、参数范围、loss、M2/M3/M6 边界和施工里程碑只维护在锁定计划中。以下旧 F1-F7/speculative runtime 内容仅保留为历史和已验证资产。
 
 ---
 
-## 0. 本规范的地位
+## 0. 历史内容说明
 
-本文件是项目后续设计、实现、审查、实验和 Git 操作的统一基准。
+本节以下内容保留为 speculative runtime 的历史设计、已验证资产和 provenance。
+当前唯一主线、阶段边界和下一步任务以本文顶部 NF-SF v1 声明及
+`docs/NF_SF_V1_LOCKED_PLAN.md` 为准。
 
-任何新任务开始前，都必须先回答：
-
-> 这项工作是否直接服务于  
-> `MCP draft → verifier → acceptance policy → longest-prefix controller → fallback/commit → 质量与加速实验`？
-
-如果不能直接映射到这条链路，且不是让该链路闭环运行所必需的工作，则默认不做。
-
-本规范优先级高于临时讨论、一次性建议和局部实现偏好。若后续需要修改主线、里程碑或架构边界，必须先更新本文件，再继续编码。
+旧 F1-F7 verifier/speculative runtime 内容不得被解释为当前 M1 施工范围。
 
 ---
 
@@ -622,7 +617,7 @@ ImageReward、VAE verifier、新 verifier、mcp_depth 2/3 真实 smoke、
 
 # 7. 后续里程碑
 
-后续里程碑以“先补齐可插拔 framework，再接真实模型，再做 verifier”为主线。
+以下 F1-F7 speculative runtime 里程碑保留为历史上下文和已验证控制框架说明；当前施工主线以本文顶部的 NF-SF v1 M0-M7 为准。第一阶段不继续横向扩展 verifier framework。
 
 ## Milestone F1：可插拔 verifier framework
 
@@ -901,29 +896,31 @@ threshold: null
 
 当前唯一下一阶段：
 
-> **Milestone F3：`inference_speculative.py` + scripted GPU parity。**
+> **NF-SF v1 M1：纯 CPU tensor 数据构造。**
 
-F3 第一阶段目标：
+M1 只包括：
 
-- 新增独立 `inference_speculative.py`；
-- 先验证 scripted policies：`always_accept`、`always_reject`、
-  `reject_at_depth`；
-- 以 `inference_mcp.py` 为 frozen MCP reference oracle；
-- 不在 F3 开始时接 ImageReward、VAE verifier 或新 verifier；
-- 不声明质量等价、推理加速或性能收益。
+- `chunk_frames` 参数化；
+- next1/2/3 shift；
+- independent noise；
+- independent timestep；
+- valid mask；
+- `s_main` / `s_mcp` 采样接口；
+- 纯 CPU tensor tests。
 
 本阶段不得直接跳到：
 
-- VAE；
-- ImageReward；
-- learned verifier；
-- 大规模实验；
-- local rolling；
-- 阈值标定；
-- 继续横向扩展 verifier framework。
+- 真实模型训练；
+- 正式并行推理；
+- verifier / ImageReward；
+- accept/reject routing；
+- refinement；
+- DMD；
+- self-rollout；
+- direct clean-history attention；
+- 16k 数据生成。
 
-F3 完成 scripted parity 后，才进入后续 VAE transaction / ImageReward /
-verifier baseline 工作。
+M1 通过后，才进入 M2 真实模型 forward 与 Frozen/Joint 梯度路径检查。
 
 ---
 
@@ -1344,35 +1341,44 @@ Formal quality-speed experiments             未完成
 
 # 18. 下一步任务边界
 
-下一任务只能做 Milestone F3。
+下一任务只能做 NF-SF v1 M1。
 
 允许：
 
-- 新增独立 `inference_speculative.py`；
-- 接入已经完成的 `SelfForcingWanMCPBackend` 和 `SelfForcingMCPRuntime`；
-- 先验证 scripted policies：`always_accept`、`always_reject`、
-  `reject_at_depth`；
-- 与 frozen `inference_mcp.py` 做 scripted GPU parity；
-- 记录 anchor/draft/fallback/commit trace；
-- 保持 longest-prefix、same-noise fallback、runtime transaction 语义不变。
+- `chunk_frames` 参数化；
+- next1/2/3 shift；
+- independent noise；
+- independent timestep；
+- valid mask；
+- `s_main` / `s_mcp` 采样接口；
+- 纯 CPU tensor tests；
+- 保持 `inference_mcp.py` 和 speculative runtime 控制语义冻结。
 
 禁止：
 
+- 实现 main + depth1/2/3 Flow Matching loss；
+- 实现 Frozen/Joint 参数开关；
+- 真实模型 forward；
+- 梯度检查；
+- 设计或实现 M3 训练入口；
 - 修改 `inference_mcp.py`；
 - 修改 frozen controller semantics；
 - 修改 runtime transaction；
 - 修改 Wan planner；
 - 修改 F2 backend ownership 边界；
-- 接 VAE；
-- 接 ImageReward；
+- 接 VAE / ImageReward；
+- 实现 accept/reject routing；
 - 实现 learned verifier；
 - 扩展 local rolling；
 - 继续扩展 F1 verifier framework；
+- 启动大规模训练；
+- 生成 16k 数据；
+- 实现正式并行推理；
+- 加入 DMD、refinement、self-rollout 或 direct history attention；
 - 声明质量等价、推理加速或性能收益；
 - commit/push/merge，除非审查后明确授权。
 
-完成 F3 scripted parity 后，再进入 VAE transaction / ImageReward /
-verifier baseline，不再横向扩展 framework。
+M1 验收后再进入 M2；不得在 M1 中预做 M2/M3 施工。
 
 ---
 
@@ -1427,4 +1433,4 @@ Backward compatibility:
 
 ## 一句话主线
 
-> **用 Self-Forcing backbone + MCP heads 实现 Next-Forcing 风格的多 chunk draft，通过可插拔 verifier 和 longest-prefix speculative controller 决定接受或 same-noise target fallback，最终研究新的视频 block verifier 与质量—速度折中。**
+> **用 Self-Forcing Wan backbone + MCP-1/2/3 做 Next-Forcing-style shifted future Flow Matching 联合训练，先验证 all-accept depth-1 并行多步去噪能否生成清晰连续的 next chunk，再决定是否加入 verifier、DMD、refinement 或更完整的 speculative routing。**

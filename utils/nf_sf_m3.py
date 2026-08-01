@@ -144,10 +144,6 @@ def tensor_sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
 
 
-def prompt_sha256(prompt: str) -> str:
-    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-
-
 def tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
     value = tensor.detach().float()
     return {
@@ -315,7 +311,11 @@ def load_m3_teacher_sample(
         "prompt": str(payload["prompt"]),
         "prompt_field": "prompt",
         "prompt_sha256": str(payload["prompt_sha256"]),
-        "actual_prompt_sha256": prompt_sha256(str(payload["prompt"])),
+        "normalized_prompt_sha256": str(payload["prompt_sha256"]),
+        "prompt_sha256_semantics": (
+            "upstream prompt plan normalized_sha256 stored under historical "
+            "field name prompt_sha256"
+        ),
         "seed": int(payload["seed"]),
         "noise_seed": int(payload["noise_seed"]),
         "rollout_seed": int(payload["rollout_seed"]),
@@ -723,17 +723,22 @@ def _validate_teacher_payload(
         raise KeyError(f"teacher payload missing fields: {sorted(missing)}")
     if payload["format"] != M3_TEACHER_PAYLOAD_FORMAT:
         raise RuntimeError("teacher payload format is not self_forcing_teacher_v1")
-    for key in ("sample_index", "split", "split_index", "prompt", "prompt_sha256"):
+    for key in ("sample_index", "split", "split_index"):
         if payload.get(key) != record.get(key):
             raise RuntimeError(f"teacher payload field {key!r} differs from manifest")
+    if payload.get("prompt") != record.get("prompt"):
+        raise RuntimeError("teacher payload prompt differs from manifest prompt")
+    payload_prompt_sha = str(payload["prompt_sha256"])
+    record_prompt_sha = str(record.get("prompt_sha256", ""))
+    if payload_prompt_sha != record_prompt_sha:
+        raise RuntimeError(
+            "teacher payload prompt_sha256 differs from manifest prompt_sha256"
+        )
+    if not _SHA256_RE.fullmatch(payload_prompt_sha):
+        raise RuntimeError("teacher payload prompt_sha256 is not a valid SHA256 string")
     generation = manifest.get("generation", {})
     if int(payload["num_frames"]) != int(generation.get("num_frames", -1)):
         raise RuntimeError("teacher payload num_frames differs from manifest")
-    actual_prompt_sha = prompt_sha256(str(payload["prompt"]))
-    if actual_prompt_sha != str(payload["prompt_sha256"]):
-        raise RuntimeError("teacher payload prompt_sha256 differs from prompt text")
-    if actual_prompt_sha != str(record.get("prompt_sha256")):
-        raise RuntimeError("teacher manifest prompt_sha256 differs from prompt text")
     manifest_checkpoint_sha = manifest.get("checkpoint", {}).get("sha256")
     if payload.get("backbone_sha256") != manifest_checkpoint_sha:
         raise RuntimeError("teacher payload backbone SHA differs from manifest")

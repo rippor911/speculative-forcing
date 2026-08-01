@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -17,7 +18,6 @@ from utils.nf_sf_m3 import (
     load_m3_teacher_sample,
     make_m3_checkpoint_payload,
     make_m3_probe,
-    prompt_sha256,
     reconstruct_main_current,
     reconstruct_mcp1_next,
     resolve_m3_solver_schedule,
@@ -38,6 +38,7 @@ from utils.scheduler import FlowMatchScheduler
 
 
 TEST_GIT_SHA = "a" * 40
+NORMALIZED_PROMPT_SHA256 = "b" * 64
 
 
 def _scheduler(shift: float) -> FlowMatchScheduler:
@@ -60,7 +61,6 @@ def _teacher_manifest_and_payload(*, num_frames: int = 15):
     ).to(torch.bfloat16)
     source = (target.float() + 100.0).to(torch.bfloat16)
     prompt = "a test prompt"
-    prompt_hash = prompt_sha256(prompt)
     payload = {
         "format": "self_forcing_teacher_v1",
         "sample_index": 0,
@@ -71,7 +71,7 @@ def _teacher_manifest_and_payload(*, num_frames: int = 15):
         "shard_id": 0,
         "plan_index": 0,
         "prompt": prompt,
-        "prompt_sha256": prompt_hash,
+        "prompt_sha256": NORMALIZED_PROMPT_SHA256,
         "seed": 1000000,
         "noise_seed": 1000000,
         "rollout_seed": 1000000,
@@ -122,7 +122,7 @@ def _teacher_manifest_and_payload(*, num_frames: int = 15):
                 "file": "/dataset/teacher_train_000000.pt",
                 "file_sha256": "payload-file-sha",
                 "prompt": prompt,
-                "prompt_sha256": prompt_hash,
+                "prompt_sha256": NORMALIZED_PROMPT_SHA256,
                 "target_latent": tensor_summary(target),
                 "source_noise": tensor_summary(source),
             }
@@ -280,7 +280,8 @@ def test_teacher_sample_audit_reads_manifest_payload_and_metadata(monkeypatch) -
     assert sample.metadata["sample_index"] == 0
     assert sample.metadata["sample_id"] == "sample-train-0"
     assert sample.metadata["prompt"] == "a test prompt"
-    assert sample.metadata["actual_prompt_sha256"] == prompt_sha256("a test prompt")
+    assert sample.metadata["normalized_prompt_sha256"] == NORMALIZED_PROMPT_SHA256
+    assert hashlib.sha256(b"a test prompt").hexdigest() != NORMALIZED_PROMPT_SHA256
     assert sample.metadata["latent_layout"] == "[B, F, C, H, W]"
     assert sample.metadata["latent_dtype"] == "torch.bfloat16"
     assert sample.metadata["latent_frame_count"] == 15
@@ -380,12 +381,31 @@ def test_teacher_sample_rejects_source_target_shape_mismatch(monkeypatch) -> Non
         _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
 
 
-def test_teacher_sample_rejects_prompt_sha_mismatch(monkeypatch) -> None:
+def test_teacher_sample_rejects_payload_manifest_prompt_mismatch(monkeypatch) -> None:
     manifest, payload = _teacher_manifest_and_payload()
-    payload["prompt_sha256"] = "bad"
-    manifest["samples"][0]["prompt_sha256"] = "bad"
+    payload["prompt"] = "a different prompt"
 
-    with pytest.raises(RuntimeError, match="prompt_sha256"):
+    with pytest.raises(RuntimeError, match="payload prompt differs from manifest prompt"):
+        _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
+
+
+def test_teacher_sample_rejects_payload_manifest_prompt_sha_mismatch(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    payload["prompt_sha256"] = "c" * 64
+
+    with pytest.raises(
+        RuntimeError,
+        match="prompt_sha256 differs from manifest prompt_sha256",
+    ):
+        _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
+
+
+def test_teacher_sample_rejects_invalid_prompt_sha(monkeypatch) -> None:
+    manifest, payload = _teacher_manifest_and_payload()
+    payload["prompt_sha256"] = "not-a-sha256"
+    manifest["samples"][0]["prompt_sha256"] = "not-a-sha256"
+
+    with pytest.raises(RuntimeError, match="prompt_sha256 is not a valid SHA256"):
         _load_teacher_with_monkeypatch(monkeypatch, manifest, payload)
 
 

@@ -1,0 +1,347 @@
+{
+  "status": "PASS",
+  "experiment": "E0208C_teacher_rollout_formal",
+  "train_count": 2048,
+  "validation_count": 256,
+  "total_count": 2304,
+  "shard_size": 64,
+  "num_shards": 36,
+  "train_shards": 32,
+  "validation_shards": 4,
+  "source_files": {
+    "train": {
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208B_prompt_split/train_records.jsonl",
+      "sha256": "43a8a144f657b76e4f03efd9e9fe1fa35db77ea1cd10a5b52a69bb5af9deabbc"
+    },
+    "validation": {
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208B_prompt_split/validation_records.jsonl",
+      "sha256": "7de087bcb262de88b97a8797f852be9f32cd052ba6535d3ec6ead03c0275aea5"
+    }
+  },
+  "shards": [
+    {
+      "shard_id": 0,
+      "split": "train",
+      "split_index_start": 0,
+      "split_index_end": 63,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_000.jsonl",
+      "sha256": "aa90dc6cfa75a993964956cc14186ce99a0197fca8fe1c39e1b8edebf8c047b1"
+    },
+    {
+      "shard_id": 1,
+      "split": "train",
+      "split_index_start": 64,
+      "split_index_end": 127,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_001.jsonl",
+      "sha256": "9052fb78996674be2f28f9012a135348ad2a446032eb7c14de2f234dce6d9d5a"
+    },
+    {
+      "shard_id": 2,
+      "split": "train",
+      "split_index_start": 128,
+      "split_index_end": 191,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_002.jsonl",
+      "sha256": "dc4e9f27d6256dae1d7ada709f0f481fd37aa188a48bae0c87b99286a9a4b5d2"
+    },
+    {
+      "shard_id": 3,
+      "split": "train",
+      "split_index_start": 192,
+      "split_index_end": 255,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_003.jsonl",
+      "sha256": "e62e82647b259b2384126cf039bafa0cc2bd68241949f673d85dbe6401b918b8"
+    },
+    {
+      "shard_id": 4,
+      "split": "train",
+      "split_index_start": 256,
+      "split_index_end": 319,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_004.jsonl",
+      "sha256": "45bdc8e305a63ef893d9dde2bc820ec2165569c61f2dc8545a0899f4624d6c2a"
+    },
+    {
+      "shard_id": 5,
+      "split": "train",
+      "split_index_start": 320,
+      "split_index_end": 383,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_005.jsonl",
+      "sha256": "6432d976f60a8f329ce1faf3d5afb13dddabbef1adca48c9a35d5b5a4f2ca434"
+    },
+    {
+      "shard_id": 6,
+      "split": "train",
+      "split_index_start": 384,
+      "split_index_end": 447,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_006.jsonl",
+      "sha256": "5055ec943055b5a29ffbf165ebe089a93e5c33d5d8b1a73c4d940d0f5d093f8c"
+    },
+    {
+      "shard_id": 7,
+      "split": "train",
+      "split_index_start": 448,
+      "split_index_end": 511,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_007.jsonl",
+      "sha256": "e77bf618a218e2168da5d286845dbe3663f11b5fdcf256bb867909edbeff36fc"
+    },
+    {
+      "shard_id": 8,
+      "split": "train",
+      "split_index_start": 512,
+      "split_index_end": 575,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_008.jsonl",
+      "sha256": "a3b56fcf18ddd581b94c4f45939816a55f14b568f8989fac404d5213bfc6c9a5"
+    },
+    {
+      "shard_id": 9,
+      "split": "train",
+      "split_index_start": 576,
+      "split_index_end": 639,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_009.jsonl",
+      "sha256": "aba942d254ba4d84a7bd4ac2380dab685c986ee686c1904029c95f5f921049a2"
+    },
+    {
+      "shard_id": 10,
+      "split": "train",
+      "split_index_start": 640,
+      "split_index_end": 703,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_010.jsonl",
+      "sha256": "91020ee0e44c7bd0e5ffd75adc1b0e1c1b8d55de826dd4eb1e0482a79fc7469e"
+    },
+    {
+      "shard_id": 11,
+      "split": "train",
+      "split_index_start": 704,
+      "split_index_end": 767,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_011.jsonl",
+      "sha256": "dfdf0f0e1a574831516e3e94a60961dc61f05fcd36bb9b1995c22cb427f99e97"
+    },
+    {
+      "shard_id": 12,
+      "split": "train",
+      "split_index_start": 768,
+      "split_index_end": 831,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_012.jsonl",
+      "sha256": "3431c5490b7e4cfde3cee99e3a963bfa40bee81a5e006fd1a19df2daf0eed514"
+    },
+    {
+      "shard_id": 13,
+      "split": "train",
+      "split_index_start": 832,
+      "split_index_end": 895,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_013.jsonl",
+      "sha256": "9abb0778f12acdb3178dfec304a5115fb8e24cf4419e6183a4bb0fcf23ce5888"
+    },
+    {
+      "shard_id": 14,
+      "split": "train",
+      "split_index_start": 896,
+      "split_index_end": 959,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_014.jsonl",
+      "sha256": "d7fe7b31e78861971a684954bcad4cec711beb4b0ce74ec806cf698e3c46abfb"
+    },
+    {
+      "shard_id": 15,
+      "split": "train",
+      "split_index_start": 960,
+      "split_index_end": 1023,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_015.jsonl",
+      "sha256": "2ca4b4d0ef8d6221bc436cd3d3ba2a1da0befcefcc64ae1afe4c1981f6aa9880"
+    },
+    {
+      "shard_id": 16,
+      "split": "train",
+      "split_index_start": 1024,
+      "split_index_end": 1087,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_016.jsonl",
+      "sha256": "faafe964f8c910a79db5b6a3a13dc50268ff5908f9ed8788538bd0d953b2273b"
+    },
+    {
+      "shard_id": 17,
+      "split": "train",
+      "split_index_start": 1088,
+      "split_index_end": 1151,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_017.jsonl",
+      "sha256": "4180ce023ba65c92a35b09d5a5c2449db3a67bf9aec61b5368c64d52894eb829"
+    },
+    {
+      "shard_id": 18,
+      "split": "train",
+      "split_index_start": 1152,
+      "split_index_end": 1215,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_018.jsonl",
+      "sha256": "793d641b8a1c33a52ed9c89c26f91adc43ea2323cb69a0993a5149391572bf46"
+    },
+    {
+      "shard_id": 19,
+      "split": "train",
+      "split_index_start": 1216,
+      "split_index_end": 1279,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_019.jsonl",
+      "sha256": "862f52945a8246eae938a6f071497032419c61f9ab355390c32a77f2722a8c9d"
+    },
+    {
+      "shard_id": 20,
+      "split": "train",
+      "split_index_start": 1280,
+      "split_index_end": 1343,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_020.jsonl",
+      "sha256": "ba90aecf30e117a088019f3e8499a8bcce1157fa9a6b33d35e0b008815ae9d13"
+    },
+    {
+      "shard_id": 21,
+      "split": "train",
+      "split_index_start": 1344,
+      "split_index_end": 1407,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_021.jsonl",
+      "sha256": "1d677aadb2b55525674820024ce4fecb6c75af118981d2508254bc065ca3451c"
+    },
+    {
+      "shard_id": 22,
+      "split": "train",
+      "split_index_start": 1408,
+      "split_index_end": 1471,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_022.jsonl",
+      "sha256": "d697f2c44b735fbb7c0c79655ccdb7ea80ef1d1d5f62a888d50d9af22e722f5d"
+    },
+    {
+      "shard_id": 23,
+      "split": "train",
+      "split_index_start": 1472,
+      "split_index_end": 1535,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_023.jsonl",
+      "sha256": "af2c3d23b4f6060e844cfe9a70e4e418eab3d3619841e44a7f08899cda38c9ee"
+    },
+    {
+      "shard_id": 24,
+      "split": "train",
+      "split_index_start": 1536,
+      "split_index_end": 1599,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_024.jsonl",
+      "sha256": "b61c07c2bfe70b5bb8c8ac9bb0f7ec310ebad767ee26ff65be6680e76ff45cdd"
+    },
+    {
+      "shard_id": 25,
+      "split": "train",
+      "split_index_start": 1600,
+      "split_index_end": 1663,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_025.jsonl",
+      "sha256": "fd5504d1848547375a2fc710a9228aa47c44483d43124cfda95b2c94e7b9fd14"
+    },
+    {
+      "shard_id": 26,
+      "split": "train",
+      "split_index_start": 1664,
+      "split_index_end": 1727,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_026.jsonl",
+      "sha256": "8ab2dfa85a1cc8d2c15c16a41da561f3432c1dd9220b279b6cecfb703d598b7e"
+    },
+    {
+      "shard_id": 27,
+      "split": "train",
+      "split_index_start": 1728,
+      "split_index_end": 1791,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_027.jsonl",
+      "sha256": "4f72fefee43d9eafa6ea9f4dc89200c917a37457923182b364007c1cafc5fc6a"
+    },
+    {
+      "shard_id": 28,
+      "split": "train",
+      "split_index_start": 1792,
+      "split_index_end": 1855,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_028.jsonl",
+      "sha256": "a60c199ed5f61c09713295b1e2af835dd0ad281af2f26adf3244e9eb7888d1a2"
+    },
+    {
+      "shard_id": 29,
+      "split": "train",
+      "split_index_start": 1856,
+      "split_index_end": 1919,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_029.jsonl",
+      "sha256": "a4e32980dc54f02e438db084a1179dcba4183defb8c0937143897c42d8002eb9"
+    },
+    {
+      "shard_id": 30,
+      "split": "train",
+      "split_index_start": 1920,
+      "split_index_end": 1983,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_030.jsonl",
+      "sha256": "50ff414d87e11f51586cb5320756655f59f9fb441e44be0b9b28783b13930b9e"
+    },
+    {
+      "shard_id": 31,
+      "split": "train",
+      "split_index_start": 1984,
+      "split_index_end": 2047,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_031.jsonl",
+      "sha256": "37f593de2fc185559721c63c2d98c7f8bac7344795f99679a756f0185a4c83fc"
+    },
+    {
+      "shard_id": 32,
+      "split": "validation",
+      "split_index_start": 0,
+      "split_index_end": 63,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_032.jsonl",
+      "sha256": "b659d42abb9239ed6c1f7fa5f1aa7eb993dff8208f5935a344beadeeb29018d5"
+    },
+    {
+      "shard_id": 33,
+      "split": "validation",
+      "split_index_start": 64,
+      "split_index_end": 127,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_033.jsonl",
+      "sha256": "eed11cf7ceca4b1c3be8be4bb286b7ee9edff1e1a9bb5bf7abd001a91cb6bc70"
+    },
+    {
+      "shard_id": 34,
+      "split": "validation",
+      "split_index_start": 128,
+      "split_index_end": 191,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_034.jsonl",
+      "sha256": "fcdc313b4e3d29c8b4ad6c9fdaec18a4717d2d58c4b0319fe41a91faa332f7c8"
+    },
+    {
+      "shard_id": 35,
+      "split": "validation",
+      "split_index_start": 192,
+      "split_index_end": 255,
+      "count": 64,
+      "path": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/plans/shard_035.jsonl",
+      "sha256": "165c24a94293d823979b1e27805fe1262565ec132b8420b166cbd9c63202ddba"
+    }
+  ]
+}

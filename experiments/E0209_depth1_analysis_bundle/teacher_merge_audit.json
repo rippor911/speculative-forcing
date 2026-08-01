@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "manifest": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/manifest.json",
+  "manifest_sha256": "6abcb2617c08d0ccf864a361594eeef7d083ac2a4067d8a2d72950f3fad00ea7",
+  "num_samples": 2304,
+  "split_counts": {
+    "train": 2048,
+    "validation": 256
+  },
+  "num_shards": 36,
+  "all_file_hashes_valid": true,
+  "checkpoint_sha256": "a0413986d9734e02c09504e1520f5697ba6df731bb2f0f35577485e9cc8f56a3"
+}

@@ -1,0 +1,20 @@
+]633;E;echo "===== HEAD =====";51ea74f1-094b-45a8-9af1-6ffe02bebc64]633;C===== HEAD =====
+0526d399031bbed0a886a013df6c0ddfeac2be2f
+
+===== BRANCH =====
+fix/dmd-training-controls
+
+===== STATUS =====
+ M .gitignore
+ M trainer/distillation.py
+?? 0
+?? 0:
+?? prompts/vidprom_filtered_extended.txt
+
+===== CHECKPOINT FILES =====
+-rw-r--r-- 1 batchcom batchcom 783M Aug  1 02:19 experiments/E0209_depth1_formal_training/mcp_depth1_best.pt
+-rw-r--r-- 1 batchcom batchcom 1.3G Aug  1 02:19 experiments/E0209_depth1_formal_training/mcp_depth1_final.pt
+
+===== CHECKPOINT SHA256 =====
+15ac461d42c033d8c9bb9582c836b2a87a914c02d4e02c4cf6781ef54e988980  experiments/E0209_depth1_formal_training/mcp_depth1_best.pt
+b97ca9d4c5f03df400d4457b6736a598d7ddd28fe81555c97135854454b26616  experiments/E0209_depth1_formal_training/mcp_depth1_final.pt

@@ -1,0 +1,42 @@
+{
+  "status": "PASS",
+  "source_script": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0209_depth1_formal_training/train_depth1_formal_impl.py",
+  "source_sha256": "c03cfc517b2a0cd96e0fb6cff2f93817ec8ed40d21cc251011ccc72949ddee80",
+  "teacher_manifest": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0208C_teacher_rollout_formal/manifest.json",
+  "teacher_manifest_sha256": "6abcb2617c08d0ccf864a361594eeef7d083ac2a4067d8a2d72950f3fad00ea7",
+  "output_dir": "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0209_depth1_formal_training",
+  "epochs": 3,
+  "schedule_seed": 20260731,
+  "path_changes": {
+    "EXP_DIR": "experiments/E0209_depth1_formal_training -> /home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0209_depth1_formal_training",
+    "BEST_CHECKPOINT_PATH": "experiments/E0207A_depth1_multistate_training/mcp_depth1_best.pt -> experiments/E0209_depth1_formal_training/mcp_depth1_best.pt",
+    "FINAL_CHECKPOINT_PATH": "experiments/E0207A_depth1_multistate_training/mcp_depth1_final.pt -> experiments/E0209_depth1_formal_training/mcp_depth1_final.pt",
+    "REPORT_PATH": "experiments/E0207A_depth1_multistate_training/report.json -> experiments/E0209_depth1_formal_training/report.json"
+  },
+  "dataset_index_changes": {},
+  "schedule": {
+    "original_signature": "(states: 'list[dict]') -> 'list[dict]'",
+    "epochs": 3,
+    "schedule_seed": 20260731,
+    "patched_global_NUM_UPDATES": "256 -> 24576",
+    "desired_updates": 24576,
+    "patched_global_EVAL_EVERY": "16 -> 8192",
+    "patched_global_ORDER_SEED": "20260730 -> 20260731",
+    "num_unique_states": 8192,
+    "num_updates": 24576
+  },
+  "evaluation": {
+    "train_state_count": 8192,
+    "train_probe_state_count": 1024,
+    "validation_state_count": 1024,
+    "validation_uses_full_set": true
+  },
+  "started_unix": 1785460882.8875458,
+  "finished_unix": 1785523933.8483791,
+  "elapsed_seconds": 63050.96083331108,
+  "checkpoints": [
+    "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0209_depth1_formal_training/mcp_depth1_best.pt",
+    "/home/dataset-assist-0/luojy/efficiency/rippor/speculative-forcing/experiments/E0209_depth1_formal_training/mcp_depth1_final.pt"
+  ],
+  "num_checkpoints": 2
+}

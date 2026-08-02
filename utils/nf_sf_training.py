@@ -64,6 +64,12 @@ class NFSFForwardResult:
 
 
 @dataclass(frozen=True)
+class NFSFMCP1GridPointResult:
+    loss: torch.Tensor
+    metadata: dict
+
+
+@dataclass(frozen=True)
 class NFSFParamAudit:
     name: str
     parameter_names: tuple[str, ...]
@@ -186,6 +192,125 @@ def run_nf_sf_forward_loss(
         main_flow_pred=main_flow_pred,
         mcp_flow_preds=tuple(mcp_flow_preds),
         losses=losses,
+    )
+
+
+def run_nf_sf_mcp1_grid_point_loss(
+    generator,
+    *,
+    conditional_dict: dict,
+    state: NFSFSelectedState,
+    scheduler,
+    epsilon_main: torch.Tensor,
+    epsilon_future: torch.Tensor,
+    timestep: torch.Tensor,
+    chunk_frames: int = 3,
+) -> NFSFMCP1GridPointResult:
+    if chunk_frames != 3:
+        raise ValueError("MCP-1 grid auxiliary loss requires chunk_frames=3")
+    if state.clean_history is None:
+        raise ValueError("MCP-1 grid auxiliary loss requires clean history")
+    if len(state.future_targets) < 1:
+        raise ValueError("MCP-1 grid auxiliary loss requires next1 target")
+    current = state.current_target
+    next1 = state.future_targets[0]
+    _validate_chunk_tensor(current, chunk_frames=chunk_frames, name="current_target")
+    _validate_chunk_tensor(next1, chunk_frames=chunk_frames, name="future1")
+    if tuple(next1.shape) != tuple(current.shape):
+        raise ValueError("future1 shape must match current_target")
+    if state.clean_history.ndim != 5 or state.clean_history.shape[1] != chunk_frames:
+        raise ValueError("MCP-1 grid auxiliary loss requires one clean history chunk")
+    if tuple(epsilon_main.shape) != tuple(current.shape):
+        raise ValueError("epsilon_main shape must match current_target")
+    if tuple(epsilon_future.shape) != tuple(next1.shape):
+        raise ValueError("epsilon_future shape must match next1 target")
+    if epsilon_main.dtype != current.dtype:
+        raise ValueError("epsilon_main dtype must match current_target")
+    if epsilon_future.dtype != next1.dtype:
+        raise ValueError("epsilon_future dtype must match next1 target")
+    _ensure_finite_tensor(epsilon_main, name="epsilon_main")
+    _ensure_finite_tensor(epsilon_future, name="epsilon_future")
+
+    timestep_chunk = _expand_timestep_to_chunk(
+        timestep,
+        target=current,
+        name="mcp1_grid_timestep",
+    )
+    noisy_current = _add_noise_like_scheduler(
+        scheduler,
+        current,
+        epsilon_main,
+        timestep_chunk,
+    )
+    noisy_future = _add_noise_like_scheduler(
+        scheduler,
+        next1,
+        epsilon_future,
+        timestep_chunk,
+    )
+    target_flow = _training_target_like_scheduler(
+        scheduler,
+        next1,
+        epsilon_future,
+        timestep_chunk,
+    )
+    _ensure_finite_tensor(noisy_current, name="mcp1_grid_noisy_current")
+    _ensure_finite_tensor(noisy_future, name="mcp1_grid_noisy_future")
+    _ensure_finite_tensor(target_flow, name="mcp1_grid_target_flow")
+
+    current_start = _current_start_frame(state)
+    future_start = current_start + chunk_frames
+    if future_start != 6:
+        raise ValueError("MCP-1 grid auxiliary loss requires future_start_frame=6")
+
+    outputs = generator(
+        noisy_image_or_video=noisy_current,
+        conditional_dict=conditional_dict,
+        timestep=timestep_chunk,
+        clean_x=state.clean_history,
+        aug_t=torch.zeros_like(timestep_chunk),
+        mcp_future_noises=[noisy_future],
+        mcp_future_start_frames=[future_start],
+        mcp_timesteps=[timestep_chunk],
+    )
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 3:
+        raise RuntimeError("MCP-1 grid auxiliary loss expected generator output triple")
+    mcp_outputs = outputs[2]
+    if not isinstance(mcp_outputs, (tuple, list)) or len(mcp_outputs) != 1:
+        count = "non-sequence" if not isinstance(mcp_outputs, (tuple, list)) else len(mcp_outputs)
+        raise RuntimeError(
+            "MCP-1 grid auxiliary loss expected exactly one MCP flow output, "
+            f"got {count}"
+        )
+    flow_pred = mcp_outputs[0]
+    if not torch.is_tensor(flow_pred):
+        raise TypeError("MCP-1 grid auxiliary flow output must be a tensor")
+    if tuple(flow_pred.shape) != tuple(target_flow.shape):
+        raise ValueError(
+            "MCP-1 grid auxiliary flow shape mismatch: "
+            f"{tuple(flow_pred.shape)} != {tuple(target_flow.shape)}"
+        )
+    if flow_pred.dtype != target_flow.dtype:
+        raise ValueError(
+            "MCP-1 grid auxiliary flow dtype mismatch: "
+            f"{flow_pred.dtype} != {target_flow.dtype}"
+        )
+    _ensure_finite_tensor(flow_pred, name="mcp1_grid_flow_pred")
+    loss = F.mse_loss(flow_pred.float(), target_flow.float(), reduction="mean")
+    if not bool(torch.isfinite(loss.detach()).all().item()):
+        raise RuntimeError("MCP-1 grid auxiliary loss is non-finite")
+    timestep_value = float(timestep_chunk.detach().float()[0, 0].item())
+    return NFSFMCP1GridPointResult(
+        loss=loss,
+        metadata={
+            "timestep": timestep_value,
+            "future_start_frame": int(future_start),
+            "loss": float(loss.detach().float().item()),
+            "flow_shape": [int(dim) for dim in flow_pred.shape],
+            "flow_dtype": str(flow_pred.dtype),
+            "target_flow_dtype": str(target_flow.dtype),
+            "finite": True,
+        },
     )
 
 
@@ -460,3 +585,38 @@ def _training_target_like_scheduler(
         epsilon.flatten(0, 1),
         timestep.flatten(0, 1),
     ).unflatten(0, clean.shape[:2])
+
+
+def _expand_timestep_to_chunk(
+    timestep: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if not torch.is_tensor(timestep):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    value = timestep.to(device=target.device, dtype=torch.float32)
+    if value.numel() == 1:
+        return torch.full(
+            target.shape[:2],
+            float(value.reshape(-1)[0].item()),
+            device=target.device,
+            dtype=torch.float32,
+        )
+    if tuple(value.shape) == tuple(target.shape[:2]):
+        return value
+    if value.numel() == int(target.shape[0] * target.shape[1]):
+        return value.reshape(target.shape[:2])
+    raise ValueError(
+        f"{name} shape {tuple(timestep.shape)} cannot broadcast to "
+        f"{tuple(target.shape[:2])}"
+    )
+
+
+def _ensure_finite_tensor(tensor: torch.Tensor, *, name: str) -> None:
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if not tensor.is_floating_point():
+        raise ValueError(f"{name} must be a floating tensor")
+    if not bool(torch.isfinite(tensor.detach().float()).all().item()):
+        raise RuntimeError(f"{name} contains non-finite values")

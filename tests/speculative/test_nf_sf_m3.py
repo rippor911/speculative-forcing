@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+import scripts.train_nf_sf_m3_overfit as train_m3
 import utils.nf_sf_m3 as m3
 from utils.nf_sf_m3 import (
     M3_CHECKPOINT_FORMAT,
@@ -31,7 +32,9 @@ from utils.nf_sf_m3 import (
 )
 from utils.nf_sf_tensors import make_cpu_generator
 from utils.nf_sf_training import (
+    NFSFSelectedState,
     configure_nf_sf_optimizer_plan,
+    run_nf_sf_forward_loss,
     prepare_nf_sf_noisy_batch,
 )
 from utils.scheduler import FlowMatchScheduler
@@ -1030,3 +1033,391 @@ def test_standalone_mcp1_reconstruction_preserves_bf16_state_across_solver_steps
 
     assert len(generator.calls) == 4
     assert result.latent.dtype == torch.bfloat16
+
+
+class AuxScalar(nn.Module):
+    def __init__(self, value: float = 0.25) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(float(value)))
+
+
+class AuxFakeModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.patch_embedding = AuxScalar(0.1)
+        self.backbone = AuxScalar(0.2)
+
+
+class AuxFakeMCP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fusion = AuxScalar(0.3)
+        self.mcp_modules = nn.ModuleList(
+            [AuxScalar(0.4), AuxScalar(0.5), AuxScalar(0.6)]
+        )
+
+
+class SingleLiveGraph(torch.autograd.Function):
+    active = 0
+    backward_count = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.active = 0
+        cls.backward_count = 0
+
+    @staticmethod
+    def forward(ctx, value):
+        if SingleLiveGraph.active != 0:
+            raise RuntimeError("previous graph is still live")
+        SingleLiveGraph.active += 1
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        SingleLiveGraph.active -= 1
+        SingleLiveGraph.backward_count += 1
+        return grad_output
+
+
+class AuxFakeWan(nn.Module):
+    def __init__(
+        self,
+        *,
+        no_fusion_aux: bool = False,
+        no_mcp1_aux: bool = False,
+        leak_mcp2_aux: bool = False,
+        single_live_aux: bool = False,
+    ) -> None:
+        super().__init__()
+        self.model = AuxFakeModel()
+        self.mcp = AuxFakeMCP()
+        self.no_fusion_aux = no_fusion_aux
+        self.no_mcp1_aux = no_mcp1_aux
+        self.leak_mcp2_aux = leak_mcp2_aux
+        self.single_live_aux = single_live_aux
+        self.calls = []
+
+    def forward(self, **kwargs):
+        noisy = kwargs["noisy_image_or_video"]
+        futures = kwargs.get("mcp_future_noises", [])
+        self.calls.append(
+            {
+                "future_count": len(futures),
+                "grad_enabled": torch.is_grad_enabled(),
+                "future_start": list(kwargs.get("mcp_future_start_frames", [])),
+                "timestep": kwargs["timestep"].detach().clone(),
+                "mcp_timestep": None
+                if not kwargs.get("mcp_timesteps")
+                else kwargs["mcp_timesteps"][0].detach().clone(),
+                "noisy_current": noisy.detach().clone(),
+                "future": None if not futures else futures[0].detach().clone(),
+            }
+        )
+        main_scale = self.model.backbone.weight + self.model.patch_embedding.weight
+        main_flow = noisy * main_scale.to(device=noisy.device, dtype=noisy.dtype)
+        mcp_flows = []
+        for index, future in enumerate(futures):
+            scale = self.mcp.fusion.weight + self.mcp.mcp_modules[index].weight
+            if len(futures) == 1:
+                terms = []
+                if not self.no_fusion_aux:
+                    terms.append(self.mcp.fusion.weight)
+                if not self.no_mcp1_aux:
+                    terms.append(self.mcp.mcp_modules[0].weight)
+                if self.leak_mcp2_aux:
+                    terms.append(self.mcp.mcp_modules[1].weight)
+                scale = sum(terms, torch.zeros_like(self.mcp.fusion.weight))
+            flow = future * scale.to(device=future.device, dtype=future.dtype)
+            if len(futures) == 1 and self.single_live_aux:
+                flow = SingleLiveGraph.apply(flow)
+            mcp_flows.append(flow)
+        return main_flow, torch.zeros_like(noisy), mcp_flows
+
+
+class CountingSGD(torch.optim.SGD):
+    def __init__(self, params, **kwargs) -> None:
+        super().__init__(params, **kwargs)
+        self.zero_grad_calls = 0
+        self.step_calls = 0
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.zero_grad_calls += 1
+        return super().zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        self.step_calls += 1
+        return super().step(closure=closure)
+
+
+def _aux_state() -> NFSFSelectedState:
+    current = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float32).reshape(1, 3, 1, 1, 1)
+    return NFSFSelectedState(
+        clean_history=torch.full_like(current, -1.0),
+        current_target=current,
+        future_targets=(current + 1.0, current + 2.0, current + 3.0),
+        current_start_frame=3,
+    )
+
+
+def _aux_optimizer(generator: AuxFakeWan) -> CountingSGD:
+    plan = configure_nf_sf_optimizer_plan(
+        generator,
+        mode="joint",
+        group_lrs={"backbone": 0.1, "patch_embedding": 0.1, "mcp": 0.1},
+    )
+    return CountingSGD(plan.optimizer_param_groups, lr=0.1)
+
+
+def _run_random_backward(generator, optimizer, state, train_rng):
+    scheduler_main = _scheduler(5.0)
+    scheduler_mcp = _scheduler(10.0)
+    batch = prepare_nf_sf_noisy_batch(
+        state,
+        scheduler_main=scheduler_main,
+        scheduler_mcp=scheduler_mcp,
+        rng=train_rng,
+    )
+    result = run_nf_sf_forward_loss(
+        generator,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        noisy_batch=batch,
+    )
+    result.losses.total_loss.backward()
+    return result, batch
+
+
+def test_mcp1_grid_aux_schedule_is_four_point_main_shift_and_independent() -> None:
+    random_scheduler = _scheduler(5.0)
+    aux_scheduler, timesteps, report = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+
+    assert aux_scheduler is not random_scheduler
+    assert timesteps.tolist() == pytest.approx(list(train_m3.MCP1_GRID_EXPECTED_TIMESTEPS))
+    assert report["generated_timesteps"] == pytest.approx(
+        list(train_m3.MCP1_GRID_EXPECTED_TIMESTEPS)
+    )
+    with pytest.raises(RuntimeError, match="exactly four"):
+        train_m3.resolve_mcp1_grid_aux_schedule(
+            teacher_payload=_solver_payload(num_steps=3, shift=5.0),
+            device=torch.device("cpu"),
+        )
+    with pytest.raises(RuntimeError, match="timesteps differ|inference grid"):
+        train_m3.resolve_mcp1_grid_aux_schedule(
+            teacher_payload=_solver_payload(num_steps=4, shift=10.0),
+            device=torch.device("cpu"),
+        )
+
+
+def test_mcp1_grid_aux_weight_zero_does_not_run_grid_forward() -> None:
+    generator = AuxFakeWan()
+    report = train_m3.accumulate_mcp1_grid_aux_gradients(
+        generator,
+        conditional_dict={},
+        state=_aux_state(),
+        scheduler=None,
+        timesteps=None,
+        epsilon_main=torch.zeros((1, 3, 1, 1, 1)),
+        epsilon_future=torch.zeros((1, 3, 1, 1, 1)),
+        weight=0.0,
+    )
+
+    assert report["enabled"] is False
+    assert generator.calls == []
+
+
+def test_mcp1_grid_aux_accumulates_four_autograd_grads_and_one_optimizer_step(monkeypatch) -> None:
+    SingleLiveGraph.reset()
+    generator = AuxFakeWan(single_live_aux=True)
+    state = _aux_state()
+    optimizer = _aux_optimizer(generator)
+    train_rng = make_cpu_generator(101)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(generator, optimizer, state, train_rng)
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+    grad_calls = []
+    real_grad = torch.autograd.grad
+
+    def counting_grad(*args, **kwargs):
+        grad_calls.append(
+            {
+                "retain_graph": kwargs.get("retain_graph", None),
+                "allow_unused": kwargs.get("allow_unused", None),
+            }
+        )
+        return real_grad(*args, **kwargs)
+
+    monkeypatch.setattr(train_m3.torch.autograd, "grad", counting_grad)
+    report = train_m3.accumulate_mcp1_grid_aux_gradients(
+        generator,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        state=state,
+        scheduler=aux_scheduler,
+        timesteps=timesteps,
+        epsilon_main=batch.epsilon_main,
+        epsilon_future=batch.epsilon_depths[0],
+        weight=1.0,
+    )
+    optimizer.step()
+
+    assert len(grad_calls) == 4
+    assert all(call["retain_graph"] is False for call in grad_calls)
+    assert all(call["allow_unused"] is False for call in grad_calls)
+    assert SingleLiveGraph.backward_count == 4
+    assert SingleLiveGraph.active == 0
+    assert optimizer.zero_grad_calls == 1
+    assert optimizer.step_calls == 1
+    assert len([call for call in generator.calls if call["future_count"] == 1]) == 4
+    assert report["mcp1_grid_aux_mean_loss"] == pytest.approx(
+        sum(report["point_losses"]) / 4.0
+    )
+    assert report["mcp1_grid_aux_weighted_loss"] == pytest.approx(
+        report["mcp1_grid_aux_mean_loss"]
+    )
+
+
+def test_mcp1_grid_aux_gradient_isolation_and_missing_target_grad_failures(monkeypatch) -> None:
+    state = _aux_state()
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+    generator = AuxFakeWan()
+    optimizer = _aux_optimizer(generator)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(generator, optimizer, state, make_cpu_generator(102))
+    before = train_m3.clone_gradients(train_m3.named_parameter_groups(generator))
+    report = train_m3.accumulate_mcp1_grid_aux_gradients(
+        generator,
+        conditional_dict={},
+        state=state,
+        scheduler=aux_scheduler,
+        timesteps=timesteps,
+        epsilon_main=batch.epsilon_main,
+        epsilon_future=batch.epsilon_depths[0],
+        weight=0.7,
+    )
+    after = train_m3.clone_gradients(train_m3.named_parameter_groups(generator))
+    for group_name in ("backbone", "patch_embedding", "mcp_depth2", "mcp_depth3"):
+        for name in before[group_name]:
+            assert torch.equal(before[group_name][name], after[group_name][name])
+    assert report["gradient_isolation"]["mcp_fusion"]["aux_grad_changed"] is True
+    assert report["gradient_isolation"]["mcp_depth1"]["aux_grad_changed"] is True
+
+    for kwargs in [
+        {"no_fusion_aux": True},
+        {"no_mcp1_aux": True},
+    ]:
+        bad = AuxFakeWan(**kwargs)
+        optimizer = _aux_optimizer(bad)
+        optimizer.zero_grad(set_to_none=True)
+        _, batch = _run_random_backward(bad, optimizer, state, make_cpu_generator(103))
+        with pytest.raises(RuntimeError, match="mcp_fusion/mcp_depth1"):
+            train_m3.accumulate_mcp1_grid_aux_gradients(
+                bad,
+                conditional_dict={},
+                state=state,
+                scheduler=aux_scheduler,
+                timesteps=timesteps,
+                epsilon_main=batch.epsilon_main,
+                epsilon_future=batch.epsilon_depths[0],
+                weight=1.0,
+            )
+
+    leaking = AuxFakeWan()
+    optimizer = _aux_optimizer(leaking)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(leaking, optimizer, state, make_cpu_generator(104))
+    real_grad = train_m3.torch.autograd.grad
+
+    def leaking_grad(*args, **kwargs):
+        grads = real_grad(*args, **kwargs)
+        leaking.mcp.mcp_modules[1].weight.grad = (
+            leaking.mcp.mcp_modules[1].weight.grad + torch.ones_like(leaking.mcp.mcp_modules[1].weight)
+        )
+        return grads
+
+    monkeypatch.setattr(train_m3.torch.autograd, "grad", leaking_grad)
+    with pytest.raises(RuntimeError, match="mcp_depth2"):
+        train_m3.accumulate_mcp1_grid_aux_gradients(
+            leaking,
+            conditional_dict={},
+            state=state,
+            scheduler=aux_scheduler,
+            timesteps=timesteps,
+            epsilon_main=batch.epsilon_main,
+            epsilon_future=batch.epsilon_depths[0],
+            weight=1.0,
+        )
+
+
+def test_mcp1_grid_aux_combined_objective_math() -> None:
+    random_total = 2.5
+    aux = {
+        "mcp1_grid_aux_mean_loss": 3.0,
+        "mcp1_grid_aux_weighted_loss": 1.5,
+    }
+    combined = random_total + aux["mcp1_grid_aux_weighted_loss"]
+
+    assert aux["mcp1_grid_aux_weighted_loss"] == pytest.approx(0.5 * aux["mcp1_grid_aux_mean_loss"])
+    assert combined == pytest.approx(4.0)
+
+
+def test_mcp1_grid_stable_probe_uses_fixed_noise_no_grad_and_preserves_rng() -> None:
+    generator = AuxFakeWan()
+    state = _aux_state()
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+    train_rng = make_cpu_generator(999)
+    before_rng = train_rng.get_state().clone()
+    epsilon_main = torch.full_like(state.current_target, 5.0)
+    epsilon_future = torch.full_like(state.future_targets[0], 6.0)
+    probe = train_m3.run_mcp1_grid_stable_probe(
+        generator,
+        conditional_dict={},
+        state=state,
+        scheduler=aux_scheduler,
+        timesteps=timesteps,
+        epsilon_main=epsilon_main,
+        epsilon_future=epsilon_future,
+    )
+    after_rng = train_rng.get_state()
+
+    assert torch.equal(before_rng, after_rng)
+    assert probe["mcp1_grid_probe_mean_loss"] == pytest.approx(
+        sum(probe["point_losses"]) / 4.0
+    )
+    assert probe["all_finite"] is True
+    assert len(probe["records"]) == 4
+    assert all(call["grad_enabled"] is False for call in generator.calls)
+    for call in generator.calls:
+        timestep = call["timestep"]
+        expected_current = aux_scheduler.add_noise(
+            state.current_target.flatten(0, 1),
+            epsilon_main.flatten(0, 1),
+            timestep.flatten(0, 1),
+        ).unflatten(0, state.current_target.shape[:2])
+        assert torch.allclose(call["noisy_current"], expected_current)
+
+
+def test_m3_checkpoint_format_unchanged_with_mcp1_grid_resolved_config() -> None:
+    payload = _checkpoint_for_pair(global_step=3)
+    payload["resolved_config"]["m3"].update(
+        {
+            "mcp1_grid_aux_weight": 1.0,
+            "mcp1_grid_aux_enabled": True,
+            "mcp1_grid_timesteps": list(train_m3.MCP1_GRID_EXPECTED_TIMESTEPS),
+            "mcp1_grid_schedule": {"source": "teacher_payload"},
+        }
+    )
+    m3.validate_m3_checkpoint_payload(payload)
+
+    assert payload["format"] == M3_CHECKPOINT_FORMAT
+    assert payload["resolved_config"]["m3"]["mcp1_grid_aux_enabled"] is True

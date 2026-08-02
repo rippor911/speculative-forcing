@@ -40,13 +40,17 @@ from utils.nf_sf_m3 import (
     run_m3_probe_forward,
     save_m3_checkpoint,
     selected_state_to_device,
+    resolve_m3_solver_schedule,
+    solver_schedule_to_json,
     validate_git_sha,
     validate_m3_mode,
 )
 from utils.nf_sf_tensors import DEFAULT_S_MAIN, DEFAULT_S_MCP, make_generator
 from utils.nf_sf_training import (
+    collect_nf_sf_parameter_groups,
     configure_nf_sf_optimizer_plan,
     prepare_nf_sf_noisy_batch,
+    run_nf_sf_mcp1_grid_point_loss,
     run_nf_sf_forward_loss,
 )
 from utils.scheduler import FlowMatchScheduler
@@ -55,6 +59,13 @@ from utils.scheduler import FlowMatchScheduler
 TAP_LAYERS = (3, 11, 19, 29)
 ADAMW_BETAS = (0.0, 0.999)
 ADAMW_EPS = 1.0e-8
+MCP1_GRID_EXPECTED_TIMESTEPS = (
+    1000.0,
+    937.5,
+    833.3333129882812,
+    625.0,
+)
+MCP1_GRID_TIMESTEP_TOLERANCE = 1.0e-4
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch_embedding_lr", type=float, required=True)
     parser.add_argument("--mcp_lr", type=float, required=True)
     parser.add_argument("--weight_decay", type=float, required=True)
+    parser.add_argument("--mcp1_grid_aux_weight", type=float, default=0.0)
     parser.add_argument("--dtype", choices=("bf16", "float32"), default="bf16")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
@@ -133,6 +145,8 @@ def validate_config(config: Any, args: argparse.Namespace) -> None:
         raise ValueError("--mcp_lr must be > 0")
     if args.weight_decay < 0:
         raise ValueError("--weight_decay must be >= 0")
+    if args.mcp1_grid_aux_weight < 0:
+        raise ValueError("--mcp1_grid_aux_weight must be >= 0")
     if bool(getattr(config, "i2v", False)):
         raise ValueError("NF-SF M3 supports T2V only")
     if int(getattr(config, "num_frame_per_block", 0)) != M3_CHUNK_FRAMES:
@@ -202,6 +216,52 @@ def make_mcp_scheduler(device: torch.device) -> FlowMatchScheduler:
     return scheduler
 
 
+def make_mcp1_grid_aux_scheduler(device: torch.device) -> FlowMatchScheduler:
+    scheduler = FlowMatchScheduler(
+        shift=DEFAULT_S_MAIN,
+        sigma_min=0.0,
+        extra_one_step=True,
+    )
+    scheduler.sigmas = scheduler.sigmas.to(device)
+    scheduler.timesteps = scheduler.timesteps.to(device)
+    return scheduler
+
+
+def validate_mcp1_grid_timesteps(timesteps: torch.Tensor) -> torch.Tensor:
+    values = timesteps.detach().float().flatten()
+    if values.numel() != len(MCP1_GRID_EXPECTED_TIMESTEPS):
+        raise RuntimeError(
+            "MCP-1 grid auxiliary schedule must contain exactly four timesteps"
+        )
+    expected = torch.tensor(MCP1_GRID_EXPECTED_TIMESTEPS, dtype=torch.float32)
+    diff = (values.detach().cpu() - expected).abs()
+    max_abs = float(diff.max().item())
+    if max_abs > MCP1_GRID_TIMESTEP_TOLERANCE:
+        raise RuntimeError(
+            "MCP-1 grid auxiliary timesteps differ from expected inference grid: "
+            f"max_abs_diff={max_abs}, tolerance={MCP1_GRID_TIMESTEP_TOLERANCE}"
+        )
+    return values
+
+
+def resolve_mcp1_grid_aux_schedule(
+    *,
+    teacher_payload: dict[str, Any],
+    device: torch.device,
+) -> tuple[FlowMatchScheduler, torch.Tensor, dict[str, Any]]:
+    scheduler = make_mcp1_grid_aux_scheduler(device)
+    schedule = resolve_m3_solver_schedule(
+        scheduler,
+        teacher_payload=teacher_payload,
+        device=device,
+        solver_steps_override=None,
+        allow_solver_override=False,
+        tolerance=MCP1_GRID_TIMESTEP_TOLERANCE,
+    )
+    timesteps = validate_mcp1_grid_timesteps(schedule.timesteps)
+    return scheduler, timesteps, solver_schedule_to_json(schedule)
+
+
 def audit_to_json(audit) -> dict[str, Any]:
     return {
         "name": audit.name,
@@ -225,6 +285,7 @@ def write_probe_report(
     step: int,
     losses: dict[str, float],
     outputs: dict[str, torch.Tensor],
+    mcp1_grid_probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = {
         "step": int(step),
@@ -232,6 +293,11 @@ def write_probe_report(
         "probe_losses": losses,
         "probe_output_summaries": probe_output_summaries(outputs),
     }
+    if mcp1_grid_probe is not None:
+        report["mcp1_grid_probe"] = mcp1_grid_probe
+        report["probe/mcp1_grid_probe_mean_loss"] = float(
+            mcp1_grid_probe["mcp1_grid_probe_mean_loss"]
+        )
     atomic_json_write(report, output_dir / f"probe_step{step:06d}.json")
     return report
 
@@ -239,6 +305,221 @@ def write_probe_report(
 def append_metrics(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def named_parameter_groups(generator) -> dict[str, tuple[tuple[str, torch.nn.Parameter], ...]]:
+    return collect_nf_sf_parameter_groups(generator)
+
+
+def clone_gradients(
+    groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
+) -> dict[str, dict[str, torch.Tensor | None]]:
+    return {
+        group_name: {
+            name: None if parameter.grad is None else parameter.grad.detach().clone()
+            for name, parameter in named_params
+        }
+        for group_name, named_params in groups.items()
+    }
+
+
+def grad_tensor_changed(before: torch.Tensor | None, after: torch.Tensor | None) -> bool:
+    if before is None and after is None:
+        return False
+    if before is None or after is None:
+        return True
+    return not torch.equal(before, after)
+
+
+def max_grad_abs_diff(before: torch.Tensor | None, after: torch.Tensor | None) -> float:
+    if before is None and after is None:
+        return 0.0
+    if before is None:
+        return float(after.detach().float().abs().max().item()) if after is not None else 0.0
+    if after is None:
+        return float(before.detach().float().abs().max().item())
+    return float((after.detach().float() - before.detach().float()).abs().max().item())
+
+
+def validate_mcp1_grid_aux_gradient_isolation(
+    before: dict[str, dict[str, torch.Tensor | None]],
+    after: dict[str, dict[str, torch.Tensor | None]],
+) -> dict[str, Any]:
+    target_groups = {"mcp_fusion", "mcp_depth1"}
+    reports = {}
+    for group_name, tensors in before.items():
+        changed_count = 0
+        max_abs = 0.0
+        for name, before_grad in tensors.items():
+            after_grad = after[group_name][name]
+            if grad_tensor_changed(before_grad, after_grad):
+                changed_count += 1
+            max_abs = max(max_abs, max_grad_abs_diff(before_grad, after_grad))
+        reports[group_name] = {
+            "changed_tensor_count": int(changed_count),
+            "max_abs_grad_diff": float(max_abs),
+            "aux_grad_changed": changed_count > 0,
+        }
+    for group_name, report in reports.items():
+        if group_name not in target_groups and report["changed_tensor_count"] != 0:
+            raise RuntimeError(
+                f"MCP-1 grid auxiliary gradient leaked into {group_name}"
+            )
+    for group_name in target_groups:
+        if reports[group_name]["changed_tensor_count"] <= 0:
+            raise RuntimeError(
+                f"MCP-1 grid auxiliary did not change gradients for {group_name}"
+            )
+    return reports
+
+
+def mcp1_grid_aux_parameters(generator) -> list[torch.nn.Parameter]:
+    groups = named_parameter_groups(generator)
+    params = [
+        parameter
+        for group_name in ("mcp_fusion", "mcp_depth1")
+        for _, parameter in groups[group_name]
+    ]
+    if not params:
+        raise RuntimeError("MCP-1 grid auxiliary parameter set is empty")
+    return params
+
+
+def validate_aux_grads(
+    params: list[torch.nn.Parameter],
+    grads: tuple[torch.Tensor, ...],
+) -> None:
+    if len(grads) != len(params):
+        raise RuntimeError("MCP-1 grid auxiliary grad count mismatch")
+    for parameter, grad in zip(params, grads):
+        if grad is None:
+            raise RuntimeError("MCP-1 grid auxiliary missing gradient")
+        if tuple(grad.shape) != tuple(parameter.shape):
+            raise RuntimeError("MCP-1 grid auxiliary gradient shape mismatch")
+        if not bool(torch.isfinite(grad.detach().float()).all().item()):
+            raise RuntimeError("MCP-1 grid auxiliary gradient is non-finite")
+
+
+def accumulate_mcp1_grid_aux_gradients(
+    generator,
+    *,
+    conditional_dict: dict[str, Any],
+    state,
+    scheduler,
+    timesteps: torch.Tensor,
+    epsilon_main: torch.Tensor,
+    epsilon_future: torch.Tensor,
+    weight: float,
+) -> dict[str, Any]:
+    if weight <= 0.0:
+        return {
+            "enabled": False,
+            "mcp1_grid_aux_mean_loss": 0.0,
+            "mcp1_grid_aux_weighted_loss": 0.0,
+            "point_losses": [],
+            "timesteps": [],
+            "gradient_isolation": {},
+        }
+    timesteps = validate_mcp1_grid_timesteps(timesteps)
+    groups = named_parameter_groups(generator)
+    before = clone_gradients(groups)
+    params = mcp1_grid_aux_parameters(generator)
+    point_losses = []
+    point_metadata = []
+    for timestep in timesteps:
+        point = run_nf_sf_mcp1_grid_point_loss(
+            generator,
+            conditional_dict=conditional_dict,
+            state=state,
+            scheduler=scheduler,
+            epsilon_main=epsilon_main,
+            epsilon_future=epsilon_future,
+            timestep=timestep,
+            chunk_frames=M3_CHUNK_FRAMES,
+        )
+        scaled_loss = point.loss * (float(weight) / float(len(timesteps)))
+        try:
+            grads = torch.autograd.grad(
+                scaled_loss,
+                params,
+                allow_unused=False,
+                retain_graph=False,
+            )
+        except RuntimeError as exc:
+            if "not have been used in the graph" in str(exc):
+                raise RuntimeError(
+                    "MCP-1 grid auxiliary missing gradient for target groups "
+                    "mcp_fusion/mcp_depth1"
+                ) from exc
+            raise
+        validate_aux_grads(params, grads)
+        for parameter, grad in zip(params, grads):
+            if parameter.grad is None:
+                raise RuntimeError(
+                    "MCP-1 grid auxiliary expected existing random-training gradient"
+                )
+            parameter.grad = parameter.grad + grad.to(
+                device=parameter.grad.device,
+                dtype=parameter.grad.dtype,
+            )
+        point_losses.append(float(point.loss.detach().float().item()))
+        point_metadata.append(point.metadata)
+    after = clone_gradients(groups)
+    isolation = validate_mcp1_grid_aux_gradient_isolation(before, after)
+    mean_loss = sum(point_losses) / len(point_losses)
+    return {
+        "enabled": True,
+        "mcp1_grid_aux_mean_loss": float(mean_loss),
+        "mcp1_grid_aux_weighted_loss": float(float(weight) * mean_loss),
+        "point_losses": point_losses,
+        "point_metadata": point_metadata,
+        "timesteps": [float(value.detach().float().item()) for value in timesteps],
+        "gradient_isolation": isolation,
+    }
+
+
+def run_mcp1_grid_stable_probe(
+    generator,
+    *,
+    conditional_dict: dict[str, Any],
+    state,
+    scheduler,
+    timesteps: torch.Tensor,
+    epsilon_main: torch.Tensor,
+    epsilon_future: torch.Tensor,
+) -> dict[str, Any]:
+    timesteps = validate_mcp1_grid_timesteps(timesteps)
+    was_training = bool(generator.training)
+    generator.eval()
+    try:
+        point_losses = []
+        records = []
+        with torch.no_grad():
+            for timestep in timesteps:
+                point = run_nf_sf_mcp1_grid_point_loss(
+                    generator,
+                    conditional_dict=conditional_dict,
+                    state=state,
+                    scheduler=scheduler,
+                    epsilon_main=epsilon_main,
+                    epsilon_future=epsilon_future,
+                    timestep=timestep,
+                    chunk_frames=M3_CHUNK_FRAMES,
+                )
+                point_losses.append(float(point.loss.detach().float().item()))
+                records.append(point.metadata)
+    finally:
+        generator.train(was_training)
+    mean_loss = sum(point_losses) / len(point_losses)
+    return {
+        "mcp1_grid_probe_mean_loss": float(mean_loss),
+        "point_losses": point_losses,
+        "records": records,
+        "timesteps": [float(value.detach().float().item()) for value in timesteps],
+        "all_finite": bool(
+            all(torch.isfinite(torch.tensor(point_losses, dtype=torch.float32)).tolist())
+        ),
+    }
 
 
 def save_checkpoint_at_step(
@@ -311,6 +592,19 @@ def main() -> None:
 
     config = merge_config(str(args.config))
     validate_config(config, args)
+    mcp1_grid_aux_enabled = float(args.mcp1_grid_aux_weight) > 0.0
+    mcp1_grid_aux_scheduler = None
+    mcp1_grid_aux_timesteps = None
+    mcp1_grid_aux_schedule = None
+    if mcp1_grid_aux_enabled:
+        (
+            mcp1_grid_aux_scheduler,
+            mcp1_grid_aux_timesteps,
+            mcp1_grid_aux_schedule,
+        ) = resolve_mcp1_grid_aux_schedule(
+            teacher_payload=sample.payload,
+            device=device,
+        )
     optimizer_config = {
         "optimizer": "AdamW",
         "betas": [float(value) for value in ADAMW_BETAS],
@@ -338,6 +632,15 @@ def main() -> None:
             "patch_embedding_lr": args.patch_embedding_lr,
             "mcp_lr": args.mcp_lr,
             "weight_decay": args.weight_decay,
+            "mcp1_grid_aux_weight": float(args.mcp1_grid_aux_weight),
+            "mcp1_grid_aux_enabled": bool(mcp1_grid_aux_enabled),
+            "mcp1_grid_timesteps": []
+            if mcp1_grid_aux_timesteps is None
+            else [
+                float(value)
+                for value in mcp1_grid_aux_timesteps.detach().float().cpu().tolist()
+            ],
+            "mcp1_grid_schedule": mcp1_grid_aux_schedule,
             "optimizer_config": optimizer_config,
             "dtype": args.dtype,
             "device": str(device),
@@ -368,6 +671,8 @@ def main() -> None:
         scheduler_main.sigmas = scheduler_main.sigmas.to(device)
         scheduler_main.timesteps = scheduler_main.timesteps.to(device)
         scheduler_mcp = make_mcp_scheduler(device)
+        if mcp1_grid_aux_enabled and mcp1_grid_aux_scheduler is scheduler_main:
+            raise RuntimeError("MCP-1 grid auxiliary scheduler must be independent")
 
         probe = make_m3_probe(
             state,
@@ -380,11 +685,23 @@ def main() -> None:
             conditional_dict=conditional_dict,
             noisy_batch=probe.noisy_batch,
         )
+        initial_grid_probe = None
+        if mcp1_grid_aux_enabled:
+            initial_grid_probe = run_mcp1_grid_stable_probe(
+                generator,
+                conditional_dict=conditional_dict,
+                state=state,
+                scheduler=mcp1_grid_aux_scheduler,
+                timesteps=mcp1_grid_aux_timesteps,
+                epsilon_main=probe.noisy_batch.epsilon_main,
+                epsilon_future=probe.noisy_batch.epsilon_depths[0],
+            )
         initial_probe_report = write_probe_report(
             args.output_dir,
             0,
             initial_probe.losses,
             initial_probe.outputs,
+            initial_grid_probe,
         )
 
         group_lrs = {
@@ -438,6 +755,21 @@ def main() -> None:
                 "step": 0,
                 "elapsed_ms": 0.0,
                 **prefix_metrics("probe", initial_probe.losses),
+                **(
+                    {}
+                    if initial_grid_probe is None
+                    else {
+                        "probe/mcp1_grid_probe_mean_loss": initial_grid_probe[
+                            "mcp1_grid_probe_mean_loss"
+                        ],
+                        "probe/mcp1_grid_probe_point_losses": initial_grid_probe[
+                            "point_losses"
+                        ],
+                        "probe/mcp1_grid_probe_all_finite": initial_grid_probe[
+                            "all_finite"
+                        ],
+                    }
+                ),
             },
         )
 
@@ -461,6 +793,19 @@ def main() -> None:
                 depth_weights=M3_DEPTH_WEIGHTS,
             )
             result.losses.total_loss.backward()
+            random_grad_audit = gradient_group_audit(optimizer)
+            if not all(entry["finite"] for entry in random_grad_audit.values()):
+                raise RuntimeError(f"non-finite random gradient audit at step {step}")
+            aux_report = accumulate_mcp1_grid_aux_gradients(
+                generator,
+                conditional_dict=conditional_dict,
+                state=state,
+                scheduler=mcp1_grid_aux_scheduler,
+                timesteps=mcp1_grid_aux_timesteps,
+                epsilon_main=noisy_batch.epsilon_main,
+                epsilon_future=noisy_batch.epsilon_depths[0],
+                weight=float(args.mcp1_grid_aux_weight),
+            )
             grad_audit = gradient_group_audit(optimizer)
             if not all(entry["finite"] for entry in grad_audit.values()):
                 raise RuntimeError(f"non-finite gradient audit at step {step}")
@@ -470,6 +815,10 @@ def main() -> None:
             torch.cuda.synchronize(device)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             train_losses = loss_dict_to_floats(result.losses)
+            combined_objective = (
+                train_losses["total_loss"]
+                + aux_report["mcp1_grid_aux_weighted_loss"]
+            )
 
             should_log = step % args.log_interval == 0 or step == args.optimizer_steps
             should_checkpoint = (
@@ -480,9 +829,30 @@ def main() -> None:
                 "step": step,
                 "elapsed_ms": elapsed_ms,
                 **prefix_metrics("train", train_losses),
+                "train/random_total_loss": train_losses["total_loss"],
+                "train/mcp1_grid_aux_mean_loss": aux_report[
+                    "mcp1_grid_aux_mean_loss"
+                ],
+                "train/mcp1_grid_aux_weighted_loss": aux_report[
+                    "mcp1_grid_aux_weighted_loss"
+                ],
+                "train/combined_objective": combined_objective,
+                "mcp1_grid_aux": aux_report,
+                "random_grad_audit": random_grad_audit,
                 "grad_audit": grad_audit,
             }
             if should_log or should_checkpoint:
+                grid_probe = None
+                if mcp1_grid_aux_enabled:
+                    grid_probe = run_mcp1_grid_stable_probe(
+                        generator,
+                        conditional_dict=conditional_dict,
+                        state=state,
+                        scheduler=mcp1_grid_aux_scheduler,
+                        timesteps=mcp1_grid_aux_timesteps,
+                        epsilon_main=probe.noisy_batch.epsilon_main,
+                        epsilon_future=probe.noisy_batch.epsilon_depths[0],
+                    )
                 probe_forward = run_m3_probe_forward(
                     generator,
                     conditional_dict=conditional_dict,
@@ -493,8 +863,23 @@ def main() -> None:
                     step,
                     probe_forward.losses,
                     probe_forward.outputs,
+                    grid_probe,
                 )
                 metric_record.update(prefix_metrics("probe", probe_forward.losses))
+                if grid_probe is not None:
+                    metric_record.update(
+                        {
+                            "probe/mcp1_grid_probe_mean_loss": grid_probe[
+                                "mcp1_grid_probe_mean_loss"
+                            ],
+                            "probe/mcp1_grid_probe_point_losses": grid_probe[
+                                "point_losses"
+                            ],
+                            "probe/mcp1_grid_probe_all_finite": grid_probe[
+                                "all_finite"
+                            ],
+                        }
+                    )
                 if should_checkpoint:
                     save_checkpoint_at_step(
                         output_dir=args.output_dir,
@@ -520,6 +905,13 @@ def main() -> None:
                         {
                             "step": step,
                             **prefix_metrics("train", train_losses),
+                            "train/mcp1_grid_aux_mean_loss": aux_report[
+                                "mcp1_grid_aux_mean_loss"
+                            ],
+                            "train/mcp1_grid_aux_weighted_loss": aux_report[
+                                "mcp1_grid_aux_weighted_loss"
+                            ],
+                            "train/combined_objective": combined_objective,
                             **prefix_metrics("probe", probe_forward.losses),
                             "grad_audit": grad_audit,
                         },

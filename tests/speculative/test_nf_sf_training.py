@@ -8,6 +8,7 @@ from utils.nf_sf_training import (
     compute_nf_sf_losses,
     configure_nf_sf_optimizer_plan,
     prepare_nf_sf_noisy_batch,
+    run_nf_sf_mcp1_grid_point_loss,
     run_nf_sf_forward_loss,
 )
 from utils.scheduler import FlowMatchScheduler
@@ -27,6 +28,42 @@ class FakeGenerator(nn.Module):
             torch.zeros_like(noisy_current),
             [torch.zeros_like(noise) for noise in mcp_noises],
         )
+
+
+class FakeGridGenerator(nn.Module):
+    def __init__(
+        self,
+        *,
+        top_level_count: int = 3,
+        mcp_count: int = 1,
+        nonfinite: bool = False,
+    ) -> None:
+        super().__init__()
+        self.top_level_count = int(top_level_count)
+        self.mcp_count = int(mcp_count)
+        self.nonfinite = bool(nonfinite)
+        self.calls = []
+
+    def forward(self, **kwargs):
+        future = kwargs["mcp_future_noises"][0]
+        self.calls.append(
+            {
+                "noisy_current": kwargs["noisy_image_or_video"].detach().clone(),
+                "future": future.detach().clone(),
+                "timestep": kwargs["timestep"].detach().clone(),
+                "mcp_timestep": kwargs["mcp_timesteps"][0].detach().clone(),
+                "future_start": list(kwargs["mcp_future_start_frames"]),
+            }
+        )
+        if self.nonfinite:
+            flow = torch.full_like(future, float("inf"))
+        else:
+            flow = torch.zeros_like(future)
+        flows = [flow]
+        flows.extend(torch.zeros_like(future) for _ in range(max(0, self.mcp_count - 1)))
+        flows = flows[: max(0, self.mcp_count)]
+        outputs = (torch.zeros_like(kwargs["noisy_image_or_video"]), torch.zeros_like(future), flows)
+        return outputs[: self.top_level_count]
 
 
 class FakeBackbone(nn.Module):
@@ -154,6 +191,110 @@ def test_forward_loss_passes_per_depth_timesteps_and_applies_masks() -> None:
     assert torch.equal(result.losses.mcp_depth_losses[1], expected.mcp_depth_losses[1])
     assert torch.equal(result.losses.mcp_depth_losses[2], expected.mcp_depth_losses[2])
     assert result.losses.mcp_depth_losses[2].item() == 0.0
+
+
+def test_mcp1_grid_point_loss_uses_oracle_inputs_and_single_future_contract() -> None:
+    state = _state()
+    scheduler = _scheduler(5.0)
+    generator = FakeGridGenerator()
+    epsilon_main = torch.full_like(state.current_target, 3.0)
+    epsilon_future = torch.full_like(state.future_targets[0], 4.0)
+    timestep = torch.tensor(float(scheduler.timesteps[7].item()))
+
+    point = run_nf_sf_mcp1_grid_point_loss(
+        generator,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        state=state,
+        scheduler=scheduler,
+        epsilon_main=epsilon_main,
+        epsilon_future=epsilon_future,
+        timestep=timestep,
+    )
+    call = generator.calls[-1]
+    timestep_chunk = torch.full(state.current_target.shape[:2], float(timestep.item()))
+    expected_current = scheduler.add_noise(
+        state.current_target.flatten(0, 1),
+        epsilon_main.flatten(0, 1),
+        timestep_chunk.flatten(0, 1),
+    ).unflatten(0, state.current_target.shape[:2])
+    expected_future = scheduler.add_noise(
+        state.future_targets[0].flatten(0, 1),
+        epsilon_future.flatten(0, 1),
+        timestep_chunk.flatten(0, 1),
+    ).unflatten(0, state.current_target.shape[:2])
+    expected_target = scheduler.training_target(
+        state.future_targets[0].flatten(0, 1),
+        epsilon_future.flatten(0, 1),
+        timestep_chunk.flatten(0, 1),
+    ).unflatten(0, state.current_target.shape[:2])
+
+    assert torch.allclose(call["noisy_current"], expected_current)
+    assert torch.allclose(call["future"], expected_future)
+    assert torch.equal(call["timestep"], call["mcp_timestep"])
+    assert call["future_start"] == [6]
+    assert point.loss.item() == pytest.approx(expected_target.float().square().mean().item())
+    assert point.metadata["future_start_frame"] == 6
+
+
+@pytest.mark.parametrize(
+    ("top_level_count", "mcp_count", "message"),
+    [
+        (2, 1, "output triple"),
+        (3, 0, "exactly one MCP"),
+        (3, 2, "exactly one MCP"),
+    ],
+)
+def test_mcp1_grid_point_loss_rejects_output_contract_errors(
+    top_level_count,
+    mcp_count,
+    message,
+) -> None:
+    state = _state()
+    scheduler = _scheduler(5.0)
+
+    with pytest.raises(RuntimeError, match=message):
+        run_nf_sf_mcp1_grid_point_loss(
+            FakeGridGenerator(top_level_count=top_level_count, mcp_count=mcp_count),
+            conditional_dict={},
+            state=state,
+            scheduler=scheduler,
+            epsilon_main=torch.ones_like(state.current_target),
+            epsilon_future=torch.ones_like(state.future_targets[0]),
+            timestep=torch.tensor(float(scheduler.timesteps[0].item())),
+        )
+
+
+def test_mcp1_grid_point_loss_rejects_nonfinite_flow_and_wrong_start() -> None:
+    state = _state()
+    scheduler = _scheduler(5.0)
+
+    with pytest.raises(RuntimeError, match="non-finite"):
+        run_nf_sf_mcp1_grid_point_loss(
+            FakeGridGenerator(nonfinite=True),
+            conditional_dict={},
+            state=state,
+            scheduler=scheduler,
+            epsilon_main=torch.ones_like(state.current_target),
+            epsilon_future=torch.ones_like(state.future_targets[0]),
+            timestep=torch.tensor(float(scheduler.timesteps[0].item())),
+        )
+
+    bad_state = NFSFSelectedState(
+        clean_history=state.clean_history,
+        current_target=state.current_target,
+        future_targets=state.future_targets,
+        current_start_frame=0,
+    )
+    with pytest.raises(ValueError, match="future_start_frame=6"):
+        run_nf_sf_mcp1_grid_point_loss(
+            FakeGridGenerator(),
+            conditional_dict={},
+            state=bad_state,
+            scheduler=scheduler,
+            epsilon_main=torch.ones_like(state.current_target),
+            epsilon_future=torch.ones_like(state.future_targets[0]),
+            timestep=torch.tensor(float(scheduler.timesteps[0].item())),
+        )
 
 
 def _audit_by_name(plan):

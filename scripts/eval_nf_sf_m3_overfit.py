@@ -41,6 +41,14 @@ from utils.nf_sf_m3 import (
     validate_m3_eval_config_matches_checkpoint,
     validate_git_sha,
 )
+from utils.nf_sf_m4 import (
+    load_m4_sample_plan,
+    load_m4_teacher_samples,
+    m4_sample_identity_from_metadata,
+    validate_m4_checkpoint_sample_plan,
+    validate_m4_decode_identity,
+    write_m4_json,
+)
 from utils.nf_sf_tensors import DEFAULT_S_MAIN
 from utils.scheduler import FlowMatchScheduler
 
@@ -65,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solver_steps", type=int, default=None)
     parser.add_argument("--allow_solver_override", action="store_true")
     parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--m4_sample_plan", type=Path, default=None)
+    parser.add_argument("--m4_decode_sample_identity", default=None)
     return parser.parse_args()
 
 
@@ -177,6 +187,13 @@ def load_optimizer_audit_for_checkpoint(checkpoint_path: Path) -> dict[str, Any]
     if not isinstance(payload, dict):
         raise RuntimeError("optimizer_audit.json must contain a JSON object")
     return payload
+
+
+def write_eval_json(payload: dict[str, Any], path: Path, *, strict: bool) -> None:
+    if strict:
+        write_m4_json(payload, path)
+    else:
+        atomic_json_write(payload, path)
 
 
 def normalize_pixels(decoded: torch.Tensor) -> torch.Tensor:
@@ -389,6 +406,30 @@ def main() -> None:
         final_payload,
         current_model_config,
     )
+    if args.m4_decode_sample_identity is not None and args.m4_sample_plan is None:
+        raise ValueError("--m4_decode_sample_identity requires --m4_sample_plan")
+    m4_plan = None
+    m4_decode_identity = None
+    m4_decode_contract = None
+    if args.m4_sample_plan is not None:
+        m4_plan = load_m4_sample_plan(
+            args.m4_sample_plan,
+            manifest_path=args.manifest,
+        )
+        validate_m4_checkpoint_sample_plan(
+            final_payload,
+            m4_plan,
+            sample_plan_path=args.m4_sample_plan,
+        )
+        m4_decode_identity = (
+            str(args.m4_decode_sample_identity)
+            if args.m4_decode_sample_identity is not None
+            else str(m4_plan["fixed_decode_validation_identity"])
+        )
+        m4_decode_contract = validate_m4_decode_identity(
+            sample_plan=m4_plan,
+            identity=m4_decode_identity,
+        )
     metadata = final_payload["selected_sample_metadata"]
     manifest_path = args.manifest or Path(metadata["manifest_path"])
     sample = load_m3_teacher_sample(
@@ -468,7 +509,11 @@ def main() -> None:
         "probe_output_comparison": probe_output_comparison,
         "selected_sample_metadata": sample.metadata,
     }
-    atomic_json_write(report, args.output_dir / "restore_validation.json")
+    write_eval_json(
+        report,
+        args.output_dir / "restore_validation.json",
+        strict=m4_plan is not None,
+    )
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
     if not restore_pass:
         raise SystemExit(2)
@@ -478,6 +523,12 @@ def main() -> None:
     parameter_change_report = None
     if args.initial_m3_checkpoint is not None:
         initial_payload = load_m3_checkpoint(args.initial_m3_checkpoint)
+        if m4_plan is not None:
+            validate_m4_checkpoint_sample_plan(
+                initial_payload,
+                m4_plan,
+                sample_plan_path=args.m4_sample_plan,
+            )
         checkpoint_pair_report = validate_m3_checkpoint_pair(
             initial_payload=initial_payload,
             final_payload=final_payload,
@@ -491,7 +542,7 @@ def main() -> None:
             optimizer_audit=optimizer_audit,
             mode=checkpoint_mode,
         )
-        atomic_json_write(
+        write_eval_json(
             {
                 "status": parameter_change_report["status"],
                 "m3_checkpoint": str(args.m3_checkpoint.resolve()),
@@ -501,6 +552,7 @@ def main() -> None:
                 **parameter_change_report,
             },
             args.output_dir / "parameter_change_audit.json",
+            strict=m4_plan is not None,
         )
         if not parameter_change_report["all_groups_match_mode_contract"]:
             raise RuntimeError(
@@ -512,14 +564,62 @@ def main() -> None:
     if initial_payload is None:
         raise ValueError("--decode requires --initial_m3_checkpoint")
     assert checkpoint_pair_report is not None
+    decode_sample = sample
+    decode_state = state
+    decode_conditional_dict = conditional_dict
+    decode_probe = rebuilt_probe
+    if m4_plan is not None:
+        assert m4_decode_identity is not None
+        manifest_for_m4 = args.manifest or Path(m4_plan["manifest_path"])
+        validation_samples = load_m4_teacher_samples(
+            m4_plan,
+            split="validation",
+            manifest_path=manifest_for_m4,
+            dataset_root=args.dataset_root,
+            reference_checkpoint_path=final_payload["reference_checkpoint"]["path"],
+        )
+        decode_sample = validation_samples[m4_decode_identity]
+        decode_state = selected_state_to_device(
+            decode_sample.selected_state,
+            device=device,
+            dtype=dtype,
+        )
+        if (
+            m4_sample_identity_from_metadata(sample.metadata)
+            == m4_sample_identity_from_metadata(decode_sample.metadata)
+        ):
+            decode_conditional_dict = conditional_dict
+        else:
+            from utils.wan_wrapper import WanTextEncoder
+
+            text_encoder = (
+                WanTextEncoder()
+                .to(device=device, dtype=dtype)
+                .eval()
+                .requires_grad_(False)
+            )
+            try:
+                with torch.no_grad():
+                    decode_conditional_dict = text_encoder([decode_sample.metadata["prompt"]])
+            finally:
+                text_encoder.to("cpu")
+                del text_encoder
+                gc.collect()
+                torch.cuda.empty_cache()
+        decode_probe = make_m3_probe(
+            decode_state,
+            scheduler_main=scheduler_main,
+            scheduler_mcp=scheduler_mcp,
+            seed=int(final_payload["probe_seed"]),
+        )
     recon = run_reconstructions(
         config=config,
         initial_payload=initial_payload,
         final_payload=final_payload,
-        teacher_payload=sample.payload,
-        conditional_dict=conditional_dict,
-        state=state,
-        probe=rebuilt_probe,
+        teacher_payload=decode_sample.payload,
+        conditional_dict=decode_conditional_dict,
+        state=decode_state,
+        probe=decode_probe,
         device=device,
         dtype=dtype,
         solver_steps_override=args.solver_steps,
@@ -530,16 +630,24 @@ def main() -> None:
         final_main=recon["final_main"],
         initial_mcp1=recon["initial_mcp1"],
         final_mcp1=recon["final_mcp1"],
-        state=sample.selected_state,
+        state=decode_sample.selected_state,
     )
-    atomic_json_write(
+    write_eval_json(
         {
             "status": "PASS",
             "checkpoint_pair": checkpoint_pair_report,
             "parameter_change_audit": parameter_change_report,
+            "m4_decode": None
+            if m4_plan is None
+            else {
+                "sample_plan_sha256": m4_plan["sample_plan_sha256"],
+                "decode_sample_identity": m4_decode_identity,
+                "decode_contract": m4_decode_contract,
+            },
             **metrics,
         },
         args.output_dir / "reconstruction_metrics.json",
+        strict=m4_plan is not None,
     )
 
     decoded_dir = args.output_dir / "decoded"
@@ -551,8 +659,8 @@ def main() -> None:
         decode_records = {
             "target_current": decode_chunk_variant(
                 vae=vae,
-                full_target_latent=sample.target_latent,
-                chunk=sample.selected_state.current_target,
+                full_target_latent=decode_sample.target_latent,
+                chunk=decode_sample.selected_state.current_target,
                 block_index=1,
                 output_path=decoded_dir / "target_current.mp4",
                 device=device,
@@ -561,8 +669,8 @@ def main() -> None:
             ),
             "target_next1": decode_chunk_variant(
                 vae=vae,
-                full_target_latent=sample.target_latent,
-                chunk=sample.selected_state.future_targets[0],
+                full_target_latent=decode_sample.target_latent,
+                chunk=decode_sample.selected_state.future_targets[0],
                 block_index=2,
                 output_path=decoded_dir / "target_next1.mp4",
                 device=device,
@@ -571,7 +679,7 @@ def main() -> None:
             ),
             "initial_main": decode_chunk_variant(
                 vae=vae,
-                full_target_latent=sample.target_latent,
+                full_target_latent=decode_sample.target_latent,
                 chunk=recon["initial_main"],
                 block_index=1,
                 output_path=decoded_dir / "initial_main.mp4",
@@ -581,7 +689,7 @@ def main() -> None:
             ),
             "final_main": decode_chunk_variant(
                 vae=vae,
-                full_target_latent=sample.target_latent,
+                full_target_latent=decode_sample.target_latent,
                 chunk=recon["final_main"],
                 block_index=1,
                 output_path=decoded_dir / "final_main.mp4",
@@ -591,7 +699,7 @@ def main() -> None:
             ),
             "initial_mcp1": decode_chunk_variant(
                 vae=vae,
-                full_target_latent=sample.target_latent,
+                full_target_latent=decode_sample.target_latent,
                 chunk=recon["initial_mcp1"],
                 block_index=2,
                 output_path=decoded_dir / "initial_mcp1.mp4",
@@ -601,7 +709,7 @@ def main() -> None:
             ),
             "final_mcp1": decode_chunk_variant(
                 vae=vae,
-                full_target_latent=sample.target_latent,
+                full_target_latent=decode_sample.target_latent,
                 chunk=recon["final_mcp1"],
                 block_index=2,
                 output_path=decoded_dir / "final_mcp1.mp4",
@@ -616,7 +724,7 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
 
-    atomic_json_write(
+    write_eval_json(
         {
             "status": "PASS",
             "decode_mode": "target_context_splice",
@@ -625,9 +733,18 @@ def main() -> None:
             "solver_steps_override": args.solver_steps,
             "checkpoint_pair": checkpoint_pair_report,
             "parameter_change_audit": parameter_change_report,
+            "m4_decode": None
+            if m4_plan is None
+            else {
+                "sample_plan_sha256": m4_plan["sample_plan_sha256"],
+                "decode_sample_identity": m4_decode_identity,
+                "decode_contract": m4_decode_contract,
+                "decode_sample_metadata": decode_sample.metadata,
+            },
             "records": decode_records,
         },
         decoded_dir / "decode_manifest.json",
+        strict=m4_plan is not None,
     )
 
 

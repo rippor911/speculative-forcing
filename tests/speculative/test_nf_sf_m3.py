@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -208,7 +209,12 @@ def _probe_outputs_for(probe):
     }
 
 
-def _checkpoint_for_pair(*, global_step: int, probe_seed: int = 44) -> dict:
+def _checkpoint_for_pair(
+    *,
+    global_step: int,
+    probe_seed: int = 44,
+    mode: str | None = None,
+) -> dict:
     state = _state()
     probe = make_m3_probe(
         state,
@@ -221,6 +227,9 @@ def _checkpoint_for_pair(*, global_step: int, probe_seed: int = 44) -> dict:
         [{"name": "linear", "params": list(model.parameters()), "lr": 1.0e-4}],
         weight_decay=0.01,
     )
+    m3_config = {"dtype": "float32"}
+    if mode is not None:
+        m3_config["mode"] = mode
     return make_m3_checkpoint_payload(
         generator=model,
         optimizer=optimizer,
@@ -243,7 +252,7 @@ def _checkpoint_for_pair(*, global_step: int, probe_seed: int = 44) -> dict:
         },
         resolved_config={
             "model_config": {"num_frame_per_block": 3},
-            "m3": {"dtype": "float32"},
+            "m3": m3_config,
         },
         git_sha=TEST_GIT_SHA,
         reference_checkpoint_path=Path("ref.pt"),
@@ -608,6 +617,40 @@ def test_initial_final_checkpoint_pair_accepts_matching_pair() -> None:
     assert report["status"] == "PASS"
     assert report["initial_global_step"] == 0
     assert report["final_global_step"] == 3
+    assert report["initial_mode"] == "joint"
+    assert report["final_mode"] == "joint"
+    assert report["mode"] == "joint"
+
+
+@pytest.mark.parametrize("mode", ["frozen", "joint"])
+def test_checkpoint_pair_report_records_initial_final_and_common_mode(mode) -> None:
+    report = validate_m3_checkpoint_pair(
+        initial_payload=_checkpoint_for_pair(global_step=0, mode=mode),
+        final_payload=_checkpoint_for_pair(global_step=3, mode=mode),
+        current_model_config={"num_frame_per_block": 3},
+        current_git_sha=TEST_GIT_SHA,
+    )
+
+    assert report["initial_mode"] == mode
+    assert report["final_mode"] == mode
+    assert report["mode"] == mode
+
+
+def test_old_checkpoint_without_mode_defaults_to_joint() -> None:
+    initial = _checkpoint_for_pair(global_step=0)
+    final = _checkpoint_for_pair(global_step=3)
+
+    assert "mode" not in initial["resolved_config"]["m3"]
+    assert m3.m3_mode_from_checkpoint_payload(final) == "joint"
+    report = validate_m3_checkpoint_pair(
+        initial_payload=initial,
+        final_payload=final,
+        current_model_config={"num_frame_per_block": 3},
+    )
+
+    assert report["mode"] == "joint"
+    assert report["initial_mode"] == "joint"
+    assert report["final_mode"] == "joint"
 
 
 @pytest.mark.parametrize(
@@ -641,6 +684,12 @@ def test_initial_final_checkpoint_pair_accepts_matching_pair() -> None:
                 {"model_config": {"num_frame_per_block": 99}}
             ),
             "current eval config",
+        ),
+        (
+            lambda payload: payload["resolved_config"]["m3"].update(
+                {"mode": "frozen"}
+            ),
+            "checkpoint mode",
         ),
         (
             lambda payload: payload.update({"git_sha": "b" * 40}),
@@ -710,7 +759,9 @@ def test_parameter_change_audit_reports_all_six_groups_changed() -> None:
     )
 
     assert report["status"] == "PASS"
+    assert report["mode"] == "joint"
     assert report["all_groups_parameter_changed"] is True
+    assert report["all_groups_match_mode_contract"] is True
     assert set(report["groups"]) == set(m3.M3_PARAMETER_GROUP_NAMES)
     for group in report["groups"].values():
         assert group["tensor_count"] == 2
@@ -718,6 +769,12 @@ def test_parameter_change_audit_reports_all_six_groups_changed() -> None:
         assert group["unchanged_tensor_count"] == 1
         assert group["max_abs_parameter_diff"] == 1.0
         assert group["parameter_changed"] is True
+        assert group["expected_change"] is True
+        assert group["contract_pass"] is True
+        assert group["initial_finite"] is True
+        assert group["final_finite"] is True
+        assert group["diff_finite"] is True
+        assert group["nonfinite_tensor_count"] == 0
 
 
 def test_parameter_change_audit_flags_unchanged_group() -> None:
@@ -731,7 +788,163 @@ def test_parameter_change_audit_flags_unchanged_group() -> None:
 
     assert report["status"] == "FAIL"
     assert report["all_groups_parameter_changed"] is False
+    assert report["all_groups_match_mode_contract"] is False
     assert report["groups"]["mcp_fusion"]["parameter_changed"] is False
+    assert report["groups"]["mcp_fusion"]["contract_pass"] is False
+
+
+def test_frozen_parameter_change_audit_accepts_exact_frozen_groups() -> None:
+    changed = set(m3.M3_PARAMETER_GROUP_NAMES) - {"backbone", "patch_embedding"}
+    initial, final = _state_dict_for_parameter_audit(changed_groups=changed)
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="frozen",
+    )
+
+    assert report["status"] == "PASS"
+    assert report["mode"] == "frozen"
+    assert report["all_groups_parameter_changed"] is False
+    assert report["all_groups_match_mode_contract"] is True
+    for group_name in ("backbone", "patch_embedding"):
+        group = report["groups"][group_name]
+        assert group["expected_change"] is False
+        assert group["changed_tensor_count"] == 0
+        assert group["max_abs_parameter_diff"] == 0.0
+        assert group["exact_unchanged"] is True
+        assert group["contract_pass"] is True
+        assert group["initial_finite"] is True
+        assert group["final_finite"] is True
+        assert group["diff_finite"] is True
+        assert group["nonfinite_tensor_count"] == 0
+    for group_name in ("mcp_fusion", "mcp_depth1", "mcp_depth2", "mcp_depth3"):
+        assert report["groups"][group_name]["expected_change"] is True
+        assert report["groups"][group_name]["parameter_changed"] is True
+        assert report["groups"][group_name]["contract_pass"] is True
+
+
+def test_frozen_parameter_change_audit_fails_any_backbone_or_patch_change() -> None:
+    changed = set(m3.M3_PARAMETER_GROUP_NAMES) - {"backbone", "patch_embedding"}
+    initial, final = _state_dict_for_parameter_audit(changed_groups=changed)
+    final["backbone.bias"] = torch.full((2,), 1.0e-7, dtype=torch.float32)
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="frozen",
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["all_groups_match_mode_contract"] is False
+    assert report["groups"]["backbone"]["changed_tensor_count"] == 1
+    assert report["groups"]["backbone"]["exact_unchanged"] is False
+    assert report["groups"]["backbone"]["contract_pass"] is False
+
+
+def test_frozen_parameter_change_audit_fails_final_nan_in_unchanged_group() -> None:
+    changed = set(m3.M3_PARAMETER_GROUP_NAMES) - {"backbone", "patch_embedding"}
+    initial, final = _state_dict_for_parameter_audit(changed_groups=changed)
+    final["backbone.weight"] = torch.full((2,), float("nan"), dtype=torch.float32)
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="frozen",
+    )
+
+    group = report["groups"]["backbone"]
+    assert report["status"] == "FAIL"
+    assert report["all_groups_match_mode_contract"] is False
+    assert group["final_finite"] is False
+    assert group["diff_finite"] is False
+    assert group["nonfinite_tensor_count"] == 1
+    assert group["exact_unchanged"] is False
+    assert group["contract_pass"] is False
+
+
+def test_frozen_parameter_change_audit_fails_initial_inf_in_unchanged_group() -> None:
+    changed = set(m3.M3_PARAMETER_GROUP_NAMES) - {"backbone", "patch_embedding"}
+    initial, final = _state_dict_for_parameter_audit(changed_groups=changed)
+    initial["patch_embedding.weight"] = torch.full(
+        (2,),
+        float("inf"),
+        dtype=torch.float32,
+    )
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="frozen",
+    )
+
+    group = report["groups"]["patch_embedding"]
+    assert report["status"] == "FAIL"
+    assert report["all_groups_match_mode_contract"] is False
+    assert group["initial_finite"] is False
+    assert group["diff_finite"] is False
+    assert group["nonfinite_tensor_count"] == 1
+    assert group["exact_unchanged"] is False
+    assert group["contract_pass"] is False
+
+
+def test_frozen_parameter_change_audit_fails_nan_in_expected_change_group() -> None:
+    changed = set(m3.M3_PARAMETER_GROUP_NAMES) - {"backbone", "patch_embedding"}
+    initial, final = _state_dict_for_parameter_audit(changed_groups=changed)
+    final["mcp_fusion.weight"] = torch.full((2,), float("nan"), dtype=torch.float32)
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="frozen",
+    )
+
+    group = report["groups"]["mcp_fusion"]
+    assert report["status"] == "FAIL"
+    assert report["all_groups_match_mode_contract"] is False
+    assert group["final_finite"] is False
+    assert group["diff_finite"] is False
+    assert group["nonfinite_tensor_count"] == 1
+    assert group["parameter_changed"] is False
+    assert group["contract_pass"] is False
+
+
+def test_joint_parameter_change_audit_fails_inf_in_required_group() -> None:
+    initial, final = _state_dict_for_parameter_audit(
+        changed_groups=set(m3.M3_PARAMETER_GROUP_NAMES),
+    )
+    final["mcp_depth2.weight"] = torch.full((2,), float("inf"), dtype=torch.float32)
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="joint",
+    )
+
+    group = report["groups"]["mcp_depth2"]
+    assert report["status"] == "FAIL"
+    assert report["all_groups_match_mode_contract"] is False
+    assert group["final_finite"] is False
+    assert group["diff_finite"] is False
+    assert group["nonfinite_tensor_count"] == 1
+    assert group["contract_pass"] is False
+
+
+def test_joint_parameter_change_audit_fails_when_required_group_is_unchanged() -> None:
+    changed = set(m3.M3_PARAMETER_GROUP_NAMES) - {"mcp_depth3"}
+    initial, final = _state_dict_for_parameter_audit(changed_groups=changed)
+    report = audit_parameter_changes(
+        initial_state_dict=initial,
+        final_state_dict=final,
+        optimizer_audit=_optimizer_audit_for_m3_groups(),
+        mode="joint",
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["all_groups_match_mode_contract"] is False
+    assert report["groups"]["mcp_depth3"]["expected_change"] is True
+    assert report["groups"]["mcp_depth3"]["parameter_changed"] is False
+    assert report["groups"]["mcp_depth3"]["contract_pass"] is False
 
 
 def test_gradient_group_audit_reports_required_format() -> None:
@@ -758,12 +971,183 @@ def test_gradient_group_audit_reports_required_format() -> None:
     optimizer = torch.optim.AdamW(groups)
     report = gradient_group_audit(optimizer)
 
-    assert set(report) == set(m3.M3_PARAMETER_GROUP_NAMES)
-    for group in report.values():
+    assert set(m3.M3_PARAMETER_GROUP_NAMES) < set(report)
+    assert report["optimizer_contract"]["all_contract_pass"] is True
+    for group_name in m3.M3_PARAMETER_GROUP_NAMES:
+        group = report[group_name]
         assert group["tensor_count_with_grad"] == 1
         assert group["tensor_count_without_grad"] == 1
         assert group["grad_norm"] == 1.0
         assert group["finite"] is True
+        assert group["expected_trainable"] is True
+        assert group["expected_in_optimizer"] is True
+        assert group["contract_pass"] is True
+
+
+def _gradient_audit_groups(
+    *,
+    mode: str,
+) -> tuple[
+    dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
+    list[dict[str, object]],
+]:
+    parameter_groups = {}
+    optimizer_groups = []
+    trainable = set(m3.M3_PARAMETER_GROUP_NAMES)
+    if mode == "frozen":
+        trainable -= {"backbone", "patch_embedding"}
+    for group_name in m3.M3_PARAMETER_GROUP_NAMES:
+        parameter = nn.Parameter(torch.ones(()))
+        parameter.requires_grad_(group_name in trainable)
+        parameter_groups[group_name] = ((f"{group_name}.weight", parameter),)
+        if group_name in trainable:
+            optimizer_groups.append(
+                {
+                    "name": group_name,
+                    "params": [parameter],
+                    "lr": 1.0e-3,
+                }
+            )
+    return parameter_groups, optimizer_groups
+
+
+def test_frozen_gradient_audit_requires_frozen_groups_out_of_optimizer_and_grad_none() -> None:
+    parameter_groups, optimizer_groups = _gradient_audit_groups(mode="frozen")
+    optimizer = torch.optim.AdamW(optimizer_groups)
+    loss = sum(
+        parameter
+        for group_name, group in parameter_groups.items()
+        for _, parameter in group
+        if group_name not in {"backbone", "patch_embedding"}
+    )
+    loss.backward()
+    report = gradient_group_audit(
+        optimizer,
+        mode="frozen",
+        parameter_groups=parameter_groups,
+    )
+
+    assert set(m3.M3_PARAMETER_GROUP_NAMES) < set(report)
+    assert report["optimizer_contract"]["all_contract_pass"] is True
+    for group_name in ("backbone", "patch_embedding"):
+        group = report[group_name]
+        assert group["expected_trainable"] is False
+        assert group["expected_in_optimizer"] is False
+        assert group["optimizer_tensor_count"] == 0
+        assert group["requires_grad_tensor_count"] == 0
+        assert group["tensor_count_with_grad"] == 0
+        assert group["tensor_count_without_grad"] == 1
+        assert group["finite"] is True
+        assert group["contract_pass"] is True
+    for group_name in ("mcp_fusion", "mcp_depth1", "mcp_depth2", "mcp_depth3"):
+        group = report[group_name]
+        assert group["expected_trainable"] is True
+        assert group["expected_in_optimizer"] is True
+        assert group["optimizer_tensor_count"] == 1
+        assert group["tensor_count_with_grad"] == 1
+        assert group["finite"] is True
+        assert group["contract_pass"] is True
+
+
+def test_joint_gradient_audit_requires_all_six_groups() -> None:
+    parameter_groups, optimizer_groups = _gradient_audit_groups(mode="joint")
+    optimizer = torch.optim.AdamW(optimizer_groups)
+    loss = sum(
+        parameter
+        for group in parameter_groups.values()
+        for _, parameter in group
+    )
+    loss.backward()
+    report = gradient_group_audit(
+        optimizer,
+        mode="joint",
+        parameter_groups=parameter_groups,
+    )
+
+    assert set(m3.M3_PARAMETER_GROUP_NAMES) < set(report)
+    assert report["optimizer_contract"]["all_contract_pass"] is True
+    assert all(report[group]["expected_trainable"] for group in m3.M3_PARAMETER_GROUP_NAMES)
+    assert all(report[group]["expected_in_optimizer"] for group in m3.M3_PARAMETER_GROUP_NAMES)
+    assert all(
+        report[group]["tensor_count_with_grad"] == 1
+        for group in m3.M3_PARAMETER_GROUP_NAMES
+    )
+    assert all(report[group]["contract_pass"] for group in m3.M3_PARAMETER_GROUP_NAMES)
+
+
+def test_gradient_audit_fails_unknown_optimizer_group_name() -> None:
+    parameter_groups, optimizer_groups = _gradient_audit_groups(mode="joint")
+    extra = nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW(
+        [
+            *optimizer_groups,
+            {"name": "unknown", "params": [extra], "lr": 1.0e-3},
+        ]
+    )
+    loss = sum(
+        parameter
+        for group in parameter_groups.values()
+        for _, parameter in group
+    ) + extra
+    loss.backward()
+    report = gradient_group_audit(
+        optimizer,
+        mode="joint",
+        parameter_groups=parameter_groups,
+    )
+
+    contract = report["optimizer_contract"]
+    assert contract["unexpected_optimizer_group_names"] == ["unknown"]
+    assert contract["unexpected_optimizer_parameter_count"] == 1
+    assert contract["optimizer_contract_pass"] is False
+    assert contract["all_contract_pass"] is False
+
+
+def test_gradient_audit_fails_extra_parameter_under_known_group_name() -> None:
+    parameter_groups, optimizer_groups = _gradient_audit_groups(mode="joint")
+    extra = nn.Parameter(torch.ones(()))
+    optimizer_groups[2]["params"].append(extra)
+    optimizer = torch.optim.AdamW(optimizer_groups)
+    loss = sum(
+        parameter
+        for group in parameter_groups.values()
+        for _, parameter in group
+    ) + extra
+    loss.backward()
+    report = gradient_group_audit(
+        optimizer,
+        mode="joint",
+        parameter_groups=parameter_groups,
+    )
+
+    contract = report["optimizer_contract"]
+    assert contract["unexpected_optimizer_group_names"] == []
+    assert contract["unexpected_optimizer_parameter_count"] == 1
+    assert contract["optimizer_contract_pass"] is False
+    assert contract["all_contract_pass"] is False
+
+
+def test_gradient_audit_fails_duplicate_optimizer_parameter() -> None:
+    parameter_groups, optimizer_groups = _gradient_audit_groups(mode="joint")
+    optimizer = torch.optim.AdamW(optimizer_groups)
+    duplicate = optimizer.param_groups[0]["params"][0]
+    optimizer.param_groups[1]["params"].append(duplicate)
+    loss = sum(
+        parameter
+        for group in parameter_groups.values()
+        for _, parameter in group
+    )
+    loss.backward()
+    report = gradient_group_audit(
+        optimizer,
+        mode="joint",
+        parameter_groups=parameter_groups,
+    )
+
+    contract = report["optimizer_contract"]
+    assert contract["duplicate_optimizer_parameter_count"] == 1
+    assert contract["optimizer_contract_pass"] is False
+    assert contract["all_contract_pass"] is False
 
 
 class FakeBackbone(nn.Module):
@@ -807,9 +1191,150 @@ def test_optimizer_group_lr_values_are_separate() -> None:
     assert by_name["mcp_depth3"] == 3.0e-5
 
 
-def test_m3_rejects_frozen_mode() -> None:
-    with pytest.raises(ValueError, match="joint"):
-        validate_m3_mode("frozen")
+@pytest.mark.parametrize("mode", ["frozen", "joint"])
+def test_m3_accepts_frozen_and_joint_modes(mode) -> None:
+    assert validate_m3_mode(mode) == mode
+
+
+def test_m3_rejects_invalid_mode() -> None:
+    with pytest.raises(ValueError, match="frozen.*joint"):
+        validate_m3_mode("invalid")
+
+
+def _train_cli_base_argv(*, optimizer_steps: int = 1) -> list[str]:
+    return [
+        "train_nf_sf_m3_overfit.py",
+        "--config",
+        "config.yaml",
+        "--checkpoint",
+        "checkpoint.pt",
+        "--manifest",
+        "manifest.json",
+        "--output_dir",
+        "out",
+        "--train_seed",
+        "1",
+        "--probe_seed",
+        "2",
+        "--optimizer_steps",
+        str(optimizer_steps),
+        "--backbone_lr",
+        "1e-5",
+        "--patch_embedding_lr",
+        "1e-5",
+        "--mcp_lr",
+        "1e-4",
+        "--weight_decay",
+        "0",
+    ]
+
+
+def test_train_cli_accepts_only_frozen_and_joint_modes(monkeypatch) -> None:
+    base_argv = _train_cli_base_argv()
+    for mode in ("frozen", "joint"):
+        monkeypatch.setattr(sys, "argv", [*base_argv, "--mode", mode])
+        assert train_m3.parse_args().mode == mode
+    monkeypatch.setattr(sys, "argv", [*base_argv, "--mode", "bad"])
+    with pytest.raises(SystemExit):
+        train_m3.parse_args()
+
+
+@pytest.mark.parametrize("optimizer_steps", [1, 3, 5])
+def test_train_cli_default_timing_warmup_is_zero_and_short_steps_pass(
+    monkeypatch,
+    optimizer_steps,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _train_cli_base_argv(optimizer_steps=optimizer_steps),
+    )
+
+    args = train_m3.parse_args()
+
+    assert args.timing_warmup_steps == 0
+    assert train_m3.validate_timing_warmup_steps(
+        args.timing_warmup_steps,
+        args.optimizer_steps,
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    ("optimizer_steps", "warmup"),
+    [(1, 0), (3, 3), (5, 5)],
+)
+def test_timing_warmup_validation_accepts_explicit_legal_values(
+    optimizer_steps,
+    warmup,
+) -> None:
+    assert train_m3.validate_timing_warmup_steps(warmup, optimizer_steps) == warmup
+
+
+def test_train_optimizer_plan_uses_requested_mode() -> None:
+    plan = train_m3.configure_m3_optimizer_plan(
+        FakeWanWrapper(),
+        mode="frozen",
+        group_lrs={"backbone": 1.0e-5, "patch_embedding": 2.0e-5, "mcp": 3.0e-5},
+    )
+    by_name = {audit.name: audit for audit in plan.audits}
+
+    assert plan.mode == "frozen"
+    assert by_name["backbone"].in_optimizer is False
+    assert by_name["patch_embedding"].in_optimizer is False
+    assert by_name["mcp_fusion"].in_optimizer is True
+    assert by_name["mcp_depth1"].in_optimizer is True
+    assert by_name["mcp_depth2"].in_optimizer is True
+    assert by_name["mcp_depth3"].in_optimizer is True
+
+
+def test_step_timing_summary_excludes_warmup_and_computes_median() -> None:
+    summary = train_m3.summarize_step_timings(
+        [10.0, 20.0, 30.0, 40.0],
+        timing_warmup_steps=2,
+    )
+
+    assert summary["all_step_elapsed_ms"] == [10.0, 20.0, 30.0, 40.0]
+    assert summary["measured_step_elapsed_ms"] == [30.0, 40.0]
+    assert summary["measured_step_count"] == 2
+    assert summary["mean_step_elapsed_ms"] == pytest.approx(35.0)
+    assert summary["median_step_elapsed_ms"] == pytest.approx(35.0)
+    assert summary["min_step_elapsed_ms"] == pytest.approx(30.0)
+    assert summary["max_step_elapsed_ms"] == pytest.approx(40.0)
+
+
+def test_step_timing_summary_supports_zero_and_all_warmup_steps() -> None:
+    no_warmup = train_m3.summarize_step_timings(
+        [1.0, 3.0, 5.0],
+        timing_warmup_steps=0,
+    )
+    all_warmup = train_m3.summarize_step_timings(
+        [1.0, 3.0, 5.0],
+        timing_warmup_steps=3,
+    )
+
+    assert no_warmup["measured_step_elapsed_ms"] == [1.0, 3.0, 5.0]
+    assert no_warmup["median_step_elapsed_ms"] == pytest.approx(3.0)
+    assert all_warmup["measured_step_elapsed_ms"] == []
+    assert all_warmup["measured_step_count"] == 0
+    assert all_warmup["mean_step_elapsed_ms"] is None
+    assert all_warmup["median_step_elapsed_ms"] is None
+    assert all_warmup["min_step_elapsed_ms"] is None
+    assert all_warmup["max_step_elapsed_ms"] is None
+
+
+@pytest.mark.parametrize("warmup", [-1, 4])
+def test_timing_warmup_validation_rejects_illegal_values(warmup) -> None:
+    with pytest.raises(ValueError, match="timing_warmup_steps"):
+        train_m3.validate_timing_warmup_steps(warmup, optimizer_steps=3)
+
+
+def test_cpu_memory_summary_is_null_without_cuda() -> None:
+    summary = train_m3.cuda_peak_memory_summary(torch.device("cpu"))
+
+    assert summary == {
+        "max_memory_allocated_bytes": None,
+        "max_memory_reserved_bytes": None,
+    }
 
 
 class ZeroMainFlowGenerator(nn.Module):
@@ -1175,10 +1700,10 @@ def _aux_state() -> NFSFSelectedState:
     )
 
 
-def _aux_optimizer(generator: AuxFakeWan) -> CountingSGD:
+def _aux_optimizer(generator: AuxFakeWan, *, mode: str = "joint") -> CountingSGD:
     plan = configure_nf_sf_optimizer_plan(
         generator,
-        mode="joint",
+        mode=mode,
         group_lrs={"backbone": 0.1, "patch_embedding": 0.1, "mcp": 0.1},
     )
     return CountingSGD(plan.optimizer_param_groups, lr=0.1)
@@ -1294,6 +1819,86 @@ def test_mcp1_grid_aux_weight_zero_does_not_run_grid_forward(monkeypatch) -> Non
     assert report["enabled"] is False
     assert generator.calls == []
     _assert_requires_grad_restored(generator, original_requires_grad)
+
+
+@pytest.mark.parametrize("mode", ["frozen", "joint"])
+def test_mcp1_grid_aux_restores_mode_requires_grad_state(mode) -> None:
+    generator = AuxFakeWan()
+    state = _aux_state()
+    optimizer = _aux_optimizer(generator, mode=mode)
+    original_requires_grad = _all_requires_grad(generator)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(generator, optimizer, state, make_cpu_generator(100))
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+
+    train_m3.accumulate_mcp1_grid_aux_gradients(
+        generator,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        state=state,
+        scheduler=aux_scheduler,
+        timesteps=timesteps,
+        epsilon_main=batch.epsilon_main,
+        epsilon_future=batch.epsilon_depths[0],
+        weight=1.0,
+    )
+
+    _assert_requires_grad_restored(generator, original_requires_grad)
+    groups = train_m3.named_parameter_groups(generator)
+    if mode == "frozen":
+        for group_name in ("backbone", "patch_embedding"):
+            for _, parameter in groups[group_name]:
+                assert parameter.requires_grad is False
+                assert parameter.grad is None
+    else:
+        assert all(parameter.requires_grad for _, parameter in generator.named_parameters())
+
+
+def test_mcp1_grid_aux_restores_frozen_requires_grad_on_midpoint_failure() -> None:
+    generator = AuxFakeWan(fail_aux_forward_at=2)
+    state = _aux_state()
+    optimizer = _aux_optimizer(generator, mode="frozen")
+    original_requires_grad = _all_requires_grad(generator)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(generator, optimizer, state, make_cpu_generator(102))
+    groups = train_m3.named_parameter_groups(generator)
+    before = train_m3.gradient_metadata_snapshot(groups)
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(RuntimeError, match="forced auxiliary forward failure"):
+        train_m3.accumulate_mcp1_grid_aux_gradients(
+            generator,
+            conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+            state=state,
+            scheduler=aux_scheduler,
+            timesteps=timesteps,
+            epsilon_main=batch.epsilon_main,
+            epsilon_future=batch.epsilon_depths[0],
+            weight=1.0,
+        )
+
+    _assert_requires_grad_restored(generator, original_requires_grad)
+    after = train_m3.gradient_metadata_snapshot(groups)
+    for group_name in ("backbone", "patch_embedding"):
+        for _, parameter in groups[group_name]:
+            assert parameter.requires_grad is False
+            assert parameter.grad is None
+    for group_name in ("mcp_depth2", "mcp_depth3"):
+        for name in before[group_name]:
+            assert after[group_name][name]["grad_is_none"] is False
+            assert after[group_name][name]["grad_object_id"] == before[group_name][name]["grad_object_id"]
+            assert after[group_name][name]["grad_data_ptr"] == before[group_name][name]["grad_data_ptr"]
+            assert after[group_name][name]["grad_version"] == before[group_name][name]["grad_version"]
+    for group_name in ("mcp_fusion", "mcp_depth1"):
+        for name in before[group_name]:
+            assert after[group_name][name]["grad_is_none"] is False
+            assert after[group_name][name]["grad_object_id"] == before[group_name][name]["grad_object_id"]
+            assert after[group_name][name]["grad_data_ptr"] == before[group_name][name]["grad_data_ptr"]
 
 
 def test_mcp1_grid_aux_accumulates_four_autograd_grads_and_one_optimizer_step(monkeypatch) -> None:

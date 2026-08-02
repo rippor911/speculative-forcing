@@ -26,6 +26,7 @@ from utils.nf_sf_m3 import (
     compare_serialized_probe_tensors,
     load_m3_checkpoint,
     load_m3_teacher_sample,
+    m3_mode_from_checkpoint_payload,
     make_m3_probe,
     move_tensors_to_device,
     reconstruct_main_current,
@@ -369,6 +370,7 @@ def main() -> None:
     device = require_single_gpu_runtime(torch, args.device)
     current_git_sha = git_head()
     final_payload = load_m3_checkpoint(args.m3_checkpoint)
+    checkpoint_mode = m3_mode_from_checkpoint_payload(final_payload)
     validate_m3_checkpoint_git_sha(
         final_payload,
         current_git_sha=current_git_sha,
@@ -487,19 +489,23 @@ def main() -> None:
             initial_state_dict=initial_payload["generator"],
             final_state_dict=final_payload["generator"],
             optimizer_audit=optimizer_audit,
+            mode=checkpoint_mode,
         )
         atomic_json_write(
             {
                 "status": parameter_change_report["status"],
                 "m3_checkpoint": str(args.m3_checkpoint.resolve()),
                 "initial_m3_checkpoint": str(args.initial_m3_checkpoint.resolve()),
+                "mode": checkpoint_mode,
                 "checkpoint_pair": checkpoint_pair_report,
                 **parameter_change_report,
             },
             args.output_dir / "parameter_change_audit.json",
         )
-        if not parameter_change_report["all_groups_parameter_changed"]:
-            raise RuntimeError("Joint M3 parameter change audit failed")
+        if not parameter_change_report["all_groups_match_mode_contract"]:
+            raise RuntimeError(
+                f"{checkpoint_mode} M3 parameter change audit contract failed"
+            )
 
     if not args.decode:
         return

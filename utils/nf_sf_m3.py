@@ -72,6 +72,8 @@ M3_PARAMETER_GROUP_NAMES = (
     "mcp_depth2",
     "mcp_depth3",
 )
+M3_TRAIN_MODES = ("frozen", "joint")
+M3_FROZEN_UNCHANGED_GROUPS = ("backbone", "patch_embedding")
 
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -118,9 +120,25 @@ class M3ReconstructionResult:
     solver_schedule: M3SolverSchedule
 
 
-def validate_m3_mode(mode: str) -> None:
-    if mode != "joint":
-        raise ValueError("NF-SF M3 only accepts joint mode")
+def validate_m3_mode(mode: str) -> str:
+    mode = str(mode)
+    if mode not in M3_TRAIN_MODES:
+        raise ValueError("NF-SF M3/M4 mode must be 'frozen' or 'joint'")
+    return mode
+
+
+def m3_mode_from_resolved_config(resolved_config: Mapping[str, Any]) -> str:
+    m3_config = resolved_config.get("m3")
+    if not isinstance(m3_config, Mapping):
+        return "joint"
+    return validate_m3_mode(str(m3_config.get("mode", "joint")))
+
+
+def m3_mode_from_checkpoint_payload(payload: Mapping[str, Any]) -> str:
+    resolved_config = payload.get("resolved_config", {})
+    if not isinstance(resolved_config, Mapping):
+        return "joint"
+    return m3_mode_from_resolved_config(resolved_config)
 
 
 def validate_git_sha(value: str, *, name: str = "git_sha") -> str:
@@ -1162,17 +1180,92 @@ def optimizer_config_summary(optimizer: torch.optim.Optimizer) -> dict[str, Any]
     }
 
 
-def gradient_group_audit(optimizer: torch.optim.Optimizer) -> dict[str, dict[str, Any]]:
-    report = {}
+def _expected_group_trainable(mode: str, group_name: str) -> bool:
+    if mode == "joint":
+        return True
+    return group_name not in M3_FROZEN_UNCHANGED_GROUPS
+
+
+def gradient_group_audit(
+    optimizer: torch.optim.Optimizer,
+    *,
+    mode: str = "joint",
+    parameter_groups: Mapping[str, tuple[tuple[str, torch.nn.Parameter], ...]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    mode = validate_m3_mode(mode)
+    optimizer_params_by_group: dict[str, tuple[torch.nn.Parameter, ...]] = {}
+    optimizer_param_ids = set()
+    duplicate_optimizer_param_ids = set()
+    unexpected_group_names = []
     for group in optimizer.param_groups:
         name = str(group.get("name"))
+        params = tuple(group.get("params", []))
         if name not in M3_PARAMETER_GROUP_NAMES:
-            continue
+            unexpected_group_names.append(name)
+        else:
+            optimizer_params_by_group[name] = (
+                optimizer_params_by_group.get(name, ()) + params
+            )
+        for parameter in params:
+            parameter_id = id(parameter)
+            if parameter_id in optimizer_param_ids:
+                duplicate_optimizer_param_ids.add(parameter_id)
+            optimizer_param_ids.add(parameter_id)
+
+    if parameter_groups is None:
+        missing = set(M3_PARAMETER_GROUP_NAMES) - set(optimizer_params_by_group.keys())
+        if missing:
+            raise RuntimeError(
+                f"missing M3 optimizer groups for grad audit: {sorted(missing)}"
+            )
+        parameter_groups = {
+            name: tuple((f"{name}.{index}", parameter) for index, parameter in enumerate(params))
+            for name, params in optimizer_params_by_group.items()
+        }
+    else:
+        missing = set(M3_PARAMETER_GROUP_NAMES) - set(parameter_groups.keys())
+        if missing:
+            raise RuntimeError(
+                f"missing M3 parameter groups for grad audit: {sorted(missing)}"
+            )
+
+    known_parameter_ids = {
+        id(parameter)
+        for group_name in M3_PARAMETER_GROUP_NAMES
+        for _, parameter in parameter_groups[group_name]
+    }
+    unexpected_optimizer_parameter_count = sum(
+        1 for parameter_id in optimizer_param_ids if parameter_id not in known_parameter_ids
+    )
+    optimizer_contract = {
+        "unexpected_optimizer_group_names": sorted(set(unexpected_group_names)),
+        "unexpected_optimizer_parameter_count": int(
+            unexpected_optimizer_parameter_count
+        ),
+        "duplicate_optimizer_parameter_count": int(len(duplicate_optimizer_param_ids)),
+    }
+    optimizer_contract["optimizer_contract_pass"] = bool(
+        not optimizer_contract["unexpected_optimizer_group_names"]
+        and optimizer_contract["unexpected_optimizer_parameter_count"] == 0
+        and optimizer_contract["duplicate_optimizer_parameter_count"] == 0
+    )
+
+    report = {}
+    for group_name in M3_PARAMETER_GROUP_NAMES:
+        expected_trainable = _expected_group_trainable(mode, group_name)
+        named_params = tuple(parameter_groups[group_name])
+        tensor_count = len(named_params)
+        optimizer_tensor_count = sum(
+            1 for _, parameter in named_params if id(parameter) in optimizer_param_ids
+        )
+        requires_grad_count = sum(
+            1 for _, parameter in named_params if bool(parameter.requires_grad)
+        )
         grad_sq_sum = 0.0
         with_grad = 0
         without_grad = 0
         finite = True
-        for parameter in group.get("params", []):
+        for _, parameter in named_params:
             grad = parameter.grad
             if grad is None:
                 without_grad += 1
@@ -1183,15 +1276,46 @@ def gradient_group_audit(optimizer: torch.optim.Optimizer) -> dict[str, dict[str
             grad_sq_sum += float(grad_value.square().sum().item())
         grad_norm = float(grad_sq_sum ** 0.5)
         finite = finite and bool(torch.isfinite(torch.tensor(grad_norm)).item())
-        report[name] = {
+        in_optimizer = tensor_count > 0 and optimizer_tensor_count == tensor_count
+        if expected_trainable:
+            contract_pass = (
+                tensor_count > 0
+                and requires_grad_count == tensor_count
+                and in_optimizer
+                and with_grad > 0
+                and finite
+            )
+        else:
+            contract_pass = (
+                tensor_count > 0
+                and requires_grad_count == 0
+                and optimizer_tensor_count == 0
+                and with_grad == 0
+                and without_grad == tensor_count
+                and finite
+            )
+        report[group_name] = {
+            "mode": mode,
+            "expected_trainable": bool(expected_trainable),
+            "expected_in_optimizer": bool(expected_trainable),
+            "tensor_count": int(tensor_count),
+            "requires_grad_tensor_count": int(requires_grad_count),
+            "optimizer_tensor_count": int(optimizer_tensor_count),
             "tensor_count_with_grad": int(with_grad),
             "tensor_count_without_grad": int(without_grad),
             "grad_norm": grad_norm,
             "finite": bool(finite),
+            "in_optimizer": bool(in_optimizer),
+            "contract_pass": bool(contract_pass),
         }
-    missing = set(M3_PARAMETER_GROUP_NAMES) - set(report.keys())
-    if missing:
-        raise RuntimeError(f"missing M3 optimizer groups for grad audit: {sorted(missing)}")
+    optimizer_contract["all_groups_mode_contract_pass"] = bool(
+        all(report[group_name]["contract_pass"] for group_name in M3_PARAMETER_GROUP_NAMES)
+    )
+    optimizer_contract["all_contract_pass"] = bool(
+        optimizer_contract["optimizer_contract_pass"]
+        and optimizer_contract["all_groups_mode_contract_pass"]
+    )
+    report["optimizer_contract"] = optimizer_contract
     return report
 
 
@@ -1222,15 +1346,24 @@ def audit_parameter_changes(
     initial_state_dict: Mapping[str, torch.Tensor],
     final_state_dict: Mapping[str, torch.Tensor],
     optimizer_audit: Mapping[str, Any],
+    mode: str = "joint",
 ) -> dict[str, Any]:
+    mode = validate_m3_mode(mode)
     groups = parameter_names_by_group_from_optimizer_audit(optimizer_audit)
     group_reports = {}
     all_changed = True
+    all_contract = True
     for group_name in M3_PARAMETER_GROUP_NAMES:
+        expected_change = _expected_group_trainable(mode, group_name)
         names = groups[group_name]
         changed_count = 0
         unchanged_count = 0
         max_abs = 0.0
+        initial_finite = True
+        final_finite = True
+        diff_finite = True
+        nonfinite_tensor_count = 0
+        nonfinite_parameter_names = []
         for name in names:
             if name not in initial_state_dict or name not in final_state_dict:
                 raise RuntimeError(f"parameter {name!r} missing from checkpoint state_dict")
@@ -1242,26 +1375,64 @@ def audit_parameter_changes(
                 raise RuntimeError(f"parameter {name!r} shape differs between checkpoints")
             if initial.dtype != final.dtype:
                 raise RuntimeError(f"parameter {name!r} dtype differs between checkpoints")
+            initial_tensor_finite = bool(torch.isfinite(initial.detach()).all().item())
+            final_tensor_finite = bool(torch.isfinite(final.detach()).all().item())
+            initial_finite = initial_finite and initial_tensor_finite
+            final_finite = final_finite and final_tensor_finite
+            if not initial_tensor_finite or not final_tensor_finite:
+                diff_finite = False
+                nonfinite_tensor_count += 1
+                nonfinite_parameter_names.append(name)
+                continue
             diff = (final.detach().float().cpu() - initial.detach().float().cpu()).abs()
+            tensor_diff_finite = bool(torch.isfinite(diff).all().item())
+            diff_finite = diff_finite and tensor_diff_finite
+            if not tensor_diff_finite:
+                nonfinite_tensor_count += 1
+                nonfinite_parameter_names.append(name)
+                continue
             tensor_max_abs = float(diff.max().item()) if diff.numel() else 0.0
             max_abs = max(max_abs, tensor_max_abs)
             if tensor_max_abs > 0.0:
                 changed_count += 1
             else:
                 unchanged_count += 1
-        parameter_changed = changed_count > 0
+        finite_contract = initial_finite and final_finite and diff_finite
+        parameter_changed = finite_contract and changed_count > 0
+        exact_unchanged = (
+            finite_contract
+            and changed_count == 0
+            and unchanged_count == len(names)
+            and max_abs == 0.0
+        )
+        contract_pass = (
+            finite_contract
+            and (parameter_changed if expected_change else exact_unchanged)
+        )
         all_changed = all_changed and parameter_changed
+        all_contract = all_contract and contract_pass
         group_reports[group_name] = {
+            "mode": mode,
             "tensor_count": int(len(names)),
             "changed_tensor_count": int(changed_count),
             "unchanged_tensor_count": int(unchanged_count),
             "max_abs_parameter_diff": max_abs,
             "parameter_changed": bool(parameter_changed),
+            "exact_unchanged": bool(exact_unchanged),
+            "expected_change": bool(expected_change),
+            "contract_pass": bool(contract_pass),
+            "initial_finite": bool(initial_finite),
+            "final_finite": bool(final_finite),
+            "diff_finite": bool(diff_finite),
+            "nonfinite_tensor_count": int(nonfinite_tensor_count),
+            "nonfinite_parameter_names": nonfinite_parameter_names,
         }
     return {
-        "status": "PASS" if all_changed else "FAIL",
+        "status": "PASS" if all_contract else "FAIL",
+        "mode": mode,
         "groups": group_reports,
         "all_groups_parameter_changed": bool(all_changed),
+        "all_groups_match_mode_contract": bool(all_contract),
     }
 
 
@@ -1613,6 +1784,10 @@ def validate_m3_checkpoint_pair(
         raise RuntimeError("final M3 checkpoint global_step must be greater than 0")
     validate_m3_eval_config_matches_checkpoint(initial_payload, current_model_config)
     validate_m3_eval_config_matches_checkpoint(final_payload, current_model_config)
+    initial_mode = m3_mode_from_checkpoint_payload(initial_payload)
+    final_mode = m3_mode_from_checkpoint_payload(final_payload)
+    if initial_mode != final_mode:
+        raise RuntimeError("initial/final M3 checkpoint mode differs")
     if initial_payload.get("resolved_config") != final_payload.get("resolved_config"):
         raise RuntimeError("initial/final resolved config differs")
     initial_git_sha = validate_git_sha(str(initial_payload["git_sha"]), name="initial.git_sha")
@@ -1660,6 +1835,9 @@ def validate_m3_checkpoint_pair(
         "prompt": initial_meta.get("prompt"),
         "reference_checkpoint_sha256": initial_reference_sha,
         "git_sha": final_git_sha,
+        "initial_mode": initial_mode,
+        "final_mode": final_mode,
+        "mode": final_mode,
         "probe_seed": int(final_payload["probe_seed"]),
         "probe_tensor_comparison": probe_tensor_comparison,
         "prompt_embedding_comparison": prompt_embedding_comparison,

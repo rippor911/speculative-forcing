@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import random
+import statistics
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from utils.nf_sf_m3 import (
     M3_CHUNK_FRAMES,
     M3_DEPTHS,
     M3_DEPTH_WEIGHTS,
+    M3_TRAIN_MODES,
     atomic_json_write,
     file_sha256,
     gradient_group_audit,
@@ -81,10 +83,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default=None)
     parser.add_argument("--split_index", type=int, default=None)
     parser.add_argument("--output_dir", required=True, type=Path)
-    parser.add_argument("--mode", default="joint")
+    parser.add_argument("--mode", choices=M3_TRAIN_MODES, default="joint")
     parser.add_argument("--train_seed", type=int, required=True)
     parser.add_argument("--probe_seed", type=int, required=True)
     parser.add_argument("--optimizer_steps", type=int, required=True)
+    parser.add_argument("--timing_warmup_steps", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--checkpoint_interval", type=int, default=10)
     parser.add_argument("--backbone_lr", type=float, required=True)
@@ -120,6 +123,72 @@ def dtype_from_arg(value: str) -> torch.dtype:
     return torch.bfloat16 if value == "bf16" else torch.float32
 
 
+def validate_timing_warmup_steps(timing_warmup_steps: int, optimizer_steps: int) -> int:
+    timing_warmup_steps = int(timing_warmup_steps)
+    optimizer_steps = int(optimizer_steps)
+    if timing_warmup_steps < 0:
+        raise ValueError("--timing_warmup_steps must be non-negative")
+    if timing_warmup_steps > optimizer_steps:
+        raise ValueError("--timing_warmup_steps must be <= --optimizer_steps")
+    return timing_warmup_steps
+
+
+def summarize_step_timings(
+    all_step_elapsed_ms: list[float],
+    *,
+    timing_warmup_steps: int,
+) -> dict[str, Any]:
+    validate_timing_warmup_steps(timing_warmup_steps, len(all_step_elapsed_ms))
+    all_steps = [float(value) for value in all_step_elapsed_ms]
+    measured = all_steps[int(timing_warmup_steps) :]
+    summary = {
+        "all_step_elapsed_ms": all_steps,
+        "measured_step_elapsed_ms": measured,
+        "measured_step_count": int(len(measured)),
+    }
+    if measured:
+        summary.update(
+            {
+                "mean_step_elapsed_ms": float(statistics.fmean(measured)),
+                "median_step_elapsed_ms": float(statistics.median(measured)),
+                "min_step_elapsed_ms": float(min(measured)),
+                "max_step_elapsed_ms": float(max(measured)),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "mean_step_elapsed_ms": None,
+                "median_step_elapsed_ms": None,
+                "min_step_elapsed_ms": None,
+                "max_step_elapsed_ms": None,
+            }
+        )
+    return summary
+
+
+def cuda_synchronize_if_available(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def reset_peak_memory_stats_if_available(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def cuda_peak_memory_summary(device: torch.device) -> dict[str, int | None]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {
+            "max_memory_allocated_bytes": None,
+            "max_memory_reserved_bytes": None,
+        }
+    return {
+        "max_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "max_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+    }
+
+
 def resolved_config_dict(config: Any) -> dict[str, Any]:
     from omegaconf import OmegaConf
 
@@ -131,6 +200,7 @@ def validate_config(config: Any, args: argparse.Namespace) -> None:
         raise FileNotFoundError(args.checkpoint)
     if args.optimizer_steps <= 0:
         raise ValueError("--optimizer_steps must be positive")
+    validate_timing_warmup_steps(args.timing_warmup_steps, args.optimizer_steps)
     if args.log_interval <= 0:
         raise ValueError("--log_interval must be positive")
     if args.checkpoint_interval <= 0:
@@ -309,6 +379,26 @@ def append_metrics(path: Path, record: dict[str, Any]) -> None:
 
 def named_parameter_groups(generator) -> dict[str, tuple[tuple[str, torch.nn.Parameter], ...]]:
     return collect_nf_sf_parameter_groups(generator)
+
+
+def configure_m3_optimizer_plan(generator, *, mode: str, group_lrs: dict[str, float]):
+    return configure_nf_sf_optimizer_plan(
+        generator,
+        mode=validate_m3_mode(mode),
+        group_lrs=group_lrs,
+    )
+
+
+def gradient_audit_contract_pass(report: dict[str, Any]) -> bool:
+    optimizer_contract = report.get("optimizer_contract")
+    if isinstance(optimizer_contract, dict):
+        return bool(optimizer_contract.get("all_contract_pass"))
+    return all(
+        isinstance(entry, dict)
+        and bool(entry.get("finite"))
+        and bool(entry.get("contract_pass"))
+        for entry in report.values()
+    )
 
 
 def gradient_metadata_snapshot(
@@ -721,7 +811,7 @@ def save_checkpoint_at_step(
 
 def main() -> None:
     args = parse_args()
-    validate_m3_mode(args.mode)
+    args.mode = validate_m3_mode(args.mode)
     dtype = dtype_from_arg(args.dtype)
     device = require_single_gpu_runtime(torch, args.device)
     reset_global_seed(args.train_seed)
@@ -782,6 +872,7 @@ def main() -> None:
             "train_seed": args.train_seed,
             "probe_seed": args.probe_seed,
             "optimizer_steps": args.optimizer_steps,
+            "timing_warmup_steps": args.timing_warmup_steps,
             "log_interval": args.log_interval,
             "checkpoint_interval": args.checkpoint_interval,
             "backbone_lr": args.backbone_lr,
@@ -865,9 +956,9 @@ def main() -> None:
             "patch_embedding": args.patch_embedding_lr,
             "mcp": args.mcp_lr,
         }
-        plan = configure_nf_sf_optimizer_plan(
+        plan = configure_m3_optimizer_plan(
             generator,
-            mode="joint",
+            mode=args.mode,
             group_lrs=group_lrs,
         )
         optimizer = torch.optim.AdamW(
@@ -929,7 +1020,10 @@ def main() -> None:
             },
         )
 
+        all_step_elapsed_ms: list[float] = []
+        reset_peak_memory_stats_if_available(device)
         for step in range(1, args.optimizer_steps + 1):
+            cuda_synchronize_if_available(device)
             started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             noisy_batch = prepare_nf_sf_noisy_batch(
@@ -949,9 +1043,14 @@ def main() -> None:
                 depth_weights=M3_DEPTH_WEIGHTS,
             )
             result.losses.total_loss.backward()
-            random_grad_audit = gradient_group_audit(optimizer)
-            if not all(entry["finite"] for entry in random_grad_audit.values()):
-                raise RuntimeError(f"non-finite random gradient audit at step {step}")
+            parameter_groups = named_parameter_groups(generator)
+            random_grad_audit = gradient_group_audit(
+                optimizer,
+                mode=args.mode,
+                parameter_groups=parameter_groups,
+            )
+            if not gradient_audit_contract_pass(random_grad_audit):
+                raise RuntimeError(f"random gradient audit contract failed at step {step}")
             aux_report = accumulate_mcp1_grid_aux_gradients(
                 generator,
                 conditional_dict=conditional_dict,
@@ -962,14 +1061,19 @@ def main() -> None:
                 epsilon_future=noisy_batch.epsilon_depths[0],
                 weight=float(args.mcp1_grid_aux_weight),
             )
-            grad_audit = gradient_group_audit(optimizer)
-            if not all(entry["finite"] for entry in grad_audit.values()):
-                raise RuntimeError(f"non-finite gradient audit at step {step}")
+            grad_audit = gradient_group_audit(
+                optimizer,
+                mode=args.mode,
+                parameter_groups=parameter_groups,
+            )
+            if not gradient_audit_contract_pass(grad_audit):
+                raise RuntimeError(f"gradient audit contract failed at step {step}")
             if has_nonfinite_grad(generator):
                 raise RuntimeError(f"non-finite gradient at step {step}")
             optimizer.step()
-            torch.cuda.synchronize(device)
+            cuda_synchronize_if_available(device)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            all_step_elapsed_ms.append(elapsed_ms)
             train_losses = loss_dict_to_floats(result.losses)
             combined_objective = (
                 train_losses["total_loss"]
@@ -1078,15 +1182,21 @@ def main() -> None:
             else:
                 append_metrics(metrics_path, metric_record)
 
-        print(
-            json.dumps(
-                {
-                    "status": "PASS",
-                    "output_dir": str(args.output_dir.resolve()),
-                    "optimizer_steps": args.optimizer_steps,
-                },
-                indent=2,
+        summary = {
+            "status": "PASS",
+            "output_dir": str(args.output_dir.resolve()),
+            "mode": args.mode,
+            "optimizer_steps": int(args.optimizer_steps),
+            "timing_warmup_steps": int(args.timing_warmup_steps),
+            **summarize_step_timings(
+                all_step_elapsed_ms,
+                timing_warmup_steps=args.timing_warmup_steps,
             ),
+            **cuda_peak_memory_summary(device),
+        }
+        atomic_json_write(summary, args.output_dir / "training_summary.json")
+        print(
+            json.dumps(summary, indent=2),
             flush=True,
         )
     finally:

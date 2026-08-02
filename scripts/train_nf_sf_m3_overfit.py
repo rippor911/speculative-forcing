@@ -311,53 +311,98 @@ def named_parameter_groups(generator) -> dict[str, tuple[tuple[str, torch.nn.Par
     return collect_nf_sf_parameter_groups(generator)
 
 
-def clone_gradients(
+def gradient_metadata_snapshot(
     groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
-) -> dict[str, dict[str, torch.Tensor | None]]:
-    return {
-        group_name: {
-            name: None if parameter.grad is None else parameter.grad.detach().clone()
-            for name, parameter in named_params
-        }
-        for group_name, named_params in groups.items()
-    }
-
-
-def grad_tensor_changed(before: torch.Tensor | None, after: torch.Tensor | None) -> bool:
-    if before is None and after is None:
-        return False
-    if before is None or after is None:
-        return True
-    return not torch.equal(before, after)
-
-
-def max_grad_abs_diff(before: torch.Tensor | None, after: torch.Tensor | None) -> float:
-    if before is None and after is None:
-        return 0.0
-    if before is None:
-        return float(after.detach().float().abs().max().item()) if after is not None else 0.0
-    if after is None:
-        return float(before.detach().float().abs().max().item())
-    return float((after.detach().float() - before.detach().float()).abs().max().item())
+) -> dict[str, dict[str, dict[str, Any]]]:
+    snapshot = {}
+    for group_name, named_params in groups.items():
+        group_snapshot = {}
+        for name, parameter in named_params:
+            grad = parameter.grad
+            if grad is None:
+                group_snapshot[name] = {
+                    "grad_is_none": True,
+                    "grad_object_id": None,
+                    "grad_data_ptr": None,
+                    "grad_version": None,
+                    "shape": None,
+                    "dtype": None,
+                    "device": None,
+                }
+            else:
+                group_snapshot[name] = {
+                    "grad_is_none": False,
+                    "grad_object_id": int(id(grad)),
+                    "grad_data_ptr": int(grad.data_ptr()),
+                    "grad_version": int(grad._version),
+                    "shape": [int(dim) for dim in grad.shape],
+                    "dtype": str(grad.dtype),
+                    "device": str(grad.device),
+                }
+        snapshot[group_name] = group_snapshot
+    return snapshot
 
 
 def validate_mcp1_grid_aux_gradient_isolation(
-    before: dict[str, dict[str, torch.Tensor | None]],
-    after: dict[str, dict[str, torch.Tensor | None]],
+    before: dict[str, dict[str, dict[str, Any]]],
+    after: dict[str, dict[str, dict[str, Any]]],
+    groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
 ) -> dict[str, Any]:
     target_groups = {"mcp_fusion", "mcp_depth1"}
     reports = {}
     for group_name, tensors in before.items():
         changed_count = 0
-        max_abs = 0.0
+        object_changed_count = 0
+        data_ptr_changed_count = 0
+        version_changed_count = 0
+        metadata_changed_count = 0
+        version_increased_count = 0
         for name, before_grad in tensors.items():
             after_grad = after[group_name][name]
-            if grad_tensor_changed(before_grad, after_grad):
+            identity_keys = (
+                "grad_is_none",
+                "grad_object_id",
+                "grad_data_ptr",
+                "shape",
+                "dtype",
+                "device",
+            )
+            identity_changed = any(
+                before_grad[key] != after_grad[key] for key in identity_keys
+            )
+            object_changed = (
+                before_grad["grad_object_id"] != after_grad["grad_object_id"]
+            )
+            data_ptr_changed = (
+                before_grad["grad_data_ptr"] != after_grad["grad_data_ptr"]
+            )
+            version_changed = (
+                before_grad["grad_version"] != after_grad["grad_version"]
+            )
+            if identity_changed or version_changed:
                 changed_count += 1
-            max_abs = max(max_abs, max_grad_abs_diff(before_grad, after_grad))
+            if object_changed:
+                object_changed_count += 1
+            if data_ptr_changed:
+                data_ptr_changed_count += 1
+            if version_changed:
+                version_changed_count += 1
+            if identity_changed:
+                metadata_changed_count += 1
+            if (
+                before_grad["grad_version"] is not None
+                and after_grad["grad_version"] is not None
+                and after_grad["grad_version"] > before_grad["grad_version"]
+            ):
+                version_increased_count += 1
         reports[group_name] = {
+            "tensor_count": int(len(tensors)),
             "changed_tensor_count": int(changed_count),
-            "max_abs_grad_diff": float(max_abs),
+            "object_id_changed_count": int(object_changed_count),
+            "data_ptr_changed_count": int(data_ptr_changed_count),
+            "version_changed_count": int(version_changed_count),
+            "metadata_changed_count": int(metadata_changed_count),
+            "version_increased_count": int(version_increased_count),
             "aux_grad_changed": changed_count > 0,
         }
     for group_name, report in reports.items():
@@ -366,23 +411,116 @@ def validate_mcp1_grid_aux_gradient_isolation(
                 f"MCP-1 grid auxiliary gradient leaked into {group_name}"
             )
     for group_name in target_groups:
-        if reports[group_name]["changed_tensor_count"] <= 0:
+        for name, before_grad in before[group_name].items():
+            after_grad = after[group_name][name]
+            if before_grad["grad_is_none"] or after_grad["grad_is_none"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary missing random gradient for {group_name}"
+                )
+            if before_grad["grad_object_id"] != after_grad["grad_object_id"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary replaced gradient object for {group_name}"
+                )
+            if before_grad["grad_data_ptr"] != after_grad["grad_data_ptr"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary replaced gradient storage for {group_name}"
+                )
+            if before_grad["shape"] != after_grad["shape"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary changed gradient shape for {group_name}"
+                )
+            if before_grad["dtype"] != after_grad["dtype"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary changed gradient dtype for {group_name}"
+                )
+            if before_grad["device"] != after_grad["device"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary changed gradient device for {group_name}"
+                )
+            if after_grad["grad_version"] <= before_grad["grad_version"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary did not update gradients for {group_name}"
+                )
+        if reports[group_name]["version_increased_count"] <= 0:
             raise RuntimeError(
                 f"MCP-1 grid auxiliary did not change gradients for {group_name}"
             )
+        for _, parameter in groups[group_name]:
+            grad = parameter.grad
+            if grad is None:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary missing final gradient for {group_name}"
+                )
+            if not bool(torch.isfinite(grad.detach().float()).all().item()):
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary final gradient is non-finite for {group_name}"
+                )
     return reports
 
 
-def mcp1_grid_aux_parameters(generator) -> list[torch.nn.Parameter]:
-    groups = named_parameter_groups(generator)
-    params = [
-        parameter
+def mcp1_grid_aux_named_parameters(
+    groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
+) -> list[tuple[str, torch.nn.Parameter]]:
+    named_params = [
+        (name, parameter)
         for group_name in ("mcp_fusion", "mcp_depth1")
-        for _, parameter in groups[group_name]
+        for name, parameter in groups[group_name]
     ]
-    if not params:
+    if not named_params:
         raise RuntimeError("MCP-1 grid auxiliary parameter set is empty")
-    return params
+    return named_params
+
+
+def mcp1_grid_aux_parameters(
+    groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
+) -> list[torch.nn.Parameter]:
+    return [parameter for _, parameter in mcp1_grid_aux_named_parameters(groups)]
+
+
+def set_mcp1_grid_aux_requires_grad(
+    generator,
+    groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
+) -> tuple[tuple[torch.nn.Parameter, bool], ...]:
+    target_ids = {id(parameter) for parameter in mcp1_grid_aux_parameters(groups)}
+    originals = []
+    seen = set()
+    for _, parameter in generator.named_parameters():
+        if id(parameter) in seen:
+            continue
+        seen.add(id(parameter))
+        originals.append((parameter, bool(parameter.requires_grad)))
+        parameter.requires_grad_(id(parameter) in target_ids)
+    validate_mcp1_grid_aux_requires_grad_scope(generator, target_ids)
+    return tuple(originals)
+
+
+def restore_requires_grad(
+    originals: tuple[tuple[torch.nn.Parameter, bool], ...],
+) -> None:
+    for parameter, requires_grad in originals:
+        parameter.requires_grad_(requires_grad)
+
+
+def validate_mcp1_grid_aux_requires_grad_scope(generator, target_ids: set[int]) -> None:
+    for name, parameter in generator.named_parameters():
+        expected = id(parameter) in target_ids
+        if bool(parameter.requires_grad) != expected:
+            group = "auxiliary target" if expected else "non-auxiliary"
+            raise RuntimeError(
+                "MCP-1 grid auxiliary requires_grad scope mismatch for "
+                f"{group} parameter {name}"
+            )
+
+
+def validate_initial_target_gradients(
+    before: dict[str, dict[str, dict[str, Any]]],
+) -> None:
+    for group_name in ("mcp_fusion", "mcp_depth1"):
+        for metadata in before[group_name].values():
+            if metadata["grad_is_none"]:
+                raise RuntimeError(
+                    f"MCP-1 grid auxiliary missing random gradient for {group_name}"
+                )
 
 
 def validate_aux_grads(
@@ -422,50 +560,68 @@ def accumulate_mcp1_grid_aux_gradients(
         }
     timesteps = validate_mcp1_grid_timesteps(timesteps)
     groups = named_parameter_groups(generator)
-    before = clone_gradients(groups)
-    params = mcp1_grid_aux_parameters(generator)
+    before = gradient_metadata_snapshot(groups)
+    params = mcp1_grid_aux_parameters(groups)
     point_losses = []
     point_metadata = []
-    for timestep in timesteps:
-        point = run_nf_sf_mcp1_grid_point_loss(
-            generator,
-            conditional_dict=conditional_dict,
-            state=state,
-            scheduler=scheduler,
-            epsilon_main=epsilon_main,
-            epsilon_future=epsilon_future,
-            timestep=timestep,
-            chunk_frames=M3_CHUNK_FRAMES,
-        )
-        scaled_loss = point.loss * (float(weight) / float(len(timesteps)))
-        try:
-            grads = torch.autograd.grad(
-                scaled_loss,
-                params,
-                allow_unused=False,
-                retain_graph=False,
+    requires_grad_originals = set_mcp1_grid_aux_requires_grad(generator, groups)
+    try:
+        validate_initial_target_gradients(before)
+        for timestep in timesteps:
+            validate_mcp1_grid_aux_requires_grad_scope(
+                generator,
+                {id(parameter) for parameter in params},
             )
-        except RuntimeError as exc:
-            if "not have been used in the graph" in str(exc):
-                raise RuntimeError(
-                    "MCP-1 grid auxiliary missing gradient for target groups "
-                    "mcp_fusion/mcp_depth1"
-                ) from exc
-            raise
-        validate_aux_grads(params, grads)
-        for parameter, grad in zip(params, grads):
-            if parameter.grad is None:
-                raise RuntimeError(
-                    "MCP-1 grid auxiliary expected existing random-training gradient"
+            point = run_nf_sf_mcp1_grid_point_loss(
+                generator,
+                conditional_dict=conditional_dict,
+                state=state,
+                scheduler=scheduler,
+                epsilon_main=epsilon_main,
+                epsilon_future=epsilon_future,
+                timestep=timestep,
+                chunk_frames=M3_CHUNK_FRAMES,
+            )
+            scaled_loss = point.loss * (float(weight) / float(len(timesteps)))
+            try:
+                grads = torch.autograd.grad(
+                    scaled_loss,
+                    params,
+                    allow_unused=False,
+                    retain_graph=False,
                 )
-            parameter.grad = parameter.grad + grad.to(
-                device=parameter.grad.device,
-                dtype=parameter.grad.dtype,
-            )
-        point_losses.append(float(point.loss.detach().float().item()))
-        point_metadata.append(point.metadata)
-    after = clone_gradients(groups)
-    isolation = validate_mcp1_grid_aux_gradient_isolation(before, after)
+            except RuntimeError as exc:
+                if "not have been used in the graph" in str(exc):
+                    raise RuntimeError(
+                        "MCP-1 grid auxiliary missing gradient for target groups "
+                        "mcp_fusion/mcp_depth1"
+                    ) from exc
+                raise
+            validate_aux_grads(params, grads)
+            with torch.no_grad():
+                for parameter, grad in zip(params, grads):
+                    if parameter.grad is None:
+                        raise RuntimeError(
+                            "MCP-1 grid auxiliary expected existing "
+                            "random-training gradient"
+                        )
+                    parameter.grad.add_(
+                        grad.to(
+                            device=parameter.grad.device,
+                            dtype=parameter.grad.dtype,
+                        )
+                    )
+            point_losses.append(float(point.loss.detach().float().item()))
+            point_metadata.append(point.metadata)
+            del grads, scaled_loss, point
+    finally:
+        restore_requires_grad(requires_grad_originals)
+    after = gradient_metadata_snapshot(groups)
+    isolation = validate_mcp1_grid_aux_gradient_isolation(
+        before,
+        after,
+        groups,
+    )
     mean_loss = sum(point_losses) / len(point_losses)
     return {
         "enabled": True,

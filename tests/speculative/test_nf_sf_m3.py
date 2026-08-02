@@ -1088,6 +1088,7 @@ class AuxFakeWan(nn.Module):
         no_mcp1_aux: bool = False,
         leak_mcp2_aux: bool = False,
         single_live_aux: bool = False,
+        fail_aux_forward_at: int | None = None,
     ) -> None:
         super().__init__()
         self.model = AuxFakeModel()
@@ -1096,11 +1097,15 @@ class AuxFakeWan(nn.Module):
         self.no_mcp1_aux = no_mcp1_aux
         self.leak_mcp2_aux = leak_mcp2_aux
         self.single_live_aux = single_live_aux
+        self.fail_aux_forward_at = fail_aux_forward_at
+        self.aux_forward_calls = 0
         self.calls = []
 
     def forward(self, **kwargs):
         noisy = kwargs["noisy_image_or_video"]
         futures = kwargs.get("mcp_future_noises", [])
+        if len(futures) == 1:
+            self.aux_forward_calls += 1
         self.calls.append(
             {
                 "future_count": len(futures),
@@ -1112,8 +1117,18 @@ class AuxFakeWan(nn.Module):
                 else kwargs["mcp_timesteps"][0].detach().clone(),
                 "noisy_current": noisy.detach().clone(),
                 "future": None if not futures else futures[0].detach().clone(),
+                "requires_grad": {
+                    name: bool(parameter.requires_grad)
+                    for name, parameter in self.named_parameters()
+                },
             }
         )
+        if (
+            len(futures) == 1
+            and self.fail_aux_forward_at is not None
+            and self.aux_forward_calls == self.fail_aux_forward_at
+        ):
+            raise RuntimeError("forced auxiliary forward failure")
         main_scale = self.model.backbone.weight + self.model.patch_embedding.weight
         main_flow = noisy * main_scale.to(device=noisy.device, dtype=noisy.dtype)
         mcp_flows = []
@@ -1187,6 +1202,51 @@ def _run_random_backward(generator, optimizer, state, train_rng):
     return result, batch
 
 
+def _all_requires_grad(generator: AuxFakeWan) -> dict[str, bool]:
+    return {
+        name: bool(parameter.requires_grad)
+        for name, parameter in generator.named_parameters()
+    }
+
+
+def _assert_requires_grad_restored(
+    generator: AuxFakeWan,
+    expected: dict[str, bool],
+) -> None:
+    assert _all_requires_grad(generator) == expected
+
+
+def _non_target_group_names() -> tuple[str, ...]:
+    return ("backbone", "patch_embedding", "mcp_depth2", "mcp_depth3")
+
+
+def _target_group_names() -> tuple[str, ...]:
+    return ("mcp_fusion", "mcp_depth1")
+
+
+def _target_grad_values(
+    groups: dict[str, tuple[tuple[str, torch.nn.Parameter], ...]],
+) -> dict[str, dict[str, torch.Tensor]]:
+    return {
+        group_name: {
+            name: parameter.grad.detach().clone()
+            for name, parameter in groups[group_name]
+        }
+        for group_name in _target_group_names()
+    }
+
+
+def _assert_snapshot_has_no_tensors(value) -> None:
+    if isinstance(value, torch.Tensor):
+        raise AssertionError("gradient metadata snapshot must not contain tensors")
+    if isinstance(value, dict):
+        for item in value.values():
+            _assert_snapshot_has_no_tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_snapshot_has_no_tensors(item)
+
+
 def test_mcp1_grid_aux_schedule_is_four_point_main_shift_and_independent() -> None:
     random_scheduler = _scheduler(5.0)
     aux_scheduler, timesteps, report = train_m3.resolve_mcp1_grid_aux_schedule(
@@ -1211,8 +1271,15 @@ def test_mcp1_grid_aux_schedule_is_four_point_main_shift_and_independent() -> No
         )
 
 
-def test_mcp1_grid_aux_weight_zero_does_not_run_grid_forward() -> None:
+def test_mcp1_grid_aux_weight_zero_does_not_run_grid_forward(monkeypatch) -> None:
     generator = AuxFakeWan()
+    original_requires_grad = _all_requires_grad(generator)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("weight=0 must not enter auxiliary setup")
+
+    monkeypatch.setattr(train_m3, "set_mcp1_grid_aux_requires_grad", forbidden)
+    monkeypatch.setattr(train_m3, "gradient_metadata_snapshot", forbidden)
     report = train_m3.accumulate_mcp1_grid_aux_gradients(
         generator,
         conditional_dict={},
@@ -1226,6 +1293,7 @@ def test_mcp1_grid_aux_weight_zero_does_not_run_grid_forward() -> None:
 
     assert report["enabled"] is False
     assert generator.calls == []
+    _assert_requires_grad_restored(generator, original_requires_grad)
 
 
 def test_mcp1_grid_aux_accumulates_four_autograd_grads_and_one_optimizer_step(monkeypatch) -> None:
@@ -1233,6 +1301,7 @@ def test_mcp1_grid_aux_accumulates_four_autograd_grads_and_one_optimizer_step(mo
     generator = AuxFakeWan(single_live_aux=True)
     state = _aux_state()
     optimizer = _aux_optimizer(generator)
+    original_requires_grad = _all_requires_grad(generator)
     train_rng = make_cpu_generator(101)
     optimizer.zero_grad(set_to_none=True)
     _, batch = _run_random_backward(generator, optimizer, state, train_rng)
@@ -1272,7 +1341,18 @@ def test_mcp1_grid_aux_accumulates_four_autograd_grads_and_one_optimizer_step(mo
     assert SingleLiveGraph.active == 0
     assert optimizer.zero_grad_calls == 1
     assert optimizer.step_calls == 1
-    assert len([call for call in generator.calls if call["future_count"] == 1]) == 4
+    aux_calls = [call for call in generator.calls if call["future_count"] == 1]
+    assert len(aux_calls) == 4
+    for call in aux_calls:
+        assert call["requires_grad"] == {
+            "model.patch_embedding.weight": False,
+            "model.backbone.weight": False,
+            "mcp.fusion.weight": True,
+            "mcp.mcp_modules.0.weight": True,
+            "mcp.mcp_modules.1.weight": False,
+            "mcp.mcp_modules.2.weight": False,
+        }
+    _assert_requires_grad_restored(generator, original_requires_grad)
     assert report["mcp1_grid_aux_mean_loss"] == pytest.approx(
         sum(report["point_losses"]) / 4.0
     )
@@ -1291,7 +1371,9 @@ def test_mcp1_grid_aux_gradient_isolation_and_missing_target_grad_failures(monke
     optimizer = _aux_optimizer(generator)
     optimizer.zero_grad(set_to_none=True)
     _, batch = _run_random_backward(generator, optimizer, state, make_cpu_generator(102))
-    before = train_m3.clone_gradients(train_m3.named_parameter_groups(generator))
+    groups = train_m3.named_parameter_groups(generator)
+    before = train_m3.gradient_metadata_snapshot(groups)
+    random_target_grads = _target_grad_values(groups)
     report = train_m3.accumulate_mcp1_grid_aux_gradients(
         generator,
         conditional_dict={},
@@ -1302,12 +1384,46 @@ def test_mcp1_grid_aux_gradient_isolation_and_missing_target_grad_failures(monke
         epsilon_future=batch.epsilon_depths[0],
         weight=0.7,
     )
-    after = train_m3.clone_gradients(train_m3.named_parameter_groups(generator))
-    for group_name in ("backbone", "patch_embedding", "mcp_depth2", "mcp_depth3"):
+    after = train_m3.gradient_metadata_snapshot(groups)
+    _assert_snapshot_has_no_tensors(before)
+    _assert_snapshot_has_no_tensors(after)
+    for group_name in _non_target_group_names():
+        assert before[group_name] == after[group_name]
+    for group_name in _target_group_names():
         for name in before[group_name]:
-            assert torch.equal(before[group_name][name], after[group_name][name])
+            assert before[group_name][name]["grad_object_id"] == after[group_name][name]["grad_object_id"]
+            assert before[group_name][name]["grad_data_ptr"] == after[group_name][name]["grad_data_ptr"]
+            assert before[group_name][name]["grad_version"] < after[group_name][name]["grad_version"]
     assert report["gradient_isolation"]["mcp_fusion"]["aux_grad_changed"] is True
     assert report["gradient_isolation"]["mcp_depth1"]["aux_grad_changed"] is True
+    expected_aux_grads = {}
+    check = AuxFakeWan()
+    _aux_optimizer(check)
+    check.zero_grad(set_to_none=True)
+    for group_name in _target_group_names():
+        for _, parameter in train_m3.named_parameter_groups(check)[group_name]:
+            parameter.grad = torch.zeros_like(parameter)
+    aux_report = train_m3.accumulate_mcp1_grid_aux_gradients(
+        check,
+        conditional_dict={},
+        state=state,
+        scheduler=aux_scheduler,
+        timesteps=timesteps,
+        epsilon_main=batch.epsilon_main,
+        epsilon_future=batch.epsilon_depths[0],
+        weight=0.7,
+    )
+    assert aux_report["enabled"] is True
+    check_groups = train_m3.named_parameter_groups(check)
+    for group_name in _target_group_names():
+        expected_aux_grads[group_name] = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in check_groups[group_name]
+        }
+    for group_name in _target_group_names():
+        for name, parameter in groups[group_name]:
+            expected = random_target_grads[group_name][name] + expected_aux_grads[group_name][name]
+            assert torch.allclose(parameter.grad, expected)
 
     for kwargs in [
         {"no_fusion_aux": True},
@@ -1315,6 +1431,7 @@ def test_mcp1_grid_aux_gradient_isolation_and_missing_target_grad_failures(monke
     ]:
         bad = AuxFakeWan(**kwargs)
         optimizer = _aux_optimizer(bad)
+        original_requires_grad = _all_requires_grad(bad)
         optimizer.zero_grad(set_to_none=True)
         _, batch = _run_random_backward(bad, optimizer, state, make_cpu_generator(103))
         with pytest.raises(RuntimeError, match="mcp_fusion/mcp_depth1"):
@@ -1328,9 +1445,11 @@ def test_mcp1_grid_aux_gradient_isolation_and_missing_target_grad_failures(monke
                 epsilon_future=batch.epsilon_depths[0],
                 weight=1.0,
             )
+        _assert_requires_grad_restored(bad, original_requires_grad)
 
     leaking = AuxFakeWan()
     optimizer = _aux_optimizer(leaking)
+    original_requires_grad = _all_requires_grad(leaking)
     optimizer.zero_grad(set_to_none=True)
     _, batch = _run_random_backward(leaking, optimizer, state, make_cpu_generator(104))
     real_grad = train_m3.torch.autograd.grad
@@ -1354,6 +1473,110 @@ def test_mcp1_grid_aux_gradient_isolation_and_missing_target_grad_failures(monke
             epsilon_future=batch.epsilon_depths[0],
             weight=1.0,
         )
+    _assert_requires_grad_restored(leaking, original_requires_grad)
+
+
+def test_mcp1_grid_aux_restores_requires_grad_on_failures(monkeypatch) -> None:
+    state = _aux_state()
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+
+    for generator, patch_grad, message in [
+        (AuxFakeWan(fail_aux_forward_at=1), None, "forced auxiliary forward failure"),
+        (AuxFakeWan(), RuntimeError("forced autograd failure"), "forced autograd failure"),
+    ]:
+        optimizer = _aux_optimizer(generator)
+        original_requires_grad = _all_requires_grad(generator)
+        optimizer.zero_grad(set_to_none=True)
+        _, batch = _run_random_backward(generator, optimizer, state, make_cpu_generator(105))
+        if patch_grad is not None:
+            def failing_grad(*args, **kwargs):
+                raise patch_grad
+
+            monkeypatch.setattr(train_m3.torch.autograd, "grad", failing_grad)
+        with pytest.raises(RuntimeError, match=message):
+            train_m3.accumulate_mcp1_grid_aux_gradients(
+                generator,
+                conditional_dict={},
+                state=state,
+                scheduler=aux_scheduler,
+                timesteps=timesteps,
+                epsilon_main=batch.epsilon_main,
+                epsilon_future=batch.epsilon_depths[0],
+                weight=1.0,
+            )
+        _assert_requires_grad_restored(generator, original_requires_grad)
+        assert all(parameter.grad is not None for _, parameter in generator.named_parameters())
+        monkeypatch.undo()
+
+    nonfinite = AuxFakeWan()
+    optimizer = _aux_optimizer(nonfinite)
+    original_requires_grad = _all_requires_grad(nonfinite)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(nonfinite, optimizer, state, make_cpu_generator(106))
+
+    def nonfinite_grad(*args, **kwargs):
+        params = args[1]
+        return tuple(torch.full_like(parameter, float("inf")) for parameter in params)
+
+    monkeypatch.setattr(train_m3.torch.autograd, "grad", nonfinite_grad)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        train_m3.accumulate_mcp1_grid_aux_gradients(
+            nonfinite,
+            conditional_dict={},
+            state=state,
+            scheduler=aux_scheduler,
+            timesteps=timesteps,
+            epsilon_main=batch.epsilon_main,
+            epsilon_future=batch.epsilon_depths[0],
+            weight=1.0,
+        )
+    _assert_requires_grad_restored(nonfinite, original_requires_grad)
+
+
+def test_mcp1_grid_aux_does_not_clone_non_target_gradients(monkeypatch) -> None:
+    state = _aux_state()
+    generator = AuxFakeWan()
+    optimizer = _aux_optimizer(generator)
+    optimizer.zero_grad(set_to_none=True)
+    _, batch = _run_random_backward(generator, optimizer, state, make_cpu_generator(107))
+    groups = train_m3.named_parameter_groups(generator)
+    blocked = {
+        (parameter.grad.data_ptr(), tuple(parameter.grad.shape))
+        for group_name in _non_target_group_names()
+        for _, parameter in groups[group_name]
+    }
+    before = train_m3.gradient_metadata_snapshot(groups)
+    _assert_snapshot_has_no_tensors(before)
+    real_clone = torch.Tensor.clone
+
+    def guarded_clone(tensor, *args, **kwargs):
+        if (tensor.data_ptr(), tuple(tensor.shape)) in blocked:
+            raise AssertionError("non-target gradient clone is forbidden")
+        return real_clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", guarded_clone)
+    aux_scheduler, timesteps, _ = train_m3.resolve_mcp1_grid_aux_schedule(
+        teacher_payload=_solver_payload(num_steps=4, shift=5.0),
+        device=torch.device("cpu"),
+    )
+    report = train_m3.accumulate_mcp1_grid_aux_gradients(
+        generator,
+        conditional_dict={},
+        state=state,
+        scheduler=aux_scheduler,
+        timesteps=timesteps,
+        epsilon_main=batch.epsilon_main,
+        epsilon_future=batch.epsilon_depths[0],
+        weight=1.0,
+    )
+    after = train_m3.gradient_metadata_snapshot(groups)
+
+    assert report["enabled"] is True
+    for group_name in _non_target_group_names():
+        assert before[group_name] == after[group_name]
 
 
 def test_mcp1_grid_aux_combined_objective_math() -> None:

@@ -26,8 +26,10 @@ from utils.nf_sf_m3 import (
     load_m3_checkpoint,
     load_m3_teacher_sample,
     move_tensors_to_device,
+    reconstruct_mcp1_next,
     resolve_m3_solver_schedule,
     selected_state_to_device,
+    tensor_summary,
     validate_git_sha,
     validate_m3_eval_config_matches_checkpoint,
 )
@@ -79,6 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--mode", choices=("train", "eval"), default="train")
     parser.add_argument("--probe_checkpoint", type=Path, default=None)
+    parser.add_argument("--decode", action="store_true")
+    parser.add_argument("--decode_output_dir", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -876,6 +880,291 @@ def load_probe_modules_into_generator(generator: Any, payload: Mapping[str, Any]
     }
 
 
+def _reconstruct_mcp1_free_running_latent(
+    generator: Any,
+    *,
+    conditional_dict: Mapping[str, Any],
+    state: Any,
+    epsilon_main: torch.Tensor,
+    epsilon_future: torch.Tensor,
+    teacher_payload: Mapping[str, Any],
+) -> torch.Tensor:
+    result = reconstruct_mcp1_next(
+        generator,
+        conditional_dict=conditional_dict,
+        state=state,
+        next_initial_noise=epsilon_future,
+        current_condition_noise=epsilon_main,
+        teacher_payload=teacher_payload,
+        solver_steps_override=None,
+        allow_solver_override=False,
+    )
+    return result.latent.detach()
+
+
+def run_decode_reconstructions(
+    generator: Any,
+    *,
+    probe_payload: Mapping[str, Any],
+    conditional_dict: Mapping[str, Any],
+    state: Any,
+    epsilon_main: torch.Tensor,
+    epsilon_future: torch.Tensor,
+    teacher_payload: Mapping[str, Any],
+    restore_fn: Callable[[Any, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    reconstruct_fn: Callable[..., torch.Tensor] | None = None,
+) -> dict[str, Any]:
+    restore_fn = load_probe_modules_into_generator if restore_fn is None else restore_fn
+    reconstruct_fn = _reconstruct_mcp1_free_running_latent if reconstruct_fn is None else reconstruct_fn
+    base_latent = reconstruct_fn(
+        generator,
+        conditional_dict=conditional_dict,
+        state=state,
+        epsilon_main=epsilon_main,
+        epsilon_future=epsilon_future,
+        teacher_payload=teacher_payload,
+    )
+    restore_report = dict(restore_fn(generator, probe_payload))
+    if not bool(restore_report.get("exact", False)):
+        raise RuntimeError("fixed-grid probe parameter restore is not exact")
+    fixed_grid_latent = reconstruct_fn(
+        generator,
+        conditional_dict=conditional_dict,
+        state=state,
+        epsilon_main=epsilon_main,
+        epsilon_future=epsilon_future,
+        teacher_payload=teacher_payload,
+    )
+    return {
+        "base_latent": base_latent.detach(),
+        "fixed_grid_latent": fixed_grid_latent.detach(),
+        "parameter_restore": restore_report,
+    }
+
+
+def latent_mse_report(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    if tuple(prediction.shape) != tuple(target.shape):
+        raise RuntimeError(
+            "decode latent MSE shape mismatch: "
+            f"{tuple(prediction.shape)} != {tuple(target.shape)}"
+        )
+    diff = prediction.detach().float() - target.detach().float()
+    mse = _finite_float("latent_mse", float(diff.square().mean().item()))
+    return {"mse": mse, "rmse": _finite_float("latent_rmse", mse**0.5)}
+
+
+def validate_decode_latent(name: str, latent: torch.Tensor) -> None:
+    if not bool(torch.isfinite(latent.detach().float()).all().item()):
+        raise RuntimeError(f"decode latent {name} contains non-finite values")
+
+
+def decode_m3_fixed_grid_video(
+    *,
+    vae: Any,
+    full_target_latent: torch.Tensor,
+    chunk: torch.Tensor,
+    block_index: int,
+    output_path: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    fps: int,
+) -> dict[str, Any]:
+    from scripts.eval_nf_sf_m3_overfit import (
+        block_pixel_span,
+        normalize_pixels,
+        save_video,
+        splice_chunk,
+    )
+
+    validate_decode_latent(output_path.stem, chunk)
+    full_latent = splice_chunk(
+        full_target_latent,
+        chunk,
+        start_frame=block_index * 3,
+    )
+    with torch.no_grad():
+        decoded = vae.decode_to_pixel(
+            full_latent.to(device=device, dtype=dtype),
+            use_cache=False,
+        )
+    frames = normalize_pixels(decoded)
+    start, end = block_pixel_span(block_index, frames.shape[0])
+    cropped = frames[start:end]
+    if cropped.ndim != 4 or int(cropped.shape[0]) <= 0:
+        raise RuntimeError(f"decode produced zero frames for {output_path.name}")
+    save_video(output_path, cropped, fps=fps)
+    if not output_path.is_file() or output_path.stat().st_size <= 0:
+        raise RuntimeError(f"decode output file missing or empty: {output_path}")
+    return {
+        "path": output_path.name,
+        "frames": int(cropped.shape[0]),
+        "height": int(cropped.shape[1]),
+        "width": int(cropped.shape[2]),
+        "fps": int(fps),
+        "block_index": int(block_index),
+        "decoded_pixel_frames": int(frames.shape[0]),
+        "saved_pixel_start": int(start),
+        "saved_pixel_end": int(end),
+    }
+
+
+def build_decode_manifest(
+    *,
+    decode_output_dir: Path,
+    base_checkpoint_path: Path,
+    base_checkpoint_sha256: str,
+    probe_checkpoint_path: Path,
+    probe_checkpoint_sha256: str,
+    checkpoint_git_sha: str,
+    current_git_sha: str,
+    sample_metadata: Mapping[str, Any],
+    timesteps: torch.Tensor,
+    parameter_restore_exact: bool,
+    target_next1: torch.Tensor,
+    base_latent: torch.Tensor,
+    fixed_grid_latent: torch.Tensor,
+    video_records: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    latents = {
+        "target_next1": target_next1.detach().cpu(),
+        "base_m3_mcp1_free_running": base_latent.detach().cpu(),
+        "fixed_grid_mcp1_free_running": fixed_grid_latent.detach().cpu(),
+    }
+    for name, latent in latents.items():
+        validate_decode_latent(name, latent)
+    required_videos = {
+        "target_next1": "target_next1.mp4",
+        "base_m3_mcp1_free_running": "base_m3_mcp1_free_running.mp4",
+        "fixed_grid_mcp1_free_running": "fixed_grid_mcp1_free_running.mp4",
+    }
+    videos = {}
+    for name, filename in required_videos.items():
+        record = dict(video_records.get(name, {}))
+        if record.get("path") != filename:
+            raise RuntimeError(f"decode video path mismatch for {name}")
+        if int(record.get("frames", 0)) <= 0:
+            raise RuntimeError(f"decode video has zero frames for {name}")
+        if int(record.get("height", 0)) <= 0 or int(record.get("width", 0)) <= 0:
+            raise RuntimeError(f"decode video has invalid resolution for {name}")
+        videos[name] = record
+    base_metrics = latent_mse_report(base_latent, target_next1)
+    probe_metrics = latent_mse_report(fixed_grid_latent, target_next1)
+    improvement = (base_metrics["mse"] - probe_metrics["mse"]) / (
+        base_metrics["mse"] + COSINE_EPS
+    )
+    return {
+        "status": "PASS",
+        "base_m3_checkpoint": {
+            "path": str(base_checkpoint_path.resolve()),
+            "sha256": str(base_checkpoint_sha256),
+        },
+        "probe_checkpoint": {
+            "path": str(probe_checkpoint_path.resolve()),
+            "sha256": str(probe_checkpoint_sha256),
+        },
+        "checkpoint_git_sha": str(checkpoint_git_sha),
+        "current_git_sha": str(current_git_sha),
+        "sample_metadata": dict(sample_metadata),
+        "four_timesteps": [float(value) for value in timesteps.detach().float().cpu().tolist()],
+        "parameter_restore_exact": bool(parameter_restore_exact),
+        "latents": {name: tensor_summary(latent) for name, latent in latents.items()},
+        "videos": videos,
+        "latent_metrics": {
+            "base_vs_target_next1": base_metrics,
+            "fixed_grid_vs_target_next1": probe_metrics,
+            "probe_vs_base_mse_improvement_ratio": _finite_float(
+                "probe_vs_base_mse_improvement_ratio",
+                improvement,
+            ),
+        },
+        "decode_output_dir": str(decode_output_dir.resolve()),
+    }
+
+
+def run_decode_outputs(
+    *,
+    decode_output_dir: Path,
+    base_checkpoint_path: Path,
+    base_checkpoint_sha256: str,
+    probe_checkpoint_path: Path,
+    probe_checkpoint_sha256: str,
+    checkpoint_git_sha: str,
+    current_git_sha: str,
+    sample_metadata: Mapping[str, Any],
+    full_target_latent: torch.Tensor,
+    target_next1: torch.Tensor,
+    base_latent: torch.Tensor,
+    fixed_grid_latent: torch.Tensor,
+    timesteps: torch.Tensor,
+    parameter_restore_exact: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+    fps: int = 16,
+) -> dict[str, Any]:
+    from utils.wan_wrapper import WanVAEWrapper
+
+    decode_output_dir.mkdir(parents=True, exist_ok=True)
+    vae = WanVAEWrapper().eval().requires_grad_(False)
+    vae.to(device=device, dtype=dtype)
+    try:
+        video_records = {
+            "target_next1": decode_m3_fixed_grid_video(
+                vae=vae,
+                full_target_latent=full_target_latent,
+                chunk=target_next1,
+                block_index=2,
+                output_path=decode_output_dir / "target_next1.mp4",
+                device=device,
+                dtype=dtype,
+                fps=fps,
+            ),
+            "base_m3_mcp1_free_running": decode_m3_fixed_grid_video(
+                vae=vae,
+                full_target_latent=full_target_latent,
+                chunk=base_latent,
+                block_index=2,
+                output_path=decode_output_dir / "base_m3_mcp1_free_running.mp4",
+                device=device,
+                dtype=dtype,
+                fps=fps,
+            ),
+            "fixed_grid_mcp1_free_running": decode_m3_fixed_grid_video(
+                vae=vae,
+                full_target_latent=full_target_latent,
+                chunk=fixed_grid_latent,
+                block_index=2,
+                output_path=decode_output_dir / "fixed_grid_mcp1_free_running.mp4",
+                device=device,
+                dtype=dtype,
+                fps=fps,
+            ),
+        }
+    finally:
+        vae.to("cpu")
+        del vae
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    manifest = build_decode_manifest(
+        decode_output_dir=decode_output_dir,
+        base_checkpoint_path=base_checkpoint_path,
+        base_checkpoint_sha256=base_checkpoint_sha256,
+        probe_checkpoint_path=probe_checkpoint_path,
+        probe_checkpoint_sha256=probe_checkpoint_sha256,
+        checkpoint_git_sha=checkpoint_git_sha,
+        current_git_sha=current_git_sha,
+        sample_metadata=sample_metadata,
+        timesteps=timesteps,
+        parameter_restore_exact=parameter_restore_exact,
+        target_next1=target_next1,
+        base_latent=base_latent,
+        fixed_grid_latent=fixed_grid_latent,
+        video_records=video_records,
+    )
+    atomic_json_write(manifest, decode_output_dir / "decode_manifest.json")
+    return manifest
+
+
 def validate_probe_checkpoint_matches(
     *,
     probe_payload: Mapping[str, Any],
@@ -930,6 +1219,10 @@ def resolved_cli(args: argparse.Namespace, *, mode: str) -> dict[str, Any]:
         "probe_checkpoint": None
         if args.probe_checkpoint is None
         else str(args.probe_checkpoint.resolve()),
+        "decode": bool(getattr(args, "decode", False)),
+        "decode_output_dir": None
+        if getattr(args, "decode_output_dir", None) is None
+        else str(args.decode_output_dir.resolve()),
     }
 
 
@@ -1141,6 +1434,8 @@ def run_train(args: argparse.Namespace) -> None:
 
 def run_eval(args: argparse.Namespace) -> None:
     validate_cli_values(steps=args.steps, lr=args.lr, log_interval=args.log_interval)
+    if bool(getattr(args, "decode", False)) and args.dtype != "bf16":
+        raise RuntimeError("--decode requires --dtype bf16")
     checkpoint_payload = load_m3_checkpoint(args.m3_checkpoint)
     validate_step100_checkpoint(checkpoint_payload)
     provenance = fixed_grid_provenance_gate(checkpoint_payload=checkpoint_payload)
@@ -1148,6 +1443,8 @@ def run_eval(args: argparse.Namespace) -> None:
     atomic_json_write(provenance, args.output_dir / "provenance.json")
     probe_path = args.probe_checkpoint or (args.output_dir / "probe_checkpoint.pt")
     probe_payload = load_probe_checkpoint(probe_path)
+    base_checkpoint_sha256 = file_sha256(args.m3_checkpoint)
+    probe_checkpoint_sha256 = file_sha256(probe_path)
 
     from inference_mcp import merge_config, require_single_gpu_runtime
     from scripts.eval_nf_sf_m3_overfit import (
@@ -1205,12 +1502,25 @@ def run_eval(args: argparse.Namespace) -> None:
             probe_payload=probe_payload,
             base_checkpoint_payload=checkpoint_payload,
             base_checkpoint_path=args.m3_checkpoint,
-            base_checkpoint_sha256=file_sha256(args.m3_checkpoint),
+            base_checkpoint_sha256=base_checkpoint_sha256,
             sample_metadata=sample.metadata,
             timesteps=timesteps,
             current_git_sha=provenance["current_git_sha"],
         )
-        restore_comparison = load_probe_modules_into_generator(generator, probe_payload)
+        decode_reconstructions = None
+        if bool(getattr(args, "decode", False)):
+            decode_reconstructions = run_decode_reconstructions(
+                generator,
+                probe_payload=probe_payload,
+                conditional_dict=conditional_dict,
+                state=state,
+                epsilon_main=epsilon_main,
+                epsilon_future=epsilon_future,
+                teacher_payload=sample.payload,
+            )
+            restore_comparison = decode_reconstructions["parameter_restore"]
+        else:
+            restore_comparison = load_probe_modules_into_generator(generator, probe_payload)
         if not bool(restore_comparison["exact"]):
             raise RuntimeError("fixed-grid probe parameter restore is not exact")
         generator.eval().requires_grad_(False)
@@ -1266,6 +1576,27 @@ def run_eval(args: argparse.Namespace) -> None:
             ),
         }
         atomic_json_write(report, args.output_dir / "restore_eval.json")
+        if bool(getattr(args, "decode", False)):
+            assert decode_reconstructions is not None
+            decode_output_dir = args.decode_output_dir or (args.output_dir / "decoded")
+            run_decode_outputs(
+                decode_output_dir=decode_output_dir,
+                base_checkpoint_path=args.m3_checkpoint,
+                base_checkpoint_sha256=base_checkpoint_sha256,
+                probe_checkpoint_path=probe_path,
+                probe_checkpoint_sha256=probe_checkpoint_sha256,
+                checkpoint_git_sha=checkpoint_payload["git_sha"],
+                current_git_sha=provenance["current_git_sha"],
+                sample_metadata=sample.metadata,
+                full_target_latent=sample.target_latent,
+                target_next1=sample.selected_state.future_targets[0],
+                base_latent=decode_reconstructions["base_latent"].detach().cpu(),
+                fixed_grid_latent=decode_reconstructions["fixed_grid_latent"].detach().cpu(),
+                timesteps=timesteps,
+                parameter_restore_exact=bool(restore_comparison["exact"]),
+                device=device,
+                dtype=dtype,
+            )
         print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
     finally:
         generator.to("cpu")

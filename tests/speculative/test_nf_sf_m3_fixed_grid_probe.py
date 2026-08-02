@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from torch import nn
@@ -15,6 +17,11 @@ def tmp_path():
     path = probe.ROOT / "videos" / "fixed_grid_probe_pytest_tmp_path"
     path.mkdir(parents=True, exist_ok=True)
     yield path
+    for child in path.glob("*"):
+        try:
+            child.unlink()
+        except OSError:
+            pass
 
 
 def _scheduler() -> FlowMatchScheduler:
@@ -533,6 +540,218 @@ def test_global_step_must_be_one_hundred() -> None:
     probe.validate_step100_checkpoint({"global_step": 100})
     with pytest.raises(RuntimeError, match="global_step=100"):
         probe.validate_step100_checkpoint({"global_step": 10})
+
+
+def test_eval_decode_defaults_are_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_nf_sf_m3_fixed_grid_probe.py",
+            "--config",
+            "config.yaml",
+            "--m3_checkpoint",
+            "m3.pt",
+            "--manifest",
+            "manifest.json",
+            "--output_dir",
+            "out",
+            "--mode",
+            "eval",
+        ],
+    )
+
+    args = probe.parse_args()
+
+    assert args.decode is False
+    assert args.decode_output_dir is None
+
+
+def test_decode_reconstructions_order_and_shared_inputs() -> None:
+    generator = FakeGenerator()
+    calls = []
+    state = object()
+    epsilon_main = torch.ones((1, 3, 1, 1, 1))
+    epsilon_future = torch.full_like(epsilon_main, 2.0)
+    teacher_payload = {"warped_denoising_steps": list(probe.EXPECTED_FIXED_TIMESTEPS)}
+
+    def reconstruct_fn(active_generator, **kwargs):
+        calls.append(
+            (
+                "reconstruct",
+                "restored" if getattr(active_generator, "restored", False) else "base",
+                id(kwargs["state"]),
+                id(kwargs["epsilon_main"]),
+                id(kwargs["epsilon_future"]),
+                id(kwargs["teacher_payload"]),
+            )
+        )
+        value = 10.0 if getattr(active_generator, "restored", False) else 20.0
+        return torch.full((1, 3, 1, 1, 1), value)
+
+    def restore_fn(active_generator, payload):
+        calls.append(("restore", bool(getattr(active_generator, "restored", False))))
+        active_generator.restored = True
+        return {"exact": True}
+
+    result = probe.run_decode_reconstructions(
+        generator,
+        probe_payload={"fusion": {}, "mcp_depth1": {}},
+        conditional_dict={},
+        state=state,
+        epsilon_main=epsilon_main,
+        epsilon_future=epsilon_future,
+        teacher_payload=teacher_payload,
+        restore_fn=restore_fn,
+        reconstruct_fn=reconstruct_fn,
+    )
+
+    assert [call[0] for call in calls] == ["reconstruct", "restore", "reconstruct"]
+    assert calls[0][1] == "base"
+    assert calls[2][1] == "restored"
+    assert calls[0][2:] == calls[2][2:]
+    assert result["parameter_restore"]["exact"] is True
+    assert result["base_latent"].mean().item() == pytest.approx(20.0)
+    assert result["fixed_grid_latent"].mean().item() == pytest.approx(10.0)
+
+
+def test_decode_reconstructions_require_exact_restore() -> None:
+    with pytest.raises(RuntimeError, match="restore is not exact"):
+        probe.run_decode_reconstructions(
+            FakeGenerator(),
+            probe_payload={},
+            conditional_dict={},
+            state=object(),
+            epsilon_main=torch.zeros((1, 3, 1, 1, 1)),
+            epsilon_future=torch.zeros((1, 3, 1, 1, 1)),
+            teacher_payload={},
+            restore_fn=lambda generator, payload: {"exact": False},
+            reconstruct_fn=lambda generator, **kwargs: torch.zeros((1, 3, 1, 1, 1)),
+        )
+
+
+def _video_records():
+    return {
+        "target_next1": {
+            "path": "target_next1.mp4",
+            "frames": 12,
+            "height": 2,
+            "width": 2,
+            "fps": 16,
+        },
+        "base_m3_mcp1_free_running": {
+            "path": "base_m3_mcp1_free_running.mp4",
+            "frames": 12,
+            "height": 2,
+            "width": 2,
+            "fps": 16,
+        },
+        "fixed_grid_mcp1_free_running": {
+            "path": "fixed_grid_mcp1_free_running.mp4",
+            "frames": 12,
+            "height": 2,
+            "width": 2,
+            "fps": 16,
+        },
+    }
+
+
+def test_decode_manifest_latent_hash_video_metadata_and_mse(tmp_path) -> None:
+    target = torch.zeros((1, 3, 1, 1, 1))
+    base = torch.full_like(target, 2.0)
+    fixed = torch.full_like(target, 1.0)
+
+    manifest = probe.build_decode_manifest(
+        decode_output_dir=tmp_path,
+        base_checkpoint_path=probe.ROOT / "checkpoints" / "base.pt",
+        base_checkpoint_sha256="c" * 64,
+        probe_checkpoint_path=tmp_path / "probe.pt",
+        probe_checkpoint_sha256="d" * 64,
+        checkpoint_git_sha=SHA_BASE,
+        current_git_sha=SHA_HEAD,
+        sample_metadata={"sample_index": 0},
+        timesteps=_scheduler().timesteps,
+        parameter_restore_exact=True,
+        target_next1=target,
+        base_latent=base,
+        fixed_grid_latent=fixed,
+        video_records=_video_records(),
+    )
+
+    assert set(manifest["latents"]) == {
+        "target_next1",
+        "base_m3_mcp1_free_running",
+        "fixed_grid_mcp1_free_running",
+    }
+    assert all("sha256" in summary for summary in manifest["latents"].values())
+    assert manifest["videos"]["target_next1"]["path"] == "target_next1.mp4"
+    assert manifest["videos"]["base_m3_mcp1_free_running"]["frames"] == 12
+    assert manifest["latent_metrics"]["base_vs_target_next1"]["mse"] == pytest.approx(4.0)
+    assert manifest["latent_metrics"]["fixed_grid_vs_target_next1"]["mse"] == pytest.approx(1.0)
+    assert manifest["latent_metrics"]["probe_vs_base_mse_improvement_ratio"] == pytest.approx(0.75)
+
+
+def test_decode_manifest_rejects_nonfinite_latent_and_bad_video_metadata(tmp_path) -> None:
+    target = torch.zeros((1, 3, 1, 1, 1))
+    bad = torch.full_like(target, float("inf"))
+    with pytest.raises(RuntimeError, match="non-finite"):
+        probe.build_decode_manifest(
+            decode_output_dir=tmp_path,
+            base_checkpoint_path=probe.ROOT / "checkpoints" / "base.pt",
+            base_checkpoint_sha256="c" * 64,
+            probe_checkpoint_path=tmp_path / "probe.pt",
+            probe_checkpoint_sha256="d" * 64,
+            checkpoint_git_sha=SHA_BASE,
+            current_git_sha=SHA_HEAD,
+            sample_metadata={},
+            timesteps=_scheduler().timesteps,
+            parameter_restore_exact=True,
+            target_next1=target,
+            base_latent=bad,
+            fixed_grid_latent=target,
+            video_records=_video_records(),
+        )
+
+    records = _video_records()
+    records["target_next1"]["frames"] = 0
+    with pytest.raises(RuntimeError, match="zero frames"):
+        probe.build_decode_manifest(
+            decode_output_dir=tmp_path,
+            base_checkpoint_path=probe.ROOT / "checkpoints" / "base.pt",
+            base_checkpoint_sha256="c" * 64,
+            probe_checkpoint_path=tmp_path / "probe.pt",
+            probe_checkpoint_sha256="d" * 64,
+            checkpoint_git_sha=SHA_BASE,
+            current_git_sha=SHA_HEAD,
+            sample_metadata={},
+            timesteps=_scheduler().timesteps,
+            parameter_restore_exact=True,
+            target_next1=target,
+            base_latent=target,
+            fixed_grid_latent=target,
+            video_records=records,
+        )
+
+
+def test_decode_video_missing_output_file_fails(monkeypatch, tmp_path) -> None:
+    class FakeVAE(nn.Module):
+        def decode_to_pixel(self, latent, use_cache=False):
+            return torch.zeros((1, 40, 3, 2, 2), device=latent.device, dtype=latent.dtype)
+
+    import scripts.eval_nf_sf_m3_overfit as eval_m3
+
+    monkeypatch.setattr(eval_m3, "save_video", lambda path, frames, fps: None)
+    with pytest.raises(RuntimeError, match="missing or empty"):
+        probe.decode_m3_fixed_grid_video(
+            vae=FakeVAE(),
+            full_target_latent=torch.zeros((1, 15, 1, 1, 1)),
+            chunk=torch.zeros((1, 3, 1, 1, 1)),
+            block_index=2,
+            output_path=tmp_path / "target_next1.mp4",
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            fps=16,
+        )
 
 
 def _fake_git(*, diff_text: str, status_text: str = "", ancestor: bool = True):

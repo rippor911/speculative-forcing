@@ -775,6 +775,41 @@ def restore_m5_probe_from_checkpoint(
     )
 
 
+M5_RESTORED_PROBE_LOSS_KEYS = frozenset(
+    {
+        "main_loss",
+        "mcp_depth1_loss",
+        "mcp_depth2_loss",
+        "mcp_depth3_loss",
+        "total_loss",
+    }
+)
+
+
+def _strict_restored_probe_losses(value: Any, *, field_path: str) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_path} must be a Mapping[str, float]")
+    actual_keys = set(value.keys())
+    if actual_keys != M5_RESTORED_PROBE_LOSS_KEYS:
+        missing = sorted(M5_RESTORED_PROBE_LOSS_KEYS - actual_keys)
+        extra = sorted(actual_keys - M5_RESTORED_PROBE_LOSS_KEYS, key=str)
+        raise ValueError(
+            f"{field_path} keys mismatch: missing={missing}, extra={extra}"
+        )
+    losses: dict[str, float] = {}
+    for key in sorted(M5_RESTORED_PROBE_LOSS_KEYS):
+        item = value[key]
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(
+                f"{field_path}.{key} must be a finite float, actual={type(item).__name__}"
+            )
+        number = float(item)
+        if not math.isfinite(number):
+            raise ValueError(f"{field_path}.{key} must be finite, actual={number}")
+        losses[key] = number
+    return losses
+
+
 def require_restored_probe_matches_checkpoint(
     *,
     parent_payload: Mapping[str, Any],
@@ -787,15 +822,19 @@ def require_restored_probe_matches_checkpoint(
     )
     if output_comparison["max_abs_diff"] != 0.0:
         raise RuntimeError("M5 restored probe outputs differ from checkpoint")
-    actual_losses = loss_dict_to_floats(probe_forward.losses)
+    actual_losses = _strict_restored_probe_losses(
+        probe_forward.losses,
+        field_path="probe_forward.losses",
+    )
     expected_summary = parent_payload.get("probe_summary")
     if not isinstance(expected_summary, Mapping):
         raise TypeError("M5 resume checkpoint missing probe_summary")
-    expected_losses = expected_summary.get("probe_losses")
-    if not isinstance(expected_losses, Mapping):
-        raise TypeError("M5 resume checkpoint missing probe losses")
+    expected_losses = _strict_restored_probe_losses(
+        expected_summary.get("probe_losses"),
+        field_path="checkpoint.probe_summary.probe_losses",
+    )
     for key, actual in actual_losses.items():
-        expected = float(expected_losses[key])
+        expected = expected_losses[key]
         if actual != expected:
             raise RuntimeError(
                 "M5 restored probe loss differs from checkpoint: "

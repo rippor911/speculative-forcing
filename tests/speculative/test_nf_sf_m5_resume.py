@@ -209,7 +209,7 @@ def _probe() -> m3.M3Probe:
     )
 
 
-def _probe_forward(model: TinyResumeModel, probe: m3.M3Probe) -> Any:
+def _probe_forward(model: TinyResumeModel, probe: m3.M3Probe) -> m3.M3ProbeForward:
     scale = model(torch.ones(1, 1)).detach().reshape(1, 1, 1, 1, 1)
     outputs = {
         "main_flow_pred": torch.zeros_like(probe.noisy_batch.target_flow_main) + scale,
@@ -233,13 +233,14 @@ def _probe_forward(model: TinyResumeModel, probe: m3.M3Probe) -> Any:
         outputs["mcp_depth3_flow_pred"].float().mean(),
     )
     total_loss = main_loss + sum(depth_losses)
-    return SimpleNamespace(
+    loss_breakdown = NFSFLossBreakdown(
+        total_loss=total_loss,
+        main_loss=main_loss,
+        mcp_depth_losses=depth_losses,
+    )
+    return m3.M3ProbeForward(
         outputs=outputs,
-        losses=NFSFLossBreakdown(
-            total_loss=total_loss,
-            main_loss=main_loss,
-            mcp_depth_losses=depth_losses,
-        ),
+        losses=m3.loss_dict_to_floats(loss_breakdown),
     )
 
 
@@ -339,7 +340,7 @@ def _save_checkpoint(
         step=step,
         train_rng=train_rng,
         probe=probe,
-        probe_summary={"probe_losses": m3.loss_dict_to_floats(probe_forward.losses)},
+        probe_summary={"probe_losses": probe_forward.losses},
         probe_outputs=probe_forward.outputs,
         sample_metadata=metadata,
         resolved_config=resolved_config,
@@ -1000,6 +1001,39 @@ def test_resume_rejects_nonempty_output_directory(tmp_path: Path) -> None:
         train_m3.require_output_dir_empty_for_resume(output_dir)
 
 
+def _restored_probe_validation_context(
+    tmp_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], m3.M3ProbeForward]:
+    path, payload, plan, config, reference_path, reference_sha = (
+        _valid_parent_payload_and_context(tmp_path)
+    )
+    model, _, _, probe, restored_prompt_embedding, _ = _restore_from_checkpoint(
+        parent_path=path,
+        tmp_path=tmp_path,
+        plan=plan,
+        resolved_config=config,
+        reference_path=reference_path,
+        reference_sha=reference_sha,
+    )
+    return payload, restored_prompt_embedding, _probe_forward(model, probe)
+
+
+def test_restored_probe_accepts_real_loss_mapping(tmp_path: Path) -> None:
+    payload, restored_prompt_embedding, probe_forward = (
+        _restored_probe_validation_context(tmp_path)
+    )
+
+    assert isinstance(probe_forward.losses, dict)
+    report = train_m3.require_restored_probe_matches_checkpoint(
+        parent_payload=payload,
+        restored_prompt_embedding=restored_prompt_embedding,
+        probe_forward=probe_forward,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["probe_losses"] == probe_forward.losses
+
+
 def test_resume_rejects_restored_probe_mismatch(tmp_path: Path) -> None:
     path, payload, plan, config, reference_path, reference_sha = (
         _valid_parent_payload_and_context(tmp_path)
@@ -1021,6 +1055,89 @@ def test_resume_rejects_restored_probe_mismatch(tmp_path: Path) -> None:
             parent_payload=bad_payload,
             restored_prompt_embedding=restored_prompt_embedding,
             probe_forward=_probe_forward(model, probe),
+        )
+
+
+def test_restored_probe_rejects_missing_loss_key(tmp_path: Path) -> None:
+    payload, restored_prompt_embedding, probe_forward = (
+        _restored_probe_validation_context(tmp_path)
+    )
+    bad_losses = dict(probe_forward.losses)
+    del bad_losses["main_loss"]
+
+    with pytest.raises(ValueError, match="main_loss"):
+        train_m3.require_restored_probe_matches_checkpoint(
+            parent_payload=payload,
+            restored_prompt_embedding=restored_prompt_embedding,
+            probe_forward=m3.M3ProbeForward(
+                losses=bad_losses,
+                outputs=probe_forward.outputs,
+            ),
+        )
+
+
+def test_restored_probe_rejects_unknown_loss_key(tmp_path: Path) -> None:
+    payload, restored_prompt_embedding, probe_forward = (
+        _restored_probe_validation_context(tmp_path)
+    )
+    bad_losses = dict(probe_forward.losses)
+    bad_losses["unknown_loss"] = 0.0
+
+    with pytest.raises(ValueError, match="unknown_loss"):
+        train_m3.require_restored_probe_matches_checkpoint(
+            parent_payload=payload,
+            restored_prompt_embedding=restored_prompt_embedding,
+            probe_forward=m3.M3ProbeForward(
+                losses=bad_losses,
+                outputs=probe_forward.outputs,
+            ),
+        )
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_restored_probe_rejects_nonfinite_loss(
+    tmp_path: Path,
+    bad_value: float,
+) -> None:
+    payload, restored_prompt_embedding, probe_forward = (
+        _restored_probe_validation_context(tmp_path)
+    )
+    bad_losses = dict(probe_forward.losses)
+    bad_losses["main_loss"] = bad_value
+
+    with pytest.raises(ValueError, match="main_loss.*finite"):
+        train_m3.require_restored_probe_matches_checkpoint(
+            parent_payload=payload,
+            restored_prompt_embedding=restored_prompt_embedding,
+            probe_forward=m3.M3ProbeForward(
+                losses=bad_losses,
+                outputs=probe_forward.outputs,
+            ),
+        )
+
+
+def test_restored_probe_rejects_loss_breakdown_object(tmp_path: Path) -> None:
+    payload, restored_prompt_embedding, probe_forward = (
+        _restored_probe_validation_context(tmp_path)
+    )
+    loss_breakdown = NFSFLossBreakdown(
+        total_loss=torch.tensor(0.0),
+        main_loss=torch.tensor(0.0),
+        mcp_depth_losses=(
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        ),
+    )
+
+    with pytest.raises(TypeError, match="Mapping"):
+        train_m3.require_restored_probe_matches_checkpoint(
+            parent_payload=payload,
+            restored_prompt_embedding=restored_prompt_embedding,
+            probe_forward=m3.M3ProbeForward(
+                losses=loss_breakdown,
+                outputs=probe_forward.outputs,
+            ),
         )
 
 

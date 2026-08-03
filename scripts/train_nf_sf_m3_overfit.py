@@ -9,7 +9,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -27,24 +27,30 @@ from utils.checkpoint import (
 )
 from utils.nf_sf_m3 import (
     M3_CHUNK_FRAMES,
-    M3_DEPTHS,
     M3_DEPTH_WEIGHTS,
+    M3_DEPTHS,
     M3_TRAIN_MODES,
+    M3Probe,
     atomic_json_write,
+    compare_probe_outputs,
+    compare_serialized_probe_tensors,
+    deserialize_noisy_batch,
     file_sha256,
     gradient_group_audit,
+    load_m3_checkpoint,
     load_m3_teacher_sample,
     loss_dict_to_floats,
     make_m3_checkpoint_payload,
     make_m3_probe,
+    move_tensors_to_device,
     optimizer_config_summary,
     optimizer_group_lr_summary,
-    probe_output_summaries,
     prefix_metrics,
+    probe_output_summaries,
+    resolve_m3_solver_schedule,
     run_m3_probe_forward,
     save_m3_checkpoint,
     selected_state_to_device,
-    resolve_m3_solver_schedule,
     solver_schedule_to_json,
     validate_git_sha,
     validate_m3_mode,
@@ -63,16 +69,28 @@ from utils.nf_sf_m4 import (
     write_m4_json,
     write_m4_sample_plan,
 )
+from utils.nf_sf_m5 import (
+    M5_RNG_EXTENSION_FIELD,
+    ResumeContractError,
+    build_resume_contract,
+    build_resume_run_fields,
+    capture_m5_global_rng_extension,
+    extract_resume_rng_states,
+    first_resumed_global_step,
+    move_loaded_optimizer_state_to_device,
+    restore_global_rng_states,
+    restore_torch_generator_from_state,
+    validate_resume_contract,
+)
 from utils.nf_sf_tensors import DEFAULT_S_MAIN, DEFAULT_S_MCP, make_generator
 from utils.nf_sf_training import (
     collect_nf_sf_parameter_groups,
     configure_nf_sf_optimizer_plan,
     prepare_nf_sf_noisy_batch,
-    run_nf_sf_mcp1_grid_point_loss,
     run_nf_sf_forward_loss,
+    run_nf_sf_mcp1_grid_point_loss,
 )
 from utils.scheduler import FlowMatchScheduler
-
 
 TAP_LAYERS = (3, 11, 19, 29)
 ADAMW_BETAS = (0.0, 0.999)
@@ -92,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--resume_checkpoint", type=Path, default=None)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--dataset_root", type=Path, default=None)
     parser.add_argument("--sample_index", type=int, default=None)
@@ -164,7 +183,163 @@ def summarize_step_timings(
     summary = {
         "all_step_elapsed_ms": all_steps,
         "measured_step_elapsed_ms": measured,
-        "measured_step_count": int(len(measured)),
+        "measured_step_count": len(measured),
+    }
+    if measured:
+        summary.update(
+            {
+                "mean_step_elapsed_ms": float(statistics.fmean(measured)),
+                "median_step_elapsed_ms": float(statistics.median(measured)),
+                "min_step_elapsed_ms": float(min(measured)),
+                "max_step_elapsed_ms": float(max(measured)),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "mean_step_elapsed_ms": None,
+                "median_step_elapsed_ms": None,
+                "min_step_elapsed_ms": None,
+                "max_step_elapsed_ms": None,
+            }
+        )
+    return summary
+
+
+def m5_absolute_training_steps(
+    *,
+    resumed_global_step: int | None,
+    target_global_step: int,
+) -> range:
+    target = int(target_global_step)
+    start = 1 if resumed_global_step is None else first_resumed_global_step(resumed_global_step)
+    if target < start:
+        raise ValueError(
+            "target_global_step must be >= first training step: "
+            f"target_global_step={target}, first_training_step={start}"
+        )
+    return range(start, target + 1)
+
+
+def _step_in_schedule(global_step: int, steps: Sequence[int] | None) -> bool:
+    if steps is None:
+        return False
+    return int(global_step) in {int(step) for step in steps}
+
+
+def m5_training_step_orchestration(
+    *,
+    global_step: int,
+    target_global_step: int,
+    sample_plan: Mapping[str, Any] | None,
+    validation_steps: Sequence[int] | None,
+    checkpoint_steps: Sequence[int] | None,
+    checkpoint_interval: int,
+    log_interval: int,
+) -> dict[str, Any]:
+    step = int(global_step)
+    target = int(target_global_step)
+    if step <= 0:
+        raise ValueError(f"global_step must be positive: {step}")
+    if target < step:
+        raise ValueError(
+            "target_global_step must be >= global_step: "
+            f"target_global_step={target}, global_step={step}"
+        )
+    if int(log_interval) <= 0:
+        raise ValueError("log_interval must be positive")
+    if int(checkpoint_interval) <= 0:
+        raise ValueError("checkpoint_interval must be positive")
+
+    record: dict[str, Any] = {
+        "global_step": step,
+        "step": step,
+        "should_log": step % int(log_interval) == 0 or step == target,
+        "should_validate": False,
+        "should_checkpoint": False,
+        "train_sample_identity": None,
+        "train_sample_position": None,
+        "train_cycle_index": None,
+    }
+    if sample_plan is None:
+        record["should_checkpoint"] = step % int(checkpoint_interval) == 0 or step == target
+        return record
+
+    train_entry = m4_train_entry_for_step(sample_plan, step)
+    record.update(
+        {
+            "should_validate": _step_in_schedule(step, validation_steps),
+            "should_checkpoint": _step_in_schedule(step, checkpoint_steps),
+            "train_sample_identity": str(train_entry["identity"]),
+            "train_sample_position": int(train_entry["train_sample_position"]),
+            "train_cycle_index": int(train_entry["train_cycle_index"]),
+        }
+    )
+    return record
+
+
+def m5_timing_record(
+    *,
+    global_step: int,
+    elapsed_ms: float,
+    timing_warmup_steps: int,
+) -> dict[str, Any]:
+    step = int(global_step)
+    warmup = int(timing_warmup_steps)
+    if step <= 0:
+        raise ValueError(f"global_step must be positive: {step}")
+    if warmup < 0:
+        raise ValueError("timing_warmup_steps must be non-negative")
+    elapsed = float(elapsed_ms)
+    if not math.isfinite(elapsed):
+        raise ValueError(f"elapsed_ms must be finite: {elapsed}")
+    return {
+        "global_step": step,
+        "elapsed_ms": elapsed,
+        "measured": step > warmup,
+    }
+
+
+def m5_metrics_step_record(
+    *,
+    step_plan: Mapping[str, Any],
+    elapsed_ms: float,
+    timing_warmup_steps: int,
+) -> dict[str, Any]:
+    timing = m5_timing_record(
+        global_step=int(step_plan["global_step"]),
+        elapsed_ms=elapsed_ms,
+        timing_warmup_steps=timing_warmup_steps,
+    )
+    return {
+        "step": int(step_plan["global_step"]),
+        "elapsed_ms": float(elapsed_ms),
+        "timing": timing,
+    }
+
+
+def summarize_m5_step_timing_records(
+    timing_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    executed_global_steps = [int(record["global_step"]) for record in timing_records]
+    all_steps = [float(record["elapsed_ms"]) for record in timing_records]
+    measured_records = [
+        record
+        for record in timing_records
+        if bool(record.get("measured"))
+    ]
+    measured_global_steps = [
+        int(record["global_step"])
+        for record in measured_records
+    ]
+    measured = [float(record["elapsed_ms"]) for record in measured_records]
+    summary = {
+        "executed_global_steps": executed_global_steps,
+        "executed_step_count": len(executed_global_steps),
+        "measured_global_steps": measured_global_steps,
+        "all_step_elapsed_ms": all_steps,
+        "measured_step_elapsed_ms": measured,
+        "measured_step_count": len(measured),
     }
     if measured:
         summary.update(
@@ -218,6 +393,11 @@ def resolved_config_dict(config: Any) -> dict[str, Any]:
 def validate_config(config: Any, args: argparse.Namespace) -> None:
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    if args.resume_checkpoint is not None:
+        if args.mode != "joint":
+            raise ValueError("M5 resume requires --mode joint")
+        if not m4_enabled(args):
+            raise ValueError("M5 resume requires --m4_sample_plan")
     if args.optimizer_steps <= 0:
         raise ValueError("--optimizer_steps must be positive")
     validate_timing_warmup_steps(args.timing_warmup_steps, args.optimizer_steps)
@@ -276,7 +456,7 @@ def load_generator(config: Any, checkpoint_path: Path) -> tuple[Any, str, int]:
     generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = extract_generator_state_dict(checkpoint)
-    checkpoint_has_mcp = any(is_mcp_state_key(key) for key in state_dict.keys())
+    checkpoint_has_mcp = any(is_mcp_state_key(key) for key in state_dict)
 
     if checkpoint_has_mcp:
         generator.add_mcp_modules(
@@ -458,6 +638,212 @@ def write_run_json(payload: dict[str, Any], path: Path, *, strict: bool) -> None
         atomic_json_write(payload, path)
 
 
+def require_output_dir_empty_for_resume(output_dir: Path) -> None:
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"--output_dir must be empty: {output_dir}")
+
+
+def load_parent_resume_checkpoint(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    parent_sha256 = file_sha256(path)
+    payload = load_m3_checkpoint(path)
+    return payload, parent_sha256
+
+
+def current_m5_resume_run_fields(
+    *,
+    resolved_config: dict[str, Any],
+    reference_checkpoint: Mapping[str, Any],
+    selected_sample_metadata: Mapping[str, Any],
+    optimizer: torch.optim.Optimizer,
+    current_git_sha: str,
+    sample_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    return build_resume_run_fields(
+        resolved_config=resolved_config,
+        reference_checkpoint=reference_checkpoint,
+        git_sha=current_git_sha,
+        optimizer_state_dict=optimizer.state_dict(),
+        optimizer_group_lrs=optimizer_group_lr_summary(optimizer),
+        selected_sample_metadata=selected_sample_metadata,
+        sample_plan=sample_plan,
+    )
+
+
+def require_m5_resume_devices(
+    resume_report: Mapping[str, Any],
+    *,
+    train_device: torch.device,
+    probe_device: torch.device,
+) -> None:
+    rng_restore = resume_report.get("rng_restore")
+    if not isinstance(rng_restore, Mapping):
+        raise TypeError("M5 resume report missing rng_restore")
+    expected_train = str(torch.device(train_device))
+    expected_probe = str(torch.device(probe_device))
+    actual_train = rng_restore.get("train_generator_device")
+    actual_probe = rng_restore.get("probe_generator_device")
+    if actual_train != expected_train:
+        raise RuntimeError(
+            "M5 train generator device mismatch: "
+            f"expected={expected_train}, actual={actual_train}"
+        )
+    if actual_probe != expected_probe:
+        raise RuntimeError(
+            "M5 probe generator device mismatch: "
+            f"expected={expected_probe}, actual={actual_probe}"
+        )
+
+
+def build_and_validate_m5_resume_report(
+    *,
+    parent_payload: Mapping[str, Any],
+    parent_checkpoint_path: Path,
+    parent_checkpoint_sha256: str,
+    current_run_fields: Mapping[str, Any],
+    target_global_step: int,
+    sample_plan: Mapping[str, Any],
+    output_dir: Path,
+    target_validation_steps: tuple[int, ...] | None,
+    target_checkpoint_steps: tuple[int, ...] | None,
+    expected_cuda_device_count: int | None,
+) -> dict[str, Any]:
+    contract = build_resume_contract(
+        parent_payload,
+        parent_checkpoint_path=parent_checkpoint_path,
+        parent_checkpoint_sha256=parent_checkpoint_sha256,
+        sample_plan=sample_plan,
+    )
+    if not bool(contract.get("source_verified")):
+        raise RuntimeError("M5 resume parent checkpoint source was not verified")
+    locked_fields = contract.get("locked_fields")
+    if not isinstance(locked_fields, Mapping):
+        raise TypeError("M5 resume contract missing locked fields")
+    if locked_fields.get("m3.mode") != "joint":
+        raise ResumeContractError(
+            "m3.mode",
+            "joint",
+            locked_fields.get("m3.mode"),
+            reason="M5 resume requires joint mode",
+        )
+    return validate_resume_contract(
+        contract,
+        current_run_fields,
+        target_global_step=target_global_step,
+        sample_plan=sample_plan,
+        output_dir=output_dir,
+        target_validation_steps=target_validation_steps,
+        target_checkpoint_steps=target_checkpoint_steps,
+        expected_cuda_device_count=expected_cuda_device_count,
+    )
+
+
+def restore_m5_probe_from_checkpoint(
+    *,
+    parent_payload: Mapping[str, Any],
+    selected_state,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[M3Probe, dict[str, Any]]:
+    probe_tensors = parent_payload.get("probe_tensors")
+    if not isinstance(probe_tensors, Mapping):
+        raise TypeError("M5 resume checkpoint missing probe_tensors")
+    noisy_batch = deserialize_noisy_batch(
+        probe_tensors,
+        state=selected_state,
+        device=device,
+        dtype=dtype,
+    )
+    probe_rng_state = parent_payload.get("probe_rng_state")
+    if not isinstance(probe_rng_state, torch.Tensor):
+        raise TypeError("M5 resume checkpoint missing probe_rng_state")
+    prompt_embedding = parent_payload.get("probe_prompt_embedding")
+    if not isinstance(prompt_embedding, Mapping):
+        raise TypeError("M5 resume checkpoint missing probe_prompt_embedding")
+    return (
+        M3Probe(
+            seed=int(parent_payload["probe_seed"]),
+            rng_state=probe_rng_state.detach().cpu().clone(),
+            noisy_batch=noisy_batch,
+        ),
+        move_tensors_to_device(
+            prompt_embedding,
+            device=device,
+            floating_dtype=dtype,
+        ),
+    )
+
+
+def require_restored_probe_matches_checkpoint(
+    *,
+    parent_payload: Mapping[str, Any],
+    restored_prompt_embedding: Mapping[str, Any],
+    probe_forward,
+) -> dict[str, Any]:
+    output_comparison = compare_probe_outputs(
+        probe_forward.outputs,
+        parent_payload["probe_outputs"],
+    )
+    if output_comparison["max_abs_diff"] != 0.0:
+        raise RuntimeError("M5 restored probe outputs differ from checkpoint")
+    actual_losses = loss_dict_to_floats(probe_forward.losses)
+    expected_summary = parent_payload.get("probe_summary")
+    if not isinstance(expected_summary, Mapping):
+        raise TypeError("M5 resume checkpoint missing probe_summary")
+    expected_losses = expected_summary.get("probe_losses")
+    if not isinstance(expected_losses, Mapping):
+        raise TypeError("M5 resume checkpoint missing probe losses")
+    for key, actual in actual_losses.items():
+        expected = float(expected_losses[key])
+        if actual != expected:
+            raise RuntimeError(
+                "M5 restored probe loss differs from checkpoint: "
+                f"field={key}, expected={expected}, actual={actual}"
+            )
+    expected_prompt_embedding = parent_payload.get("probe_prompt_embedding")
+    if not isinstance(expected_prompt_embedding, Mapping):
+        raise TypeError("M5 resume checkpoint missing probe_prompt_embedding")
+    try:
+        prompt_comparison = compare_serialized_probe_tensors(
+            restored_prompt_embedding,
+            expected_prompt_embedding,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "M5 restored probe prompt embedding structure differs from checkpoint"
+        ) from exc
+    if prompt_comparison["max_abs_diff"] != 0.0:
+        raise RuntimeError("M5 restored probe prompt embedding differs from checkpoint")
+    return {
+        "status": "PASS",
+        "probe_output_comparison": output_comparison,
+        "probe_prompt_embedding_comparison": prompt_comparison,
+        "probe_losses": actual_losses,
+    }
+
+
+def strict_load_m5_generator_state(
+    generator,
+    state_dict: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        missing, unexpected = generator.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"M5 generator strict load failed: {exc}") from exc
+    if missing or unexpected:
+        raise RuntimeError(
+            "M5 generator strict load failed: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        "status": "PASS",
+        "strict": True,
+        "missing_keys": [],
+        "unexpected_keys": [],
+    }
+
+
 def named_parameter_groups(generator) -> dict[str, tuple[tuple[str, torch.nn.Parameter], ...]]:
     return collect_nf_sf_parameter_groups(generator)
 
@@ -512,6 +898,47 @@ def conditional_dict_for_identity(
     return cache[identity]
 
 
+def precompute_m5_resume_conditionals(
+    *,
+    text_encoder,
+    sample_plan: Mapping[str, Any],
+    train_samples_by_identity: Mapping[str, Any],
+    validation_samples_by_identity: Mapping[str, Any],
+    fixed_decode_prompt_embedding: dict[str, Any],
+    conditional_cache: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    fixed_decode_identity = str(sample_plan["fixed_decode_validation_identity"])
+    train_identities = [
+        str(identity)
+        for identity in sample_plan["train_sample_identities"]
+    ]
+    validation_identities = [
+        str(identity)
+        for identity in sample_plan["validation_sample_identities"]
+    ]
+    conditional_cache[fixed_decode_identity] = fixed_decode_prompt_embedding
+    for identity in train_identities:
+        conditional_dict_for_identity(
+            text_encoder=text_encoder,
+            sample=train_samples_by_identity[identity],
+            identity=identity,
+            cache=conditional_cache,
+        )
+    for identity in validation_identities:
+        conditional_dict_for_identity(
+            text_encoder=text_encoder,
+            sample=validation_samples_by_identity[identity],
+            identity=identity,
+            cache=conditional_cache,
+        )
+    return {
+        "fixed_decode_identity": fixed_decode_identity,
+        "train_identities": train_identities,
+        "validation_identities": validation_identities,
+        "cached_identities": sorted(conditional_cache),
+    }
+
+
 def write_m4_validation_report(
     *,
     output_dir: Path,
@@ -541,7 +968,7 @@ def write_m4_validation_report(
 
 def require_m4_validation_pass(report: Any, *, global_step: int) -> None:
     if not isinstance(report, Mapping):
-        raise RuntimeError(
+        raise TypeError(
             "M4 validation contract failed "
             f"at step {int(global_step)}: report is not a mapping"
         )
@@ -585,6 +1012,172 @@ def handle_m4_validation_report(
     )
     require_m4_validation_pass(report, global_step=global_step)
     validation_reports.append(report)
+
+
+def run_m5_m4_validation_for_step(
+    *,
+    generator,
+    text_encoder,
+    validation_samples_by_identity: Mapping[str, Any],
+    conditional_cache: dict[str, dict[str, Any]],
+    scheduler_main,
+    scheduler_mcp,
+    device: torch.device,
+    dtype: torch.dtype,
+    mode: str,
+    global_step: int,
+    sample_plan: Mapping[str, Any],
+    validation_seed: int,
+    train_rng: torch.Generator,
+    probe: M3Probe,
+    output_dir: Path,
+    current_git_sha: str,
+    reference_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    validation_samples = [
+        validation_samples_by_identity[str(identity)]
+        for identity in sample_plan["validation_sample_identities"]
+    ]
+    validation_conditionals = {
+        str(identity): conditional_dict_for_identity(
+            text_encoder=text_encoder,
+            sample=validation_samples_by_identity[str(identity)],
+            identity=str(identity),
+            cache=conditional_cache,
+        )
+        for identity in sample_plan["validation_sample_identities"]
+    }
+    return run_m4_validation(
+        generator=generator,
+        samples=validation_samples,
+        conditional_dicts=validation_conditionals,
+        scheduler_main=scheduler_main,
+        scheduler_mcp=scheduler_mcp,
+        device=device,
+        dtype=dtype,
+        mode=mode,
+        global_step=global_step,
+        sample_plan=sample_plan,
+        validation_seed=int(validation_seed),
+        train_rng=train_rng,
+        probe_rng_state=probe.rng_state,
+        model_identity={
+            "output_dir": str(output_dir.resolve()),
+            "git_sha": current_git_sha,
+            "reference_checkpoint_sha256": reference_checkpoint_sha256,
+        },
+    )
+
+
+def write_m5_step_artifacts(
+    *,
+    output_dir: Path,
+    metrics_path: Path,
+    generator,
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    metric_record: dict[str, Any],
+    should_log: bool,
+    should_checkpoint: bool,
+    train_rng: torch.Generator,
+    probe: M3Probe,
+    sample_metadata: Mapping[str, Any],
+    resolved_config: dict[str, Any],
+    current_git_sha: str,
+    reference_checkpoint_path: Path,
+    reference_checkpoint_sha256: str,
+    train_seed: int,
+    probe_seed: int,
+    prompt_embedding: dict[str, Any],
+    device: torch.device,
+    strict: bool,
+    mcp1_grid_aux_enabled: bool,
+    mcp1_grid_aux_scheduler,
+    mcp1_grid_aux_timesteps,
+    state,
+    train_losses: Mapping[str, float],
+    aux_report: Mapping[str, Any],
+    grad_audit: Mapping[str, Any],
+) -> None:
+    if not should_log and not should_checkpoint:
+        append_run_metrics(metrics_path, metric_record, strict=strict)
+        return
+
+    grid_probe = None
+    if mcp1_grid_aux_enabled:
+        grid_probe = run_mcp1_grid_stable_probe(
+            generator,
+            conditional_dict=prompt_embedding,
+            state=state,
+            scheduler=mcp1_grid_aux_scheduler,
+            timesteps=mcp1_grid_aux_timesteps,
+            epsilon_main=probe.noisy_batch.epsilon_main,
+            epsilon_future=probe.noisy_batch.epsilon_depths[0],
+        )
+    probe_forward = run_m3_probe_forward(
+        generator,
+        conditional_dict=prompt_embedding,
+        noisy_batch=probe.noisy_batch,
+    )
+    probe_report = write_probe_report(
+        output_dir,
+        global_step,
+        probe_forward.losses,
+        probe_forward.outputs,
+        grid_probe,
+        strict=strict,
+    )
+    metric_record.update(prefix_metrics("probe", probe_forward.losses))
+    if grid_probe is not None:
+        metric_record.update(
+            {
+                "probe/mcp1_grid_probe_mean_loss": grid_probe[
+                    "mcp1_grid_probe_mean_loss"
+                ],
+                "probe/mcp1_grid_probe_point_losses": grid_probe["point_losses"],
+                "probe/mcp1_grid_probe_all_finite": grid_probe["all_finite"],
+            }
+        )
+    if should_checkpoint:
+        save_checkpoint_at_step(
+            output_dir=output_dir,
+            generator=generator,
+            optimizer=optimizer,
+            step=global_step,
+            train_rng=train_rng,
+            probe=probe,
+            probe_summary=probe_report,
+            probe_outputs=probe_forward.outputs,
+            sample_metadata=dict(sample_metadata),
+            resolved_config=resolved_config,
+            git_sha=current_git_sha,
+            reference_checkpoint_path=reference_checkpoint_path,
+            reference_checkpoint_sha256=reference_checkpoint_sha256,
+            train_seed=train_seed,
+            probe_seed=probe_seed,
+            prompt_embedding=prompt_embedding,
+            device=device,
+        )
+    append_run_metrics(metrics_path, metric_record, strict=strict)
+    print(
+        json.dumps(
+            {
+                "step": global_step,
+                **prefix_metrics("train", train_losses),
+                "train/mcp1_grid_aux_mean_loss": aux_report[
+                    "mcp1_grid_aux_mean_loss"
+                ],
+                "train/mcp1_grid_aux_weighted_loss": aux_report[
+                    "mcp1_grid_aux_weighted_loss"
+                ],
+                "train/combined_objective": metric_record["train/combined_objective"],
+                **prefix_metrics("probe", probe_forward.losses),
+                "grad_audit": grad_audit,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
 
 def run_m4_validation_stage(
@@ -634,7 +1227,7 @@ def gradient_metadata_snapshot(
             else:
                 group_snapshot[name] = {
                     "grad_is_none": False,
-                    "grad_object_id": int(id(grad)),
+                    "grad_object_id": id(grad),
                     "grad_data_ptr": int(grad.data_ptr()),
                     "grad_version": int(grad._version),
                     "shape": [int(dim) for dim in grad.shape],
@@ -698,7 +1291,7 @@ def validate_mcp1_grid_aux_gradient_isolation(
             ):
                 version_increased_count += 1
         reports[group_name] = {
-            "tensor_count": int(len(tensors)),
+            "tensor_count": len(tensors),
             "changed_tensor_count": int(changed_count),
             "object_id_changed_count": int(object_changed_count),
             "data_ptr_changed_count": int(data_ptr_changed_count),
@@ -998,6 +1591,7 @@ def save_checkpoint_at_step(
     train_seed: int,
     probe_seed: int,
     prompt_embedding: dict[str, Any],
+    device: torch.device,
 ) -> Path:
     path = output_dir / f"checkpoint_step{step:06d}.pt"
     payload = make_m3_checkpoint_payload(
@@ -1017,6 +1611,11 @@ def save_checkpoint_at_step(
         probe_seed=probe_seed,
         prompt_embedding=prompt_embedding,
     )
+    payload[M5_RNG_EXTENSION_FIELD] = capture_m5_global_rng_extension(
+        include_cuda=device.type == "cuda",
+        train_generator_device=device,
+        probe_generator_device=device,
+    )
     save_m3_checkpoint(payload, path)
     return path
 
@@ -1024,14 +1623,15 @@ def save_checkpoint_at_step(
 def main() -> None:
     args = parse_args()
     args.mode = validate_m3_mode(args.mode)
+    resume_enabled = args.resume_checkpoint is not None
     dtype = dtype_from_arg(args.dtype)
     device = require_single_gpu_runtime(torch, args.device)
-    reset_global_seed(args.train_seed)
 
-    if args.output_dir.exists() and any(args.output_dir.iterdir()):
-        raise FileExistsError(f"--output_dir must be empty: {args.output_dir}")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    require_output_dir_empty_for_resume(args.output_dir)
 
+    config = merge_config(str(args.config))
+    validate_config(config, args)
+    current_git_sha = git_head()
     reference_checkpoint_sha256 = file_sha256(args.checkpoint)
     m4_plan = None
     m4_plan_sha = None
@@ -1043,7 +1643,6 @@ def main() -> None:
         m4_plan = load_m4_sample_plan(args.m4_sample_plan, manifest_path=args.manifest)
         validate_m4_sample_plan(m4_plan)
         m4_plan_sha = m4_sample_plan_sha256(m4_plan)
-        write_m4_sample_plan(m4_plan, args.output_dir / "m4_sample_plan.json")
         train_samples_by_identity = load_m4_teacher_samples(
             m4_plan,
             split="train",
@@ -1073,6 +1672,18 @@ def main() -> None:
             split_index=args.split_index,
             reference_checkpoint_path=args.checkpoint,
         )
+    parent_resume_payload = None
+    parent_resume_sha256 = None
+    if resume_enabled:
+        assert args.resume_checkpoint is not None
+        parent_resume_payload, parent_resume_sha256 = load_parent_resume_checkpoint(
+            args.resume_checkpoint
+        )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if m4_enabled(args):
+        assert m4_plan is not None
+        write_m4_sample_plan(m4_plan, args.output_dir / "m4_sample_plan.json")
     write_run_json(
         sample.metadata,
         args.output_dir / "sample_metadata.json",
@@ -1082,9 +1693,12 @@ def main() -> None:
         reference_checkpoint_sha256 + "\n",
         encoding="utf-8",
     )
-
-    config = merge_config(str(args.config))
-    validate_config(config, args)
+    if resume_enabled:
+        assert parent_resume_sha256 is not None
+        (args.output_dir / "parent_checkpoint_sha256.txt").write_text(
+            parent_resume_sha256 + "\n",
+            encoding="utf-8",
+        )
     if m4_enabled(args):
         m4_validation_steps, m4_checkpoint_steps = resolved_m4_step_sets(args)
     mcp1_grid_aux_enabled = float(args.mcp1_grid_aux_weight) > 0.0
@@ -1169,12 +1783,12 @@ def main() -> None:
         args.output_dir / "resolved_config.json",
         strict=m4_enabled(args),
     )
-    current_git_sha = git_head()
     (args.output_dir / "git_sha.txt").write_text(current_git_sha + "\n", encoding="utf-8")
 
     generator = None
     text_encoder = None
-    train_rng = make_generator(args.train_seed, device)
+    reset_global_seed(args.train_seed)
+    train_rng = None
     metrics_path = args.output_dir / "metrics.jsonl"
     try:
         generator, load_mode, mcp_tensor_count = load_generator(config, args.checkpoint)
@@ -1188,12 +1802,15 @@ def main() -> None:
         if m4_enabled(args):
             assert m4_plan is not None
             fixed_decode_identity = str(m4_plan["fixed_decode_validation_identity"])
-            conditional_dict = conditional_dict_for_identity(
-                text_encoder=text_encoder,
-                sample=sample,
-                identity=fixed_decode_identity,
-                cache=conditional_cache,
-            )
+            if resume_enabled:
+                conditional_dict = {}
+            else:
+                conditional_dict = conditional_dict_for_identity(
+                    text_encoder=text_encoder,
+                    sample=sample,
+                    identity=fixed_decode_identity,
+                    cache=conditional_cache,
+                )
         else:
             with torch.no_grad():
                 conditional_dict = text_encoder([sample.metadata["prompt"]])
@@ -1206,37 +1823,6 @@ def main() -> None:
         scheduler_mcp = make_mcp_scheduler(device)
         if mcp1_grid_aux_enabled and mcp1_grid_aux_scheduler is scheduler_main:
             raise RuntimeError("MCP-1 grid auxiliary scheduler must be independent")
-
-        probe = make_m3_probe(
-            state,
-            scheduler_main=scheduler_main,
-            scheduler_mcp=scheduler_mcp,
-            seed=args.probe_seed,
-        )
-        initial_probe = run_m3_probe_forward(
-            generator,
-            conditional_dict=conditional_dict,
-            noisy_batch=probe.noisy_batch,
-        )
-        initial_grid_probe = None
-        if mcp1_grid_aux_enabled:
-            initial_grid_probe = run_mcp1_grid_stable_probe(
-                generator,
-                conditional_dict=conditional_dict,
-                state=state,
-                scheduler=mcp1_grid_aux_scheduler,
-                timesteps=mcp1_grid_aux_timesteps,
-                epsilon_main=probe.noisy_batch.epsilon_main,
-                epsilon_future=probe.noisy_batch.epsilon_depths[0],
-            )
-        initial_probe_report = write_probe_report(
-            args.output_dir,
-            0,
-            initial_probe.losses,
-            initial_probe.outputs,
-            initial_grid_probe,
-            strict=m4_enabled(args),
-        )
 
         group_lrs = {
             "backbone": args.backbone_lr,
@@ -1266,117 +1852,229 @@ def main() -> None:
             args.output_dir / "optimizer_audit.json",
             strict=m4_enabled(args),
         )
-        save_checkpoint_at_step(
-            output_dir=args.output_dir,
-            generator=generator,
-            optimizer=optimizer,
-            step=0,
-            train_rng=train_rng,
-            probe=probe,
-            probe_summary=initial_probe_report,
-            probe_outputs=initial_probe.outputs,
-            sample_metadata=sample.metadata,
-            resolved_config=resolved_config,
-            git_sha=current_git_sha,
-            reference_checkpoint_path=args.checkpoint,
-            reference_checkpoint_sha256=reference_checkpoint_sha256,
-            train_seed=args.train_seed,
-            probe_seed=args.probe_seed,
-            prompt_embedding=conditional_dict,
-        )
-        append_run_metrics(
-            metrics_path,
-            {
-                "step": 0,
-                "elapsed_ms": 0.0,
-                **prefix_metrics("probe", initial_probe.losses),
-                **(
-                    {}
-                    if initial_grid_probe is None
-                    else {
-                        "probe/mcp1_grid_probe_mean_loss": initial_grid_probe[
-                            "mcp1_grid_probe_mean_loss"
-                        ],
-                        "probe/mcp1_grid_probe_point_losses": initial_grid_probe[
-                            "point_losses"
-                        ],
-                        "probe/mcp1_grid_probe_all_finite": initial_grid_probe[
-                            "all_finite"
-                        ],
-                    }
-                ),
-            },
-            strict=m4_enabled(args),
-        )
+        resumed_global_step = None
+        resume_report = None
+        if resume_enabled:
+            assert parent_resume_payload is not None
+            assert parent_resume_sha256 is not None
+            assert args.resume_checkpoint is not None
+            assert m4_plan is not None
+            current_run_fields = current_m5_resume_run_fields(
+                resolved_config=resolved_config,
+                reference_checkpoint={
+                    "path": args.checkpoint,
+                    "sha256": reference_checkpoint_sha256,
+                },
+                selected_sample_metadata=sample.metadata,
+                optimizer=optimizer,
+                current_git_sha=current_git_sha,
+                sample_plan=m4_plan,
+            )
+            resume_report = build_and_validate_m5_resume_report(
+                parent_payload=parent_resume_payload,
+                parent_checkpoint_path=args.resume_checkpoint,
+                parent_checkpoint_sha256=parent_resume_sha256,
+                current_run_fields=current_run_fields,
+                target_global_step=int(args.optimizer_steps),
+                sample_plan=m4_plan,
+                output_dir=args.output_dir,
+                target_validation_steps=m4_validation_steps,
+                target_checkpoint_steps=m4_checkpoint_steps,
+                expected_cuda_device_count=1 if device.type == "cuda" else None,
+            )
+            require_m5_resume_devices(
+                resume_report,
+                train_device=device,
+                probe_device=device,
+            )
+            generator_restore = strict_load_m5_generator_state(
+                generator,
+                parent_resume_payload["generator"],
+            )
+            optimizer.load_state_dict(parent_resume_payload["optimizer"])
+            optimizer_device_report = move_loaded_optimizer_state_to_device(
+                optimizer,
+                device=device,
+            )
+            rng_states = extract_resume_rng_states(parent_resume_payload)
+            train_rng = restore_torch_generator_from_state(
+                rng_states["train_generator_state"],
+                device=device,
+            )
+            probe, restored_prompt_embedding = restore_m5_probe_from_checkpoint(
+                parent_payload=parent_resume_payload,
+                selected_state=state,
+                device=device,
+                dtype=dtype,
+            )
+            conditional_dict = restored_prompt_embedding
+            restored_probe = run_m3_probe_forward(
+                generator,
+                conditional_dict=conditional_dict,
+                noisy_batch=probe.noisy_batch,
+            )
+            probe_restore = require_restored_probe_matches_checkpoint(
+                parent_payload=parent_resume_payload,
+                restored_prompt_embedding=restored_prompt_embedding,
+                probe_forward=restored_probe,
+            )
+            assert train_samples_by_identity is not None
+            assert validation_samples_by_identity is not None
+            conditional_restore = precompute_m5_resume_conditionals(
+                text_encoder=text_encoder,
+                sample_plan=m4_plan,
+                train_samples_by_identity=train_samples_by_identity,
+                validation_samples_by_identity=validation_samples_by_identity,
+                fixed_decode_prompt_embedding=restored_prompt_embedding,
+                conditional_cache=conditional_cache,
+            )
+            resume_report.update(
+                {
+                    "generator_restore": generator_restore,
+                    "optimizer_device_restore": optimizer_device_report,
+                    "probe_restore": probe_restore,
+                    "conditional_cache_restore": conditional_restore,
+                }
+            )
+            write_run_json(
+                resume_report,
+                args.output_dir / "resume_report.json",
+                strict=True,
+            )
+            restore_global_rng_states(rng_states)
+            resumed_global_step = int(parent_resume_payload["global_step"])
+        else:
+            train_rng = make_generator(args.train_seed, device)
+            probe = make_m3_probe(
+                state,
+                scheduler_main=scheduler_main,
+                scheduler_mcp=scheduler_mcp,
+                seed=args.probe_seed,
+            )
+            initial_probe = run_m3_probe_forward(
+                generator,
+                conditional_dict=conditional_dict,
+                noisy_batch=probe.noisy_batch,
+            )
+            initial_grid_probe = None
+            if mcp1_grid_aux_enabled:
+                initial_grid_probe = run_mcp1_grid_stable_probe(
+                    generator,
+                    conditional_dict=conditional_dict,
+                    state=state,
+                    scheduler=mcp1_grid_aux_scheduler,
+                    timesteps=mcp1_grid_aux_timesteps,
+                    epsilon_main=probe.noisy_batch.epsilon_main,
+                    epsilon_future=probe.noisy_batch.epsilon_depths[0],
+                )
+            initial_probe_report = write_probe_report(
+                args.output_dir,
+                0,
+                initial_probe.losses,
+                initial_probe.outputs,
+                initial_grid_probe,
+                strict=m4_enabled(args),
+            )
+            save_checkpoint_at_step(
+                output_dir=args.output_dir,
+                generator=generator,
+                optimizer=optimizer,
+                step=0,
+                train_rng=train_rng,
+                probe=probe,
+                probe_summary=initial_probe_report,
+                probe_outputs=initial_probe.outputs,
+                sample_metadata=sample.metadata,
+                resolved_config=resolved_config,
+                git_sha=current_git_sha,
+                reference_checkpoint_path=args.checkpoint,
+                reference_checkpoint_sha256=reference_checkpoint_sha256,
+                train_seed=args.train_seed,
+                probe_seed=args.probe_seed,
+                prompt_embedding=conditional_dict,
+                device=device,
+            )
+            append_run_metrics(
+                metrics_path,
+                {
+                    "step": 0,
+                    "elapsed_ms": 0.0,
+                    **prefix_metrics("probe", initial_probe.losses),
+                    **(
+                        {}
+                        if initial_grid_probe is None
+                        else {
+                            "probe/mcp1_grid_probe_mean_loss": initial_grid_probe[
+                                "mcp1_grid_probe_mean_loss"
+                            ],
+                            "probe/mcp1_grid_probe_point_losses": initial_grid_probe[
+                                "point_losses"
+                            ],
+                            "probe/mcp1_grid_probe_all_finite": initial_grid_probe[
+                                "all_finite"
+                            ],
+                        }
+                    ),
+                },
+                strict=m4_enabled(args),
+            )
         validation_reports: list[dict[str, Any]] = []
-        if m4_enabled(args):
+        if m4_enabled(args) and not resume_enabled:
             assert m4_plan is not None
             assert validation_samples_by_identity is not None
             assert m4_validation_steps is not None
+            assert train_rng is not None
             if 0 in m4_validation_steps:
-                validation_samples = [
-                    validation_samples_by_identity[str(identity)]
-                    for identity in m4_plan["validation_sample_identities"]
-                ]
-                validation_conditionals = {
-                    str(identity): conditional_dict_for_identity(
-                        text_encoder=text_encoder,
-                        sample=validation_samples_by_identity[str(identity)],
-                        identity=str(identity),
-                        cache=conditional_cache,
-                    )
-                    for identity in m4_plan["validation_sample_identities"]
-                }
-                def run_step0_validation() -> dict[str, Any]:
-                    return run_m4_validation(
-                        generator=generator,
-                        samples=validation_samples,
-                        conditional_dicts=validation_conditionals,
-                        scheduler_main=scheduler_main,
-                        scheduler_mcp=scheduler_mcp,
-                        device=device,
-                        dtype=dtype,
-                        mode=args.mode,
-                        global_step=0,
-                        sample_plan=m4_plan,
-                        validation_seed=int(args.validation_seed),
-                        train_rng=train_rng,
-                        probe_rng_state=probe.rng_state,
-                        model_identity={
-                            "output_dir": str(args.output_dir.resolve()),
-                            "git_sha": current_git_sha,
-                            "reference_checkpoint_sha256": reference_checkpoint_sha256,
-                        },
-                    )
-
-                run_m4_validation_stage(
+                report = run_m5_m4_validation_for_step(
+                    generator=generator,
+                    text_encoder=text_encoder,
+                    validation_samples_by_identity=validation_samples_by_identity,
+                    conditional_cache=conditional_cache,
+                    scheduler_main=scheduler_main,
+                    scheduler_mcp=scheduler_mcp,
+                    device=device,
+                    dtype=dtype,
+                    mode=args.mode,
                     global_step=0,
-                    run_validation=run_step0_validation,
-                    handle_report=lambda *, report, global_step: handle_m4_validation_report(
-                        output_dir=args.output_dir,
-                        metrics_path=metrics_path,
-                        validation_reports=validation_reports,
-                        report=report,
-                        global_step=global_step,
-                    ),
+                    sample_plan=m4_plan,
+                    validation_seed=int(args.validation_seed),
+                    train_rng=train_rng,
+                    probe=probe,
+                    output_dir=args.output_dir,
+                    current_git_sha=current_git_sha,
+                    reference_checkpoint_sha256=reference_checkpoint_sha256,
+                )
+                handle_m4_validation_report(
+                    output_dir=args.output_dir,
+                    metrics_path=metrics_path,
+                    validation_reports=validation_reports,
+                    report=report,
+                    global_step=0,
                 )
 
-        all_step_elapsed_ms: list[float] = []
+        step_timing_records: list[dict[str, Any]] = []
         reset_peak_memory_stats_if_available(device)
-        for step in range(1, args.optimizer_steps + 1):
+        assert train_rng is not None
+        for step in m5_absolute_training_steps(
+            resumed_global_step=resumed_global_step,
+            target_global_step=args.optimizer_steps,
+        ):
             cuda_synchronize_if_available(device)
             started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            train_sample_identity = None
-            train_sample_position = None
-            train_cycle_index = None
+            step_plan = m5_training_step_orchestration(
+                global_step=step,
+                target_global_step=args.optimizer_steps,
+                sample_plan=m4_plan if m4_enabled(args) else None,
+                validation_steps=m4_validation_steps,
+                checkpoint_steps=m4_checkpoint_steps,
+                checkpoint_interval=args.checkpoint_interval,
+                log_interval=args.log_interval,
+            )
             if m4_enabled(args):
                 assert m4_plan is not None
                 assert train_samples_by_identity is not None
-                train_entry = m4_train_entry_for_step(m4_plan, step)
-                train_sample_identity = str(train_entry["identity"])
-                train_sample_position = int(train_entry["train_sample_position"])
-                train_cycle_index = int(train_entry["train_cycle_index"])
+                train_sample_identity = str(step_plan["train_sample_identity"])
                 train_sample = train_samples_by_identity[train_sample_identity]
                 step_state = selected_state_to_device(
                     train_sample.selected_state,
@@ -1439,25 +2137,23 @@ def main() -> None:
             optimizer.step()
             cuda_synchronize_if_available(device)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
-            all_step_elapsed_ms.append(elapsed_ms)
+            metric_step_record = m5_metrics_step_record(
+                step_plan=step_plan,
+                elapsed_ms=elapsed_ms,
+                timing_warmup_steps=args.timing_warmup_steps,
+            )
+            step_timing_records.append(metric_step_record["timing"])
             train_losses = loss_dict_to_floats(result.losses)
             combined_objective = (
                 train_losses["total_loss"]
                 + aux_report["mcp1_grid_aux_weighted_loss"]
             )
 
-            should_log = step % args.log_interval == 0 or step == args.optimizer_steps
-            if m4_enabled(args):
-                assert m4_checkpoint_steps is not None
-                should_checkpoint = step in m4_checkpoint_steps
-            else:
-                should_checkpoint = (
-                    step % args.checkpoint_interval == 0
-                    or step == args.optimizer_steps
-                )
+            should_log = bool(step_plan["should_log"])
+            should_checkpoint = bool(step_plan["should_checkpoint"])
+            should_validate = bool(step_plan["should_validate"])
             metric_record = {
-                "step": step,
-                "elapsed_ms": elapsed_ms,
+                **metric_step_record,
                 **prefix_metrics("train", train_losses),
                 "train/random_total_loss": train_losses["total_loss"],
                 "train/mcp1_grid_aux_mean_loss": aux_report[
@@ -1474,159 +2170,74 @@ def main() -> None:
             if m4_enabled(args):
                 metric_record.update(
                     {
-                        "train_sample_identity": train_sample_identity,
-                        "train_sample_position": train_sample_position,
-                        "train_cycle_index": train_cycle_index,
+                        "train_sample_identity": step_plan["train_sample_identity"],
+                        "train_sample_position": step_plan["train_sample_position"],
+                        "train_cycle_index": step_plan["train_cycle_index"],
+                        "should_validate": should_validate,
+                        "should_checkpoint": should_checkpoint,
                     }
                 )
-            def write_step_artifacts_after_validation() -> None:
-                if should_log or should_checkpoint:
-                    grid_probe = None
-                    if mcp1_grid_aux_enabled:
-                        grid_probe = run_mcp1_grid_stable_probe(
-                            generator,
-                            conditional_dict=conditional_dict,
-                            state=state,
-                            scheduler=mcp1_grid_aux_scheduler,
-                            timesteps=mcp1_grid_aux_timesteps,
-                            epsilon_main=probe.noisy_batch.epsilon_main,
-                            epsilon_future=probe.noisy_batch.epsilon_depths[0],
-                        )
-                    probe_forward = run_m3_probe_forward(
-                        generator,
-                        conditional_dict=conditional_dict,
-                        noisy_batch=probe.noisy_batch,
-                    )
-                    probe_report = write_probe_report(
-                        args.output_dir,
-                        step,
-                        probe_forward.losses,
-                        probe_forward.outputs,
-                        grid_probe,
-                        strict=m4_enabled(args),
-                    )
-                    metric_record.update(prefix_metrics("probe", probe_forward.losses))
-                    if grid_probe is not None:
-                        metric_record.update(
-                            {
-                                "probe/mcp1_grid_probe_mean_loss": grid_probe[
-                                    "mcp1_grid_probe_mean_loss"
-                                ],
-                                "probe/mcp1_grid_probe_point_losses": grid_probe[
-                                    "point_losses"
-                                ],
-                                "probe/mcp1_grid_probe_all_finite": grid_probe[
-                                    "all_finite"
-                                ],
-                            }
-                        )
-                    if should_checkpoint:
-                        save_checkpoint_at_step(
-                            output_dir=args.output_dir,
-                            generator=generator,
-                            optimizer=optimizer,
-                            step=step,
-                            train_rng=train_rng,
-                            probe=probe,
-                            probe_summary=probe_report,
-                            probe_outputs=probe_forward.outputs,
-                            sample_metadata=sample.metadata,
-                            resolved_config=resolved_config,
-                            git_sha=current_git_sha,
-                            reference_checkpoint_path=args.checkpoint,
-                            reference_checkpoint_sha256=reference_checkpoint_sha256,
-                            train_seed=args.train_seed,
-                            probe_seed=args.probe_seed,
-                            prompt_embedding=conditional_dict,
-                        )
-                    append_run_metrics(
-                        metrics_path,
-                        metric_record,
-                        strict=m4_enabled(args),
-                    )
-                    print(
-                        json.dumps(
-                            {
-                                "step": step,
-                                **prefix_metrics("train", train_losses),
-                                "train/mcp1_grid_aux_mean_loss": aux_report[
-                                    "mcp1_grid_aux_mean_loss"
-                                ],
-                                "train/mcp1_grid_aux_weighted_loss": aux_report[
-                                    "mcp1_grid_aux_weighted_loss"
-                                ],
-                                "train/combined_objective": combined_objective,
-                                **prefix_metrics("probe", probe_forward.losses),
-                                "grad_audit": grad_audit,
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
-                else:
-                    append_run_metrics(
-                        metrics_path,
-                        metric_record,
-                        strict=m4_enabled(args),
-                    )
 
             if m4_enabled(args):
                 assert m4_plan is not None
                 assert validation_samples_by_identity is not None
                 assert m4_validation_steps is not None
-                if step in m4_validation_steps:
-                    validation_samples = [
-                        validation_samples_by_identity[str(identity)]
-                        for identity in m4_plan["validation_sample_identities"]
-                    ]
-                    validation_conditionals = {
-                        str(identity): conditional_dict_for_identity(
-                            text_encoder=text_encoder,
-                            sample=validation_samples_by_identity[str(identity)],
-                            identity=str(identity),
-                            cache=conditional_cache,
-                        )
-                        for identity in m4_plan["validation_sample_identities"]
-                    }
-
-                    def run_step_validation() -> dict[str, Any]:
-                        return run_m4_validation(
-                            generator=generator,
-                            samples=validation_samples,
-                            conditional_dicts=validation_conditionals,
-                            scheduler_main=scheduler_main,
-                            scheduler_mcp=scheduler_mcp,
-                            device=device,
-                            dtype=dtype,
-                            mode=args.mode,
-                            global_step=step,
-                            sample_plan=m4_plan,
-                            validation_seed=int(args.validation_seed),
-                            train_rng=train_rng,
-                            probe_rng_state=probe.rng_state,
-                            model_identity={
-                                "output_dir": str(args.output_dir.resolve()),
-                                "git_sha": current_git_sha,
-                                "reference_checkpoint_sha256": reference_checkpoint_sha256,
-                            },
-                        )
-
-                    run_m4_validation_stage(
+                if should_validate:
+                    report = run_m5_m4_validation_for_step(
+                        generator=generator,
+                        text_encoder=text_encoder,
+                        validation_samples_by_identity=validation_samples_by_identity,
+                        conditional_cache=conditional_cache,
+                        scheduler_main=scheduler_main,
+                        scheduler_mcp=scheduler_mcp,
+                        device=device,
+                        dtype=dtype,
+                        mode=args.mode,
                         global_step=step,
-                        run_validation=run_step_validation,
-                        handle_report=lambda *, report, global_step: handle_m4_validation_report(
-                            output_dir=args.output_dir,
-                            metrics_path=metrics_path,
-                            validation_reports=validation_reports,
-                            report=report,
-                            global_step=global_step,
-                        ),
-                        after_pass=write_step_artifacts_after_validation,
+                        sample_plan=m4_plan,
+                        validation_seed=int(args.validation_seed),
+                        train_rng=train_rng,
+                        probe=probe,
+                        output_dir=args.output_dir,
+                        current_git_sha=current_git_sha,
+                        reference_checkpoint_sha256=reference_checkpoint_sha256,
                     )
-                else:
-                    write_step_artifacts_after_validation()
-            else:
-                write_step_artifacts_after_validation()
+                    handle_m4_validation_report(
+                        output_dir=args.output_dir,
+                        metrics_path=metrics_path,
+                        validation_reports=validation_reports,
+                        report=report,
+                        global_step=step,
+                    )
+            write_m5_step_artifacts(
+                output_dir=args.output_dir,
+                metrics_path=metrics_path,
+                generator=generator,
+                optimizer=optimizer,
+                global_step=step,
+                metric_record=metric_record,
+                should_log=should_log,
+                should_checkpoint=should_checkpoint,
+                train_rng=train_rng,
+                probe=probe,
+                sample_metadata=sample.metadata,
+                resolved_config=resolved_config,
+                current_git_sha=current_git_sha,
+                reference_checkpoint_path=args.checkpoint,
+                reference_checkpoint_sha256=reference_checkpoint_sha256,
+                train_seed=args.train_seed,
+                probe_seed=args.probe_seed,
+                prompt_embedding=conditional_dict,
+                device=device,
+                strict=m4_enabled(args),
+                mcp1_grid_aux_enabled=mcp1_grid_aux_enabled,
+                mcp1_grid_aux_scheduler=mcp1_grid_aux_scheduler,
+                mcp1_grid_aux_timesteps=mcp1_grid_aux_timesteps,
+                state=state,
+                train_losses=train_losses,
+                aux_report=aux_report,
+                grad_audit=grad_audit,
+            )
 
         summary = {
             "status": "PASS",
@@ -1634,10 +2245,7 @@ def main() -> None:
             "mode": args.mode,
             "optimizer_steps": int(args.optimizer_steps),
             "timing_warmup_steps": int(args.timing_warmup_steps),
-            **summarize_step_timings(
-                all_step_elapsed_ms,
-                timing_warmup_steps=args.timing_warmup_steps,
-            ),
+            **summarize_m5_step_timing_records(step_timing_records),
             **cuda_peak_memory_summary(device),
         }
         if m4_enabled(args):

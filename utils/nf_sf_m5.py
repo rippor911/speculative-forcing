@@ -1597,7 +1597,15 @@ def _m4_plan_fields(
         "resolved_config.m4.fixed_decode_validation_identity",
     ))
     if sample_plan is not None:
-        validate_m4_sample_plan(sample_plan, expected_sha256=sample_plan_sha)
+        try:
+            validate_m4_sample_plan(sample_plan, expected_sha256=sample_plan_sha)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ResumeContractError(
+                "m4.sample_plan_sha256",
+                sample_plan_sha,
+                f"{type(exc).__name__}: {exc}",
+                reason="resume sample plan contract mismatch",
+            ) from exc
         actual_sha = m4_sample_plan_sha256(sample_plan)
         actual_train = [str(value) for value in sample_plan[
             "train_sample_identities"

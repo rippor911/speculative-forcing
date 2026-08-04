@@ -1,3 +1,7 @@
+> **NF-SF v1 mainline note**
+>
+> Current repository work is governed by the [NF-SF v1 locked plan](docs/NF_SF_V1_LOCKED_PLAN.md) and the [NF-SF mainline guide](docs/NF_SF_MAINLINE_GUIDE.md). `inference_mcp.py` is a legacy frozen one-step rollout entry (`ANCHOR_DENOISING_STEPS=[1000]`) and must not be used to evaluate NF-SF v1. The next mainline inference entry is planned as `inference_next_forcing.py`.
+
 <p align="center">
 <h1 align="center">Self Forcing</h1>
 <h3 align="center">Bridging the Train-Test Gap in Autoregressive Video Diffusion</h3>

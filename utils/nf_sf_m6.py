@@ -40,7 +40,11 @@ M6_ORACLE_SCHEMA = "nf_sf_m6_oracle_v1"
 M6_COMPARISON_SCHEMA = "nf_sf_m6_oracle_comparison_v1"
 M6_COMMON_INPUTS_SCHEMA = "nf_sf_m6_common_inputs_v1"
 M6_LOCKED_RAW_SCHEDULE = (1000.0, 750.0, 500.0, 250.0)
-M6_RNG_DRAW_CONTRACT_VERSION = "m6_ab_main_only_rng_draw_contract_v1"
+M6_RNG_DRAW_CONTRACT_VERSION = "m6_ab_teacher_compatible_rng_draw_contract_v2"
+M6_TEACHER_COMPATIBILITY_PURPOSE = "teacher_exit_flag_randint_compatibility"
+M6_TEACHER_COMPATIBILITY_REASON = (
+    "match formal Teacher generate_and_sync_list(last_step_only=True) RNG consumption"
+)
 M6_WAN_FRAME_SEQ_LENGTH = 1560
 M6_CHECKPOINT_OFFICIAL = "official_reference"
 M6_CHECKPOINT_FORMAL_STEP0 = "formal_step0"
@@ -271,6 +275,19 @@ def build_common_inputs(
     runtime_git_sha: str,
 ) -> tuple[dict[str, Any], str]:
     source_summary = tensor_json_summary(source_noise)
+    frame_count = int(source_summary["shape"][1])
+    if frame_count % int(chunk_frames) != 0:
+        raise ValueError("source_noise frame count must be chunk-aligned")
+    num_chunks = frame_count // int(chunk_frames)
+    rng_compatibility_contract = {
+        "operation": "torch.randint",
+        "purpose": M6_TEACHER_COMPATIBILITY_PURPOSE,
+        "low": 0,
+        "high": len(schedule.main_warped_schedule),
+        "size": [num_chunks],
+        "dtype": str(torch.long),
+        "values_discarded": True,
+    }
     common_inputs = {
         "schema": M6_COMMON_INPUTS_SCHEMA,
         "teacher_identity": teacher_identity_json(teacher_metadata),
@@ -282,6 +299,7 @@ def build_common_inputs(
         "main_warped_schedule": list(schedule.main_warped_schedule),
         "rollout_seed": int(rollout_seed),
         "rng_draw_contract_version": M6_RNG_DRAW_CONTRACT_VERSION,
+        "rng_compatibility_contract": rng_compatibility_contract,
         "context_noise": int(context_noise),
         "latent_shape": source_summary["shape"],
         "latent_dtype": source_summary["dtype"],
@@ -358,16 +376,23 @@ def run_main_only_oracle(
     _validate_source_noise(source_noise, teacher_payload=teacher_payload)
     _validate_runtime(runtime)
 
-    rollout_seed = int(teacher_payload["rollout_seed"])
-    noise_seed = int(teacher_payload["noise_seed"])
-    reset_rollout_rng(rollout_seed, source_noise.device)
-    initial_rng_hash = global_rng_state_hash(source_noise.device)
-
     batch_size, num_frames = int(source_noise.shape[0]), int(source_noise.shape[1])
     chunk_frames = int(runtime.num_frame_per_block)
     num_chunks = num_frames // chunk_frames
+    rollout_seed = int(teacher_payload["rollout_seed"])
+    noise_seed = int(teacher_payload["noise_seed"])
+    reset_rollout_rng(rollout_seed, source_noise.device)
+    post_reset_rng_hash = global_rng_state_hash(source_noise.device)
+    rng_draws: list[dict[str, Any]] = [
+        consume_teacher_exit_flag_rng_compatibility_draw(
+            num_chunks=num_chunks,
+            num_denoising_steps=len(schedule.main_warped_schedule),
+            device=source_noise.device,
+            draw_order=0,
+        )
+    ]
+    pre_solver_rng_hash = global_rng_state_hash(source_noise.device)
     output = torch.empty_like(source_noise)
-    rng_draws: list[dict[str, Any]] = []
     chunks = []
 
     runtime.generator.eval()
@@ -588,10 +613,25 @@ def run_main_only_oracle(
         "rng": {
             "noise_seed": noise_seed,
             "rollout_seed": rollout_seed,
-            "initial_global_rng_state_hash": initial_rng_hash,
+            "initial_global_rng_state_hash": post_reset_rng_hash,
+            "initial_global_rng_state_hash_semantics": (
+                "post reset, before teacher compatibility draw"
+            ),
+            "post_reset_global_rng_state_hash": post_reset_rng_hash,
+            "pre_solver_global_rng_state_hash": pre_solver_rng_hash,
             "draw_contract": {
                 "source_noise": "exact tensor loaded from teacher payload",
-                "rollout_rng": "global torch RNG reset to teacher payload rollout_seed before solver",
+                "rollout_rng": (
+                    "global torch RNG reset to teacher payload rollout_seed; "
+                    "consume one teacher-compatible exit-flag torch.randint draw; "
+                    "then start solver transition/context draws"
+                ),
+                M6_TEACHER_COMPATIBILITY_PURPOSE: (
+                    "one torch.randint(low=0, high=num_denoising_steps, "
+                    "size=[num_chunks], dtype=torch.long, device=source_noise.device) "
+                    "matching formal Teacher generate_and_sync_list(last_step_only=True); "
+                    "values discarded"
+                ),
                 "transition_re_noise": "one torch.randn_like(flattened clean x0) after each non-final forward",
                 "context_clean_recache_noise": "one torch.randn_like(flattened clean chunk) before clean recache for each chunk",
             },
@@ -1024,6 +1064,44 @@ def global_rng_state_hash(device: torch.device | str) -> str:
             torch.cuda.get_rng_state(device).cpu().numpy().tobytes()
         )
     return _bytes_sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+
+def consume_teacher_exit_flag_rng_compatibility_draw(
+    *,
+    num_chunks: int,
+    num_denoising_steps: int,
+    device: torch.device | str,
+    draw_order: int,
+) -> dict[str, Any]:
+    if int(num_chunks) <= 0:
+        raise ValueError("num_chunks must be positive")
+    if int(num_denoising_steps) <= 0:
+        raise ValueError("num_denoising_steps must be positive")
+    device = torch.device(device)
+    state_before = global_rng_state_hash(device)
+    values = torch.randint(
+        low=0,
+        high=int(num_denoising_steps),
+        size=(int(num_chunks),),
+        device=device,
+        dtype=torch.long,
+    )
+    state_after = global_rng_state_hash(device)
+    return {
+        "draw_order": int(draw_order),
+        "purpose": M6_TEACHER_COMPATIBILITY_PURPOSE,
+        "operation": "torch.randint",
+        "low": 0,
+        "high": int(num_denoising_steps),
+        "size": [int(num_chunks)],
+        "dtype": str(values.dtype),
+        "device": str(values.device),
+        "state_before_hash": state_before,
+        "state_after_hash": state_after,
+        "values": [int(value) for value in values.detach().cpu().tolist()],
+        "values_discarded": True,
+        "reason": M6_TEACHER_COMPATIBILITY_REASON,
+    }
 
 
 def randn_like_with_trace(

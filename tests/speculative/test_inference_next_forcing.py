@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,13 +160,13 @@ def make_metadata():
     }
 
 
-def make_checkpoint(kind: str = "A") -> m6.M6CheckpointRecord:
+def make_checkpoint(kind: str = "A", *, sha256: str = TEST_SHA256) -> m6.M6CheckpointRecord:
     checkpoint_type = (
         m6.M6_CHECKPOINT_OFFICIAL if kind == "A" else m6.M6_CHECKPOINT_FORMAL_STEP0
     )
     return m6.M6CheckpointRecord(
         path="/tmp/checkpoint.pt",
-        sha256=TEST_SHA256,
+        sha256=sha256,
         checkpoint_type=checkpoint_type,
         load_mode="test",
         generator_state_dict={},
@@ -226,6 +227,7 @@ def run_fake_oracle(
     oracle_kind: str = "A",
     generator: FakeGenerator | None = None,
     source_noise: torch.Tensor | None = None,
+    checkpoint_sha256: str = TEST_SHA256,
     tolerance: float | None = None,
 ):
     payload = make_payload(source_noise=source_noise)
@@ -238,7 +240,7 @@ def run_fake_oracle(
         teacher_metadata=make_metadata(),
         conditional_dict={"prompt_embeds": torch.zeros((1, 4, 2), dtype=torch.float32)},
         schedule=m6.resolve_m6_schedule(make_config()),
-        checkpoint=make_checkpoint(oracle_kind),
+        checkpoint=make_checkpoint(oracle_kind, sha256=checkpoint_sha256),
         git_sha=TEST_GIT_SHA,
         resolved_config_canonical_sha256=TEST_SHA256,
         device_runtime_contract={"WORLD_SIZE": "1", "device": "cpu", "runtime": "fake_cpu"},
@@ -431,8 +433,10 @@ def test_rollout_rng_draw_order_transition_hashes_and_context_consumption_reprod
 
     first_draws = first.trace["rng"]["draws"]
     second_draws = second.trace["rng"]["draws"]
-    assert [draw["draw_order"] for draw in first_draws] == list(range(8))
+    assert len(first_draws) == 9
+    assert [draw["draw_order"] for draw in first_draws] == list(range(9))
     assert [draw["purpose"] for draw in first_draws] == [
+        "teacher_exit_flag_randint_compatibility",
         "transition_re_noise",
         "transition_re_noise",
         "transition_re_noise",
@@ -442,9 +446,121 @@ def test_rollout_rng_draw_order_transition_hashes_and_context_consumption_reprod
         "transition_re_noise",
         "context_clean_recache_noise",
     ]
-    assert [draw["noise"]["sha256"] for draw in first_draws] == [
-        draw["noise"]["sha256"] for draw in second_draws
+    compatibility = first_draws[0]
+    assert compatibility["operation"] == "torch.randint"
+    assert compatibility["low"] == 0
+    assert compatibility["high"] == 4
+    assert compatibility["size"] == [2]
+    assert compatibility["dtype"] == "torch.int64"
+    assert compatibility["device"] == "cpu"
+    assert compatibility["values_discarded"] is True
+    assert compatibility["reason"] == (
+        "match formal Teacher generate_and_sync_list(last_step_only=True) RNG consumption"
+    )
+    assert first.trace["rng"]["post_reset_global_rng_state_hash"] == compatibility[
+        "state_before_hash"
     ]
+    assert first.trace["rng"]["pre_solver_global_rng_state_hash"] == compatibility[
+        "state_after_hash"
+    ]
+    for before, after in pairwise(first_draws):
+        assert before["state_after_hash"] == after["state_before_hash"]
+    assert compatibility["state_after_hash"] == first_draws[1]["state_before_hash"]
+    assert compatibility["values"] == second_draws[0]["values"]
+    assert [draw["state_before_hash"] for draw in first_draws] == [
+        draw["state_before_hash"] for draw in second_draws
+    ]
+    assert [draw["state_after_hash"] for draw in first_draws] == [
+        draw["state_after_hash"] for draw in second_draws
+    ]
+    assert [draw["noise"]["sha256"] for draw in first_draws[1:]] == [
+        draw["noise"]["sha256"] for draw in second_draws[1:]
+    ]
+
+
+def test_teacher_compatibility_draw_is_called_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = m6.consume_teacher_exit_flag_rng_compatibility_draw
+    calls = []
+
+    def spy(**kwargs):
+        calls.append(dict(kwargs))
+        return original(**kwargs)
+
+    monkeypatch.setattr(m6, "consume_teacher_exit_flag_rng_compatibility_draw", spy)
+
+    run_fake_oracle()
+
+    assert calls == [
+        {
+            "num_chunks": 2,
+            "num_denoising_steps": 4,
+            "device": torch.device("cpu"),
+            "draw_order": 0,
+        }
+    ]
+
+
+def test_teacher_compatibility_draw_aligns_next_rng_draw_with_manual_reference() -> None:
+    seed = 789
+    reference_tensor = torch.zeros((2, 3), dtype=torch.float32)
+
+    m6.reset_rollout_rng(seed, "cpu")
+    unburned_next = torch.randn_like(reference_tensor)
+
+    m6.reset_rollout_rng(seed, "cpu")
+    reference_values = torch.randint(
+        low=0,
+        high=4,
+        size=(2,),
+        device="cpu",
+        dtype=torch.long,
+    )
+    reference_next = torch.randn_like(reference_tensor)
+
+    m6.reset_rollout_rng(seed, "cpu")
+    state_before = m6.global_rng_state_hash("cpu")
+    record = m6.consume_teacher_exit_flag_rng_compatibility_draw(
+        num_chunks=2,
+        num_denoising_steps=4,
+        device="cpu",
+        draw_order=0,
+    )
+    actual_next = torch.randn_like(reference_tensor)
+
+    assert not torch.equal(unburned_next, reference_next)
+    assert torch.equal(actual_next, reference_next)
+    assert record["state_before_hash"] == state_before
+    assert record["values"] == [int(value) for value in reference_values.tolist()]
+    assert record["values_discarded"] is True
+
+
+def test_common_inputs_bind_teacher_rng_compatibility_contract_not_checkpoint() -> None:
+    result_a, _ = run_fake_oracle(oracle_kind="A")
+    result_b, _ = run_fake_oracle(
+        oracle_kind="B",
+        checkpoint_sha256="c" * 64,
+    )
+
+    common_inputs = result_a.summary["common_inputs"]
+    assert common_inputs["rng_draw_contract_version"] == (
+        "m6_ab_teacher_compatible_rng_draw_contract_v2"
+    )
+    assert common_inputs["rng_compatibility_contract"] == {
+        "operation": "torch.randint",
+        "purpose": "teacher_exit_flag_randint_compatibility",
+        "low": 0,
+        "high": 4,
+        "size": [2],
+        "dtype": "torch.int64",
+        "values_discarded": True,
+    }
+    assert "checkpoint" not in common_inputs
+    assert "checkpoint_sha256" not in common_inputs
+    assert result_b.summary["common_inputs"] == common_inputs
+    assert (
+        result_b.summary["common_inputs_fingerprint_sha256"]
+        == result_a.summary["common_inputs_fingerprint_sha256"]
+    )
 
 
 def test_each_chunk_has_four_forwards_each_rolled_back_and_one_clean_recache() -> None:

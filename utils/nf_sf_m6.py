@@ -38,9 +38,13 @@ from utils.nf_sf_tensors import (
 
 M6_ORACLE_SCHEMA = "nf_sf_m6_oracle_v1"
 M6_COMPARISON_SCHEMA = "nf_sf_m6_oracle_comparison_v1"
+M6_PIXEL_COMPARISON_SCHEMA = "nf_sf_m6_pixel_comparison_v1"
 M6_COMMON_INPUTS_SCHEMA = "nf_sf_m6_common_inputs_v1"
 M6_LOCKED_RAW_SCHEDULE = (1000.0, 750.0, 500.0, 250.0)
 M6_RNG_DRAW_CONTRACT_VERSION = "m6_ab_teacher_compatible_rng_draw_contract_v2"
+M6_ORACLE_C_MAIN_QUALITY_CONTRACT_VERSION = (
+    "m6_oracle_c_main_quality_contract_v1"
+)
 M6_TEACHER_COMPATIBILITY_PURPOSE = "teacher_exit_flag_randint_compatibility"
 M6_TEACHER_COMPATIBILITY_REASON = (
     "match formal Teacher generate_and_sync_list(last_step_only=True) RNG consumption"
@@ -48,9 +52,10 @@ M6_TEACHER_COMPATIBILITY_REASON = (
 M6_WAN_FRAME_SEQ_LENGTH = 1560
 M6_CHECKPOINT_OFFICIAL = "official_reference"
 M6_CHECKPOINT_FORMAL_STEP0 = "formal_step0"
+M6_CHECKPOINT_FORMAL_STEP500 = "formal_step500"
 M5_FORMAL_TRAINER_SCHEMA = "nf_sf_m5_formal_trainer_v1"
 
-OracleKind = Literal["A", "B"]
+OracleKind = Literal["A", "B", "C"]
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,20 @@ class M6OracleAArtifactRecord:
     latent_sha256: str
 
 
+@dataclass(frozen=True)
+class M6OracleBArtifactRecord:
+    artifact_dir: str
+    trace: Mapping[str, Any]
+    summary: Mapping[str, Any]
+    latent_payload: Mapping[str, Any]
+    latent: torch.Tensor
+    common_inputs: Mapping[str, Any]
+    common_inputs_fingerprint_sha256: str
+    latent_sha256: str
+    artifact_hashes: Mapping[str, str]
+    checkpoint: Mapping[str, Any]
+
+
 class M6KVSnapshot:
     def __init__(self, layers: list[dict[str, Any]]) -> None:
         self._states = layers
@@ -209,7 +228,7 @@ def resolve_m6_schedule(
     raw_schedule = tuple(_raw_schedule_from_config(config))
     if raw_schedule != M6_LOCKED_RAW_SCHEDULE:
         raise ValueError(
-            "NF-SF M6.0 A/B requires raw denoising schedule "
+            "NF-SF M6.0 A/B/C requires raw denoising schedule "
             f"{list(M6_LOCKED_RAW_SCHEDULE)}, got {list(raw_schedule)}"
         )
     if len(raw_schedule) <= 1:
@@ -218,7 +237,7 @@ def resolve_m6_schedule(
     configured_shift = _main_shift_from_config(config, default=main_shift)
     if not math.isclose(float(configured_shift), float(main_shift), rel_tol=0.0, abs_tol=0.0):
         raise ValueError(
-            f"NF-SF M6.0 A/B requires main timestep shift {main_shift}, "
+            f"NF-SF M6.0 A/B/C requires main timestep shift {main_shift}, "
             f"got {configured_shift}"
         )
 
@@ -327,6 +346,51 @@ def canonical_json_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def oracle_c_main_quality_contract() -> dict[str, Any]:
+    contract = {
+        "version": M6_ORACLE_C_MAIN_QUALITY_CONTRACT_VERSION,
+        "oracle": "C",
+        "checkpoint": "formal Stage A global_step=500",
+        "runtime": "Main-only four-step rollout with MCP disabled",
+        "automatic_quality_threshold": None,
+        "evidence": {
+            "latent_space": [
+                "C step500 output latent vs strict PASS B step0 output latent",
+                "shape",
+                "dtype",
+                "exact_equality",
+                "max_abs_diff",
+                "mean_abs_diff",
+                "mse",
+                "per_chunk",
+                "sha256",
+            ],
+            "video_space": [
+                "decode B and C latents with the same VAE runtime/config/device/dtype",
+                "save step0_reference.mp4",
+                "save step500_main.mp4",
+                "record video SHA256",
+                "record MAE/MSE/PSNR and per-frame MAE/MSE",
+            ],
+            "manual_review": (
+                "main_quality_pass may be set only after reviewing numeric "
+                "evidence and both videos"
+            ),
+        },
+        "fail_criteria": [
+            "subject, scene recognizability, or prompt-consistent content is newly lost",
+            "new blur or detail collapse is obvious",
+            "new temporal flicker or discontinuity is obvious",
+            "progressive/autoregressive collapse or late-chunk instability is obvious",
+        ],
+        "initial_main_quality_pass": None,
+        "initial_status_when_protocol_passes": "REPORT_ONLY",
+        "initial_review_status": "PENDING",
+    }
+    validate_json_payload(contract)
+    return contract
+
+
 def load_oracle_checkpoint(
     *,
     path: Path | str,
@@ -345,6 +409,12 @@ def load_oracle_checkpoint(
         )
     if oracle_kind == "B":
         return _formal_step0_checkpoint_record(
+            path=path,
+            payload=payload,
+            checkpoint_sha=checkpoint_sha,
+        )
+    if oracle_kind == "C":
+        return _formal_step500_checkpoint_record(
             path=path,
             payload=payload,
             checkpoint_sha=checkpoint_sha,
@@ -368,10 +438,10 @@ def run_main_only_oracle(
     expected_common_inputs: Mapping[str, Any] | None = None,
     tolerance: float | None = None,
 ) -> M6OracleResult:
-    if oracle_kind not in ("A", "B"):
-        raise ValueError("M6.0 A/B supports only Oracle A and B")
+    if oracle_kind not in ("A", "B", "C"):
+        raise ValueError("M6.0 supports only Oracle A, B, and C")
     if schedule.mcp_enabled or schedule.mcp_warped_schedule is not None:
-        raise ValueError("M6.0 A/B must run with MCP disabled")
+        raise ValueError("M6.0 A/B/C must run with MCP disabled")
     validate_schedule_matches_teacher(schedule, teacher_payload)
     _validate_source_noise(source_noise, teacher_payload=teacher_payload)
     _validate_runtime(runtime)
@@ -563,7 +633,7 @@ def run_main_only_oracle(
 
     mcp_call_count = _runtime_mcp_call_count(runtime.generator)
     if mcp_call_count != 0:
-        raise RuntimeError(f"M6.0 A/B requires mcp_call_count=0, actual={mcp_call_count}")
+        raise RuntimeError(f"M6.0 A/B/C requires mcp_call_count=0, actual={mcp_call_count}")
     _ensure_finite_tensor(output, name="output_latent")
     conditioning_summary = conditioning_json_summary(conditional_dict)
     common_inputs, common_fingerprint = build_common_inputs(
@@ -590,6 +660,9 @@ def run_main_only_oracle(
         teacher_payload["target_latent"].detach().cpu(),
         chunk_frames=chunk_frames,
         tolerance=tolerance,
+    )
+    oracle_c_quality_contract = (
+        oracle_c_main_quality_contract() if oracle_kind == "C" else None
     )
     trace = {
         "schema": M6_ORACLE_SCHEMA,
@@ -632,8 +705,14 @@ def run_main_only_oracle(
                     "matching formal Teacher generate_and_sync_list(last_step_only=True); "
                     "values discarded"
                 ),
-                "transition_re_noise": "one torch.randn_like(flattened clean x0) after each non-final forward",
-                "context_clean_recache_noise": "one torch.randn_like(flattened clean chunk) before clean recache for each chunk",
+                "transition_re_noise": (
+                    "one torch.randn_like(flattened clean x0) after each "
+                    "non-final forward"
+                ),
+                "context_clean_recache_noise": (
+                    "one torch.randn_like(flattened clean chunk) before clean "
+                    "recache for each chunk"
+                ),
             },
             "draws": rng_draws,
         },
@@ -642,6 +721,7 @@ def run_main_only_oracle(
             "output_latent": True,
             "all_solver_outputs": True,
         },
+        "oracle_c_main_quality_contract": oracle_c_quality_contract,
         "target_latent_comparison": target_comparison,
         "artifact_hashes": {
             "output_latent_tensor_sha256": tensor_sha256(output.detach().cpu()),
@@ -661,12 +741,19 @@ def run_main_only_oracle(
         "main_warped_schedule": list(schedule.main_warped_schedule),
         "mcp_enabled": False,
         "mcp_call_count": int(mcp_call_count),
+        "oracle_c_main_quality_contract": oracle_c_quality_contract,
         "target_latent_comparison": target_comparison,
         "output_latent": tensor_json_summary(output),
         "common_inputs": common_inputs,
         "common_inputs_fingerprint_sha256": common_fingerprint,
     }
-    _apply_oracle_gate_fields(trace, summary, oracle_a_comparison=None)
+    _apply_oracle_gate_fields(
+        trace,
+        summary,
+        oracle_a_comparison=None,
+        oracle_b_comparison=None,
+        oracle_b_artifact=None,
+    )
     validate_json_payload(trace)
     validate_json_payload(summary)
     return M6OracleResult(
@@ -755,13 +842,90 @@ def validate_oracle_a_artifact_dir(
     *,
     expected_common_inputs_fingerprint_sha256: str,
 ) -> M6OracleAArtifactRecord:
-    oracle_a_dir = Path(oracle_a_dir)
-    trace_path = oracle_a_dir / "oracle_trace.json"
-    summary_path = oracle_a_dir / "oracle_summary.json"
-    latent_path = oracle_a_dir / "output_latent.pt"
+    record = _validate_oracle_artifact_dir(
+        oracle_a_dir,
+        expected_common_inputs_fingerprint_sha256=(
+            expected_common_inputs_fingerprint_sha256
+        ),
+        expected_oracle_kind="A",
+        expected_checkpoint_type=M6_CHECKPOINT_OFFICIAL,
+    )
+    return M6OracleAArtifactRecord(
+        trace=record["trace"],
+        summary=record["summary"],
+        latent_payload=record["latent_payload"],
+        latent=record["latent"],
+        common_inputs=record["common_inputs"],
+        common_inputs_fingerprint_sha256=record[
+            "common_inputs_fingerprint_sha256"
+        ],
+        latent_sha256=record["latent_sha256"],
+    )
+
+
+def validate_oracle_b_artifact_dir(
+    oracle_b_dir: Path | str,
+    *,
+    expected_common_inputs_fingerprint_sha256: str,
+) -> M6OracleBArtifactRecord:
+    record = _validate_oracle_artifact_dir(
+        oracle_b_dir,
+        expected_common_inputs_fingerprint_sha256=(
+            expected_common_inputs_fingerprint_sha256
+        ),
+        expected_oracle_kind="B",
+        expected_checkpoint_type=M6_CHECKPOINT_FORMAL_STEP0,
+    )
+    checkpoint = record["checkpoint"]
+    if checkpoint.get("global_step") != 0:
+        raise RuntimeError("Oracle B artifact checkpoint global_step must be 0")
+    return M6OracleBArtifactRecord(
+        artifact_dir=record["artifact_dir"],
+        trace=record["trace"],
+        summary=record["summary"],
+        latent_payload=record["latent_payload"],
+        latent=record["latent"],
+        common_inputs=record["common_inputs"],
+        common_inputs_fingerprint_sha256=record[
+            "common_inputs_fingerprint_sha256"
+        ],
+        latent_sha256=record["latent_sha256"],
+        artifact_hashes=record["artifact_hashes"],
+        checkpoint=checkpoint,
+    )
+
+
+def oracle_b_artifact_identity(record: M6OracleBArtifactRecord) -> dict[str, Any]:
+    identity = {
+        "oracle_kind": "B",
+        "artifact_dir": record.artifact_dir,
+        "status": str(record.summary.get("status")),
+        "protocol_pass": record.summary.get("protocol_pass"),
+        "oracle_gate_pass": record.summary.get("oracle_gate_pass"),
+        "checkpoint": dict(record.checkpoint),
+        "common_inputs_fingerprint_sha256": record.common_inputs_fingerprint_sha256,
+        "latent_sha256": record.latent_sha256,
+        "artifact_hashes": dict(record.artifact_hashes),
+    }
+    validate_json_payload(identity)
+    return identity
+
+
+def _validate_oracle_artifact_dir(
+    oracle_dir: Path | str,
+    *,
+    expected_common_inputs_fingerprint_sha256: str,
+    expected_oracle_kind: str,
+    expected_checkpoint_type: str,
+) -> dict[str, Any]:
+    oracle_dir = Path(oracle_dir)
+    label = f"Oracle {expected_oracle_kind}"
+    trace_path = oracle_dir / "oracle_trace.json"
+    summary_path = oracle_dir / "oracle_summary.json"
+    latent_path = oracle_dir / "output_latent.pt"
     for path in (trace_path, summary_path, latent_path):
         if not path.is_file() or path.stat().st_size <= 0:
-            raise FileNotFoundError(f"Oracle A artifact missing or empty: {path}")
+            raise FileNotFoundError(f"{label} artifact missing or empty: {path}")
 
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -773,18 +937,20 @@ def validate_oracle_a_artifact_dir(
     ):
         if payload.get("schema") != M6_ORACLE_SCHEMA:
             raise RuntimeError(f"{name} schema mismatch")
-        if payload.get("oracle_kind") != "A":
-            raise RuntimeError(f"{name} is not an Oracle A artifact")
+        if payload.get("oracle_kind") != expected_oracle_kind:
+            raise RuntimeError(f"{name} is not an {label} artifact")
 
     if trace.get("status") != "PASS" or summary.get("status") != "PASS":
-        raise RuntimeError("Oracle A artifact status must be PASS")
+        raise RuntimeError(f"{label} artifact status must be PASS")
     if trace.get("protocol_pass") is not True or summary.get("protocol_pass") is not True:
-        raise RuntimeError("Oracle A artifact protocol_pass must be True")
+        raise RuntimeError(f"{label} artifact protocol_pass must be True")
     if trace.get("oracle_gate_pass") is not True or summary.get("oracle_gate_pass") is not True:
-        raise RuntimeError("Oracle A artifact oracle_gate_pass must be True")
+        raise RuntimeError(f"{label} artifact oracle_gate_pass must be True")
     checkpoint = trace.get("checkpoint")
-    if not isinstance(checkpoint, Mapping) or checkpoint.get("type") != M6_CHECKPOINT_OFFICIAL:
-        raise RuntimeError("Oracle A artifact checkpoint type must be official_reference")
+    if not isinstance(checkpoint, Mapping) or checkpoint.get("type") != expected_checkpoint_type:
+        raise RuntimeError(
+            f"{label} artifact checkpoint type must be {expected_checkpoint_type}"
+        )
 
     expected_fingerprint = _require_sha256(
         expected_common_inputs_fingerprint_sha256,
@@ -796,16 +962,18 @@ def validate_oracle_a_artifact_dir(
         latent_payload.get("common_inputs_fingerprint_sha256"),
     ]
     if any(item != expected_fingerprint for item in fingerprints):
-        raise RuntimeError("Oracle A common inputs fingerprint mismatch")
+        raise RuntimeError(f"{label} common inputs fingerprint mismatch")
     common_inputs = trace.get("common_inputs")
     if (
         not isinstance(common_inputs, Mapping)
         or summary.get("common_inputs") != common_inputs
         or latent_payload.get("common_inputs") != common_inputs
     ):
-        raise RuntimeError("Oracle A common inputs differ across artifacts")
+        raise RuntimeError(f"{label} common inputs differ across artifacts")
     if canonical_json_sha256(dict(common_inputs)) != expected_fingerprint:
-        raise RuntimeError("Oracle A common inputs fingerprint does not match payload")
+        raise RuntimeError(
+            f"{label} common inputs fingerprint does not match payload"
+        )
 
     latent_sha = str(latent_payload["latent_sha256"])
     trace_latent_sha = (
@@ -820,18 +988,25 @@ def validate_oracle_a_artifact_dir(
         else None
     )
     if trace_latent_sha != latent_sha or summary_latent_sha != latent_sha:
-        raise RuntimeError("Oracle A latent SHA differs across artifacts")
+        raise RuntimeError(f"{label} latent SHA differs across artifacts")
     if tensor_sha256(latent_payload["latent"]) != latent_sha:
-        raise RuntimeError("Oracle A actual latent tensor SHA mismatch")
-    return M6OracleAArtifactRecord(
-        trace=trace,
-        summary=summary,
-        latent_payload=latent_payload,
-        latent=latent_payload["latent"],
-        common_inputs=common_inputs,
-        common_inputs_fingerprint_sha256=expected_fingerprint,
-        latent_sha256=latent_sha,
-    )
+        raise RuntimeError(f"{label} actual latent tensor SHA mismatch")
+    return {
+        "artifact_dir": str(oracle_dir.resolve()),
+        "trace": trace,
+        "summary": summary,
+        "latent_payload": latent_payload,
+        "latent": latent_payload["latent"],
+        "common_inputs": common_inputs,
+        "common_inputs_fingerprint_sha256": expected_fingerprint,
+        "latent_sha256": latent_sha,
+        "checkpoint": checkpoint,
+        "artifact_hashes": {
+            "oracle_trace_json_sha256": file_sha256(trace_path),
+            "oracle_summary_json_sha256": file_sha256(summary_path),
+            "output_latent_pt_sha256": file_sha256(latent_path),
+        },
+    }
 
 
 def validate_schedule_matches_teacher(
@@ -841,7 +1016,9 @@ def validate_schedule_matches_teacher(
     tolerance: float = 1.0e-4,
 ) -> dict[str, Any]:
     teacher_raw = tuple(float(value) for value in teacher_payload.get("raw_denoising_steps", ()))
-    teacher_warped = tuple(float(value) for value in teacher_payload.get("warped_denoising_steps", ()))
+    teacher_warped = tuple(
+        float(value) for value in teacher_payload.get("warped_denoising_steps", ())
+    )
     if teacher_raw != schedule.raw_schedule:
         raise RuntimeError("config raw schedule differs from teacher payload")
     if len(teacher_warped) != len(schedule.main_warped_schedule):
@@ -929,6 +1106,52 @@ def compare_latents(
     }
 
 
+def compare_pixel_frames(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> dict[str, Any]:
+    shape_match = tuple(actual.shape) == tuple(expected.shape)
+    dtype_match = actual.dtype == expected.dtype
+    exact_equal = shape_match and dtype_match and bool(torch.equal(actual, expected))
+    mae = mse = psnr = None
+    per_frame = []
+    if shape_match:
+        diff = actual.detach().float().cpu() - expected.detach().float().cpu()
+        abs_diff = diff.abs()
+        mae = float(abs_diff.mean().item())
+        mse = float(diff.square().mean().item())
+        if mse > 0.0:
+            psnr = float(20.0 * math.log10(255.0) - 10.0 * math.log10(mse))
+        if actual.ndim >= 1:
+            for frame_index in range(int(actual.shape[0])):
+                frame_diff = diff[frame_index]
+                if frame_diff.numel() == 0:
+                    continue
+                per_frame.append(
+                    {
+                        "frame_index": int(frame_index),
+                        "mae": float(frame_diff.abs().mean().item()),
+                        "mse": float(frame_diff.square().mean().item()),
+                    }
+                )
+    comparison = {
+        "schema": M6_PIXEL_COMPARISON_SCHEMA,
+        "shape_match": bool(shape_match),
+        "dtype_match": bool(dtype_match),
+        "exact_equal": bool(exact_equal),
+        "actual_shape": [int(dim) for dim in actual.shape],
+        "expected_shape": [int(dim) for dim in expected.shape],
+        "actual_dtype": str(actual.dtype),
+        "expected_dtype": str(expected.dtype),
+        "mae": mae,
+        "mse": mse,
+        "psnr": psnr,
+        "per_frame": per_frame,
+    }
+    validate_json_payload(comparison)
+    return comparison
+
+
 def write_oracle_comparison(
     *,
     output_dir: Path | str,
@@ -971,6 +1194,8 @@ def finalize_oracle_gate(
     result: M6OracleResult,
     *,
     oracle_a_comparison: Mapping[str, Any] | None = None,
+    oracle_b_comparison: Mapping[str, Any] | None = None,
+    oracle_b_artifact: Mapping[str, Any] | None = None,
 ) -> M6OracleResult:
     trace = copy.deepcopy(result.trace)
     summary = copy.deepcopy(result.summary)
@@ -978,6 +1203,8 @@ def finalize_oracle_gate(
         trace,
         summary,
         oracle_a_comparison=oracle_a_comparison,
+        oracle_b_comparison=oracle_b_comparison,
+        oracle_b_artifact=oracle_b_artifact,
     )
     validate_json_payload(trace)
     validate_json_payload(summary)
@@ -1006,6 +1233,8 @@ def oracle_stdout_payload(
         "protocol_pass": summary["protocol_pass"],
         "target_reproduction_pass": summary["target_reproduction_pass"],
         "oracle_a_reproduction_pass": summary["oracle_a_reproduction_pass"],
+        "main_quality_pass": summary["main_quality_pass"],
+        "review_status": summary["review_status"],
         "oracle_gate_pass": summary["oracle_gate_pass"],
         "status": summary["status"],
         "gate_reasons": list(summary["gate_reasons"]),
@@ -1286,7 +1515,29 @@ def _apply_oracle_gate_fields(
     summary: dict[str, Any],
     *,
     oracle_a_comparison: Mapping[str, Any] | None,
+    oracle_b_comparison: Mapping[str, Any] | None,
+    oracle_b_artifact: Mapping[str, Any] | None,
 ) -> None:
+    oracle_kind = str(trace.get("oracle_kind"))
+    if oracle_a_comparison is not None:
+        trace["oracle_a_comparison"] = dict(oracle_a_comparison)
+        summary["oracle_a_comparison"] = dict(oracle_a_comparison)
+    elif oracle_kind == "B":
+        trace["oracle_a_comparison"] = None
+        summary["oracle_a_comparison"] = None
+    if oracle_b_comparison is not None:
+        trace["oracle_b_comparison"] = dict(oracle_b_comparison)
+        summary["oracle_b_comparison"] = dict(oracle_b_comparison)
+    elif oracle_kind == "C":
+        trace["oracle_b_comparison"] = None
+        summary["oracle_b_comparison"] = None
+    if oracle_b_artifact is not None:
+        trace["oracle_b_artifact"] = dict(oracle_b_artifact)
+        summary["oracle_b_artifact"] = dict(oracle_b_artifact)
+    elif oracle_kind == "C":
+        trace["oracle_b_artifact"] = None
+        summary["oracle_b_artifact"] = None
+
     protocol_reasons = _protocol_failure_reasons(trace)
     protocol_pass = len(protocol_reasons) == 0
     target_pass, target_reason = _nullable_comparison_gate_value(
@@ -1295,7 +1546,6 @@ def _apply_oracle_gate_fields(
         failed_reason="TARGET_REPRODUCTION_FAILED",
     )
 
-    oracle_kind = str(trace.get("oracle_kind"))
     oracle_a_pass: bool | None
     oracle_a_reason: str | None = None
     if oracle_kind == "B":
@@ -1311,16 +1561,28 @@ def _apply_oracle_gate_fields(
     else:
         oracle_a_pass = None
 
+    main_quality_pass: bool | None = None
+    review_status: str | None = None
+    main_quality_reason: str | None = None
+    if oracle_kind == "C":
+        review_status = "PENDING"
+        if protocol_pass:
+            main_quality_reason = "MAIN_QUALITY_REVIEW_PENDING"
+
     gate_reasons = list(protocol_reasons)
     if oracle_kind == "A" and target_reason is not None:
         gate_reasons.append(target_reason)
     if oracle_a_reason is not None:
         gate_reasons.append(oracle_a_reason)
+    if main_quality_reason is not None:
+        gate_reasons.append(main_quality_reason)
 
     if oracle_kind == "A":
         oracle_gate_pass = _and_nullable(protocol_pass, target_pass)
     elif oracle_kind == "B":
         oracle_gate_pass = _and_nullable(protocol_pass, oracle_a_pass)
+    elif oracle_kind == "C":
+        oracle_gate_pass = _and_nullable(protocol_pass, main_quality_pass)
     else:
         oracle_gate_pass = False
         gate_reasons.append("UNSUPPORTED_ORACLE_KIND")
@@ -1330,16 +1592,12 @@ def _apply_oracle_gate_fields(
         "protocol_pass": bool(protocol_pass),
         "target_reproduction_pass": target_pass,
         "oracle_a_reproduction_pass": oracle_a_pass,
+        "main_quality_pass": main_quality_pass,
+        "review_status": review_status,
         "oracle_gate_pass": oracle_gate_pass,
         "status": status,
         "gate_reasons": gate_reasons,
     }
-    if oracle_a_comparison is not None:
-        trace["oracle_a_comparison"] = dict(oracle_a_comparison)
-        summary["oracle_a_comparison"] = dict(oracle_a_comparison)
-    elif oracle_kind == "B":
-        trace["oracle_a_comparison"] = None
-        summary["oracle_a_comparison"] = None
     if status == "PASS" and gate_reasons:
         raise RuntimeError("PASS oracle gate must not contain gate_reasons")
     trace.update(gate_fields)
@@ -1386,18 +1644,36 @@ def _protocol_failure_reasons(trace: Mapping[str, Any]) -> list[str]:
         reasons.append("CHECKPOINT_METADATA_MISSING")
     elif oracle_kind == "A" and checkpoint.get("type") != M6_CHECKPOINT_OFFICIAL:
         reasons.append("CHECKPOINT_TYPE_NOT_OFFICIAL")
-    elif oracle_kind == "B" and checkpoint.get("type") != M6_CHECKPOINT_FORMAL_STEP0:
-        reasons.append("CHECKPOINT_TYPE_NOT_FORMAL_STEP0")
+    elif oracle_kind == "B":
+        if checkpoint.get("type") != M6_CHECKPOINT_FORMAL_STEP0:
+            reasons.append("CHECKPOINT_TYPE_NOT_FORMAL_STEP0")
+        if checkpoint.get("global_step") != 0:
+            reasons.append("CHECKPOINT_GLOBAL_STEP_NOT_ZERO")
+        if int(checkpoint.get("mcp_tensor_count", 0)) <= 0:
+            reasons.append("CHECKPOINT_MCP_TENSORS_MISSING")
+    elif oracle_kind == "C":
+        if checkpoint.get("type") != M6_CHECKPOINT_FORMAL_STEP500:
+            reasons.append("CHECKPOINT_TYPE_NOT_FORMAL_STEP500")
+        if checkpoint.get("global_step") != 500:
+            reasons.append("CHECKPOINT_GLOBAL_STEP_NOT_500")
+        if int(checkpoint.get("mcp_tensor_count", 0)) <= 0:
+            reasons.append("CHECKPOINT_MCP_TENSORS_MISSING")
 
     schedule = trace.get("schedule")
     if not isinstance(schedule, Mapping):
         reasons.append("SCHEDULE_METADATA_MISSING")
     else:
-        if tuple(float(value) for value in schedule.get("raw_schedule", ())) != M6_LOCKED_RAW_SCHEDULE:
+        raw_schedule = tuple(
+            float(value) for value in schedule.get("raw_schedule", ())
+        )
+        if raw_schedule != M6_LOCKED_RAW_SCHEDULE:
             reasons.append("RAW_SCHEDULE_MISMATCH")
         if len(schedule.get("main_warped_schedule", ())) != len(M6_LOCKED_RAW_SCHEDULE):
             reasons.append("MAIN_SCHEDULE_NOT_FOUR_STEP")
-        if schedule.get("mcp_enabled") is not False or schedule.get("mcp_warped_schedule") is not None:
+        if (
+            schedule.get("mcp_enabled") is not False
+            or schedule.get("mcp_warped_schedule") is not None
+        ):
             reasons.append("MCP_SCHEDULE_NOT_DISABLED")
 
     if trace.get("mcp_enabled") is not False:
@@ -1405,8 +1681,20 @@ def _protocol_failure_reasons(trace: Mapping[str, Any]) -> list[str]:
     if int(trace.get("mcp_call_count", -1)) != 0:
         reasons.append("MCP_CALL_COUNT_NONZERO")
 
+    common_inputs = trace.get("common_inputs")
+    common_fingerprint = trace.get("common_inputs_fingerprint_sha256")
+    if not isinstance(common_inputs, Mapping):
+        reasons.append("COMMON_INPUTS_MISSING")
+    else:
+        if common_inputs.get("rng_draw_contract_version") != M6_RNG_DRAW_CONTRACT_VERSION:
+            reasons.append("RNG_DRAW_CONTRACT_NOT_V2")
+        if canonical_json_sha256(dict(common_inputs)) != common_fingerprint:
+            reasons.append("COMMON_INPUTS_FINGERPRINT_MISMATCH")
+
     finite_checks = trace.get("finite_checks")
-    if not isinstance(finite_checks, Mapping) or not all(bool(value) for value in finite_checks.values()):
+    if not isinstance(finite_checks, Mapping) or not all(
+        bool(value) for value in finite_checks.values()
+    ):
         reasons.append("FINITE_CHECKS_FAILED")
 
     chunks = trace.get("chunks")
@@ -1450,8 +1738,54 @@ def _protocol_failure_reasons(trace: Mapping[str, Any]) -> list[str]:
                 after = recache.get("after")
                 if not isinstance(before, Mapping) or not isinstance(after, Mapping):
                     reasons.append(f"CHUNK_{chunk_index}_CLEAN_RECACHE_BOUNDARY_MISSING")
-                elif int(after.get("local_end_index", -1)) <= int(before.get("local_end_index", -1)):
+                elif int(after.get("local_end_index", -1)) <= int(
+                    before.get("local_end_index", -1)
+                ):
                     reasons.append(f"CHUNK_{chunk_index}_CLEAN_RECACHE_DID_NOT_ADVANCE")
+            commit = chunk.get("commit")
+            if not isinstance(commit, Mapping):
+                reasons.append(f"CHUNK_{chunk_index}_COMMIT_MISSING")
+            else:
+                start_frame = int(chunk.get("start_frame", -1))
+                chunk_frames = int(chunk.get("num_frames", -1))
+                if commit.get("main_only") is not True or commit.get("next_commit") is not None:
+                    reasons.append(f"CHUNK_{chunk_index}_COMMIT_NOT_MAIN_ONLY")
+                if int(commit.get("cursor_before", -1)) != start_frame:
+                    reasons.append(f"CHUNK_{chunk_index}_CURSOR_BEFORE_MISMATCH")
+                if int(commit.get("cursor_after", -1)) != start_frame + chunk_frames:
+                    reasons.append(f"CHUNK_{chunk_index}_CURSOR_AFTER_MISMATCH")
+    if oracle_kind == "C":
+        oracle_b_artifact = trace.get("oracle_b_artifact")
+        oracle_b_comparison = trace.get("oracle_b_comparison")
+        if not isinstance(oracle_b_artifact, Mapping):
+            reasons.append("ORACLE_B_ARTIFACT_MISSING")
+        else:
+            if oracle_b_artifact.get("oracle_kind") != "B":
+                reasons.append("ORACLE_B_ARTIFACT_KIND_INVALID")
+            if oracle_b_artifact.get("status") != "PASS":
+                reasons.append("ORACLE_B_ARTIFACT_STATUS_NOT_PASS")
+            if oracle_b_artifact.get("protocol_pass") is not True:
+                reasons.append("ORACLE_B_ARTIFACT_PROTOCOL_NOT_PASS")
+            if oracle_b_artifact.get("oracle_gate_pass") is not True:
+                reasons.append("ORACLE_B_ARTIFACT_GATE_NOT_PASS")
+            if oracle_b_artifact.get("common_inputs_fingerprint_sha256") != common_fingerprint:
+                reasons.append("ORACLE_B_COMMON_INPUTS_FINGERPRINT_MISMATCH")
+        if not isinstance(oracle_b_comparison, Mapping):
+            reasons.append("ORACLE_B_COMPARISON_MISSING")
+        else:
+            output_sha = (
+                trace.get("artifact_hashes", {}).get("output_latent_tensor_sha256")
+                if isinstance(trace.get("artifact_hashes"), Mapping)
+                else None
+            )
+            if oracle_b_comparison.get("actual_sha256") != output_sha:
+                reasons.append("ORACLE_B_COMPARISON_ACTUAL_SHA_MISMATCH")
+            if (
+                isinstance(oracle_b_artifact, Mapping)
+                and oracle_b_comparison.get("expected_sha256")
+                != oracle_b_artifact.get("latent_sha256")
+            ):
+                reasons.append("ORACLE_B_COMPARISON_EXPECTED_SHA_MISMATCH")
     return reasons
 
 
@@ -1478,7 +1812,11 @@ def _official_checkpoint_record(
         generator_state_dict=state_dict,
         global_step=None,
         mcp_tensor_count=mcp_tensor_count,
-        payload_format=None if not isinstance(payload, Mapping) else _string_or_none(payload.get("format")),
+        payload_format=(
+            None
+            if not isinstance(payload, Mapping)
+            else _string_or_none(payload.get("format"))
+        ),
     )
 
 
@@ -1488,24 +1826,69 @@ def _formal_step0_checkpoint_record(
     payload: Any,
     checkpoint_sha: str,
 ) -> M6CheckpointRecord:
+    return _formal_stage_a_checkpoint_record(
+        path=path,
+        payload=payload,
+        checkpoint_sha=checkpoint_sha,
+        oracle_kind="B",
+        expected_global_step=0,
+        checkpoint_type=M6_CHECKPOINT_FORMAL_STEP0,
+        load_mode="FORMAL_STEP0_FULL_GENERATOR_STRICT",
+    )
+
+
+def _formal_step500_checkpoint_record(
+    *,
+    path: Path,
+    payload: Any,
+    checkpoint_sha: str,
+) -> M6CheckpointRecord:
+    return _formal_stage_a_checkpoint_record(
+        path=path,
+        payload=payload,
+        checkpoint_sha=checkpoint_sha,
+        oracle_kind="C",
+        expected_global_step=500,
+        checkpoint_type=M6_CHECKPOINT_FORMAL_STEP500,
+        load_mode="FORMAL_STEP500_FULL_GENERATOR_STRICT",
+    )
+
+
+def _formal_stage_a_checkpoint_record(
+    *,
+    path: Path,
+    payload: Any,
+    checkpoint_sha: str,
+    oracle_kind: OracleKind,
+    expected_global_step: int,
+    checkpoint_type: str,
+    load_mode: str,
+) -> M6CheckpointRecord:
+    descriptor = _formal_checkpoint_descriptor(oracle_kind, expected_global_step)
     if str(path).lower().endswith(".tmp"):
-        raise RuntimeError("Oracle B formal checkpoint path must not end with .tmp")
+        raise RuntimeError(f"{descriptor} checkpoint path must not end with .tmp")
     if not isinstance(payload, Mapping) or payload.get("format") != M3_CHECKPOINT_FORMAT:
-        raise RuntimeError("Oracle B requires formal step0 M3 checkpoint")
+        raise RuntimeError(f"{descriptor} requires formal M3 checkpoint")
     formal_payload = load_m3_checkpoint(path)
     global_step = int(formal_payload["global_step"])
-    if global_step != 0:
-        raise RuntimeError("Oracle B requires formal global_step=0 checkpoint")
+    if global_step != int(expected_global_step):
+        raise RuntimeError(
+            f"{descriptor} requires formal global_step={int(expected_global_step)} checkpoint"
+        )
     state_dict = formal_payload["generator"]
     mcp_tensor_count = _count_mcp_tensors(state_dict)
     if mcp_tensor_count <= 0:
-        raise RuntimeError("Oracle B formal checkpoint must contain MCP tensors")
-    formal_metadata = _validate_m5_formal_step0_checkpoint(formal_payload)
+        raise RuntimeError(f"{descriptor} checkpoint must contain MCP tensors")
+    formal_metadata = _validate_m5_formal_stage_a_checkpoint(
+        formal_payload,
+        oracle_kind=oracle_kind,
+        expected_global_step=int(expected_global_step),
+    )
     return M6CheckpointRecord(
         path=str(path.resolve()),
         sha256=checkpoint_sha,
-        checkpoint_type=M6_CHECKPOINT_FORMAL_STEP0,
-        load_mode="FORMAL_STEP0_FULL_GENERATOR_STRICT",
+        checkpoint_type=checkpoint_type,
+        load_mode=load_mode,
         generator_state_dict=state_dict,
         global_step=global_step,
         mcp_tensor_count=mcp_tensor_count,
@@ -1515,22 +1898,36 @@ def _formal_step0_checkpoint_record(
 
 
 def _validate_m5_formal_step0_checkpoint(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return _validate_m5_formal_stage_a_checkpoint(
+        payload,
+        oracle_kind="B",
+        expected_global_step=0,
+    )
+
+
+def _validate_m5_formal_stage_a_checkpoint(
+    payload: Mapping[str, Any],
+    *,
+    oracle_kind: OracleKind,
+    expected_global_step: int,
+) -> dict[str, Any]:
+    descriptor = _formal_checkpoint_descriptor(oracle_kind, expected_global_step)
     if "m5_formal_smoke" in payload:
-        raise RuntimeError("Oracle B rejects M5 formal smoke checkpoint markers")
+        raise RuntimeError(f"{descriptor} rejects M5 formal smoke checkpoint markers")
     validate_git_sha(str(payload.get("git_sha", "")), name="formal_checkpoint.git_sha")
     metadata = payload.get("m5_formal_trainer")
     if not isinstance(metadata, Mapping):
-        raise TypeError("Oracle B formal step0 checkpoint missing m5_formal_trainer metadata")
+        raise TypeError(f"{descriptor} checkpoint missing m5_formal_trainer metadata")
     if metadata.get("schema") != M5_FORMAL_TRAINER_SCHEMA:
-        raise RuntimeError("Oracle B formal step0 checkpoint schema mismatch")
+        raise RuntimeError(f"{descriptor} checkpoint schema mismatch")
     if metadata.get("status") != "PASS":
-        raise RuntimeError("Oracle B formal step0 checkpoint status mismatch")
+        raise RuntimeError(f"{descriptor} checkpoint status mismatch")
     if metadata.get("formal_enabled") is not True:
-        raise RuntimeError("Oracle B formal step0 checkpoint marker is not enabled")
+        raise RuntimeError(f"{descriptor} checkpoint marker is not enabled")
     if metadata.get("smoke_enabled") is True:
-        raise RuntimeError("Oracle B formal step0 checkpoint must not enable smoke")
+        raise RuntimeError(f"{descriptor} checkpoint must not enable smoke")
     if metadata.get("run_kind") == "short_smoke":
-        raise RuntimeError("Oracle B formal step0 checkpoint must not be short_smoke")
+        raise RuntimeError(f"{descriptor} checkpoint must not be short_smoke")
 
     stage_contract = resolve_m5_formal_stage_contract(500)
     expected_stage_contract = {
@@ -1543,7 +1940,7 @@ def _validate_m5_formal_step0_checkpoint(payload: Mapping[str, Any]) -> dict[str
     expected_stage = "stage_a"
     if metadata.get("stage") != expected_stage:
         raise RuntimeError(
-            "Oracle B formal step0 checkpoint stage mismatch: "
+            f"{descriptor} checkpoint stage mismatch: "
             f"expected={expected_stage}, actual={metadata.get('stage')}"
         )
     actual_stage_contract = _strict_formal_stage_contract(
@@ -1552,16 +1949,16 @@ def _validate_m5_formal_step0_checkpoint(payload: Mapping[str, Any]) -> dict[str
     )
     if actual_stage_contract != expected_stage_contract:
         raise RuntimeError(
-            "Oracle B formal step0 checkpoint stage_contract mismatch: "
+            f"{descriptor} checkpoint stage_contract mismatch: "
             f"expected={expected_stage_contract}, actual={actual_stage_contract}"
         )
 
     resolved_config = payload.get("resolved_config")
     if not isinstance(resolved_config, Mapping):
-        raise TypeError("Oracle B formal step0 checkpoint missing resolved_config")
+        raise TypeError(f"{descriptor} checkpoint missing resolved_config")
     formal_config = resolved_config.get("m5_formal")
     if not isinstance(formal_config, Mapping):
-        raise TypeError("Oracle B formal step0 checkpoint resolved_config missing m5_formal")
+        raise TypeError(f"{descriptor} checkpoint resolved_config missing m5_formal")
 
     matched_fields = {
         "sample_plan_sha256": metadata.get("sample_plan_sha256"),
@@ -1576,18 +1973,20 @@ def _validate_m5_formal_step0_checkpoint(payload: Mapping[str, Any]) -> dict[str
     ):
         _require_sha256(metadata.get(field), f"m5_formal_trainer.{field}")
     if metadata.get("validation_implementation_schema") != M5_STREAMING_VALIDATION_SCHEMA:
-        raise RuntimeError("Oracle B formal step0 validation implementation schema mismatch")
+        raise RuntimeError(
+            f"{descriptor} validation implementation schema mismatch"
+        )
     for field, expected in matched_fields.items():
         actual = formal_config.get(field)
         if actual != expected:
             raise RuntimeError(
-                "Oracle B formal step0 checkpoint provenance mismatch: "
+                f"{descriptor} checkpoint provenance mismatch: "
                 f"field=m5_formal.{field}, expected={expected}, actual={actual}"
             )
     if formal_config.get("schema") != M5_FORMAL_TRAINER_SCHEMA:
-        raise RuntimeError("Oracle B formal step0 resolved_config schema mismatch")
+        raise RuntimeError(f"{descriptor} resolved_config schema mismatch")
     if formal_config.get("enabled") is not True:
-        raise RuntimeError("Oracle B formal step0 resolved_config marker is not enabled")
+        raise RuntimeError(f"{descriptor} resolved_config marker is not enabled")
     return {
         "schema": str(metadata["schema"]),
         "status": str(metadata["status"]),
@@ -1599,6 +1998,13 @@ def _validate_m5_formal_step0_checkpoint(payload: Mapping[str, Any]) -> dict[str
         "conditional_artifact_sha256": str(metadata["conditional_artifact_sha256"]),
         "validation_implementation_schema": str(metadata["validation_implementation_schema"]),
     }
+
+
+def _formal_checkpoint_descriptor(
+    oracle_kind: OracleKind,
+    expected_global_step: int,
+) -> str:
+    return f"Oracle {oracle_kind} formal step{int(expected_global_step)}"
 
 
 def _strict_formal_stage_contract(value: Any, *, field_path: str) -> dict[str, Any]:
@@ -1690,7 +2096,7 @@ def _validate_source_noise(
 
 def _validate_runtime(runtime: M6OracleRuntime) -> None:
     if int(runtime.num_frame_per_block) != M3_CHUNK_FRAMES:
-        raise ValueError("M6.0 A/B requires chunk_frames=3")
+        raise ValueError("M6.0 A/B/C requires chunk_frames=3")
     if not runtime.kv_cache:
         raise ValueError("runtime.kv_cache must not be empty")
     if not hasattr(runtime.scheduler, "add_noise"):

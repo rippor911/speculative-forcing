@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,6 +99,8 @@ def make_config(schedule=None):
         model_kwargs={"timestep_shift": 5.0},
         num_frame_per_block=3,
         context_noise=0,
+        mcp_num_layers=2,
+        mcp_tap_layers=(1, 2),
     )
 
 
@@ -161,22 +164,34 @@ def make_metadata():
 
 
 def make_checkpoint(kind: str = "A", *, sha256: str = TEST_SHA256) -> m6.M6CheckpointRecord:
-    checkpoint_type = (
-        m6.M6_CHECKPOINT_OFFICIAL if kind == "A" else m6.M6_CHECKPOINT_FORMAL_STEP0
-    )
+    if kind == "A":
+        checkpoint_type = m6.M6_CHECKPOINT_OFFICIAL
+        global_step = None
+        mcp_tensor_count = 0
+    elif kind == "B":
+        checkpoint_type = m6.M6_CHECKPOINT_FORMAL_STEP0
+        global_step = 0
+        mcp_tensor_count = 1
+    elif kind == "C":
+        checkpoint_type = m6.M6_CHECKPOINT_FORMAL_STEP500
+        global_step = 500
+        mcp_tensor_count = 1
+    else:
+        raise ValueError(f"unsupported checkpoint kind: {kind}")
     return m6.M6CheckpointRecord(
         path="/tmp/checkpoint.pt",
         sha256=sha256,
         checkpoint_type=checkpoint_type,
         load_mode="test",
         generator_state_dict={},
-        global_step=None if kind == "A" else 0,
-        mcp_tensor_count=0 if kind == "A" else 1,
+        global_step=global_step,
+        mcp_tensor_count=mcp_tensor_count,
     )
 
 
 def make_formal_step0_payload(
     *,
+    global_step: int = 0,
     metadata: dict | None = None,
     top_level: dict | None = None,
 ) -> dict:
@@ -203,7 +218,7 @@ def make_formal_step0_payload(
     payload = {
         "format": m6.M3_CHECKPOINT_FORMAT,
         "git_sha": TEST_GIT_SHA,
-        "global_step": 0,
+        "global_step": int(global_step),
         "generator": {"mcp.weight": torch.zeros(1)},
         "m5_formal_trainer": formal_metadata,
         "resolved_config": {
@@ -321,6 +336,32 @@ def test_cli_parse_args_accepts_argv() -> None:
     assert args.output_dir == Path("out")
 
 
+def test_cli_parse_args_accepts_oracle_c() -> None:
+    args = inf.parse_args(
+        [
+            "--oracle",
+            "C",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "step500.pt",
+            "--teacher_manifest",
+            "manifest.json",
+            "--dataset_root",
+            "dataset",
+            "--output_dir",
+            "out",
+            "--oracle_b_dir",
+            "oracle_b",
+            "--decode",
+        ]
+    )
+
+    assert args.oracle == "C"
+    assert args.oracle_b_dir == Path("oracle_b")
+    assert args.decode is True
+
+
 def test_oracle_b_cli_contract_rejects_before_output_dir_creation(tmp_path: Path) -> None:
     args = SimpleNamespace(
         oracle="B",
@@ -332,6 +373,76 @@ def test_oracle_b_cli_contract_rejects_before_output_dir_creation(tmp_path: Path
     with pytest.raises(ValueError, match="oracle_a_dir"):
         inf.validate_oracle_b_cli_contract(args)
     assert not args.output_dir.exists()
+
+
+def test_oracle_c_cli_contract_requires_b_dir_before_output_creation(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        oracle="C",
+        oracle_b_dir=None,
+        decode=True,
+        tolerance=None,
+        output_dir=tmp_path / "should_not_exist",
+    )
+
+    with pytest.raises(ValueError, match="oracle_b_dir"):
+        inf.validate_oracle_c_cli_contract(args)
+    assert not args.output_dir.exists()
+
+
+def test_oracle_c_cli_contract_requires_decode_before_output_creation(
+    tmp_path: Path,
+) -> None:
+    oracle_b_dir = tmp_path / "oracle_b"
+    oracle_b_dir.mkdir()
+    for name in ("oracle_trace.json", "oracle_summary.json", "output_latent.pt"):
+        (oracle_b_dir / name).write_bytes(b"x")
+    args = SimpleNamespace(
+        oracle="C",
+        oracle_b_dir=oracle_b_dir,
+        decode=False,
+        tolerance=None,
+        output_dir=tmp_path / "should_not_exist",
+    )
+
+    with pytest.raises(ValueError, match="decode"):
+        inf.validate_oracle_c_cli_contract(args)
+    assert not args.output_dir.exists()
+
+
+@pytest.mark.parametrize("tolerance", [0.0, 1.0e-4, 1.0])
+def test_oracle_c_cli_contract_rejects_tolerance_before_output_creation(
+    tmp_path: Path,
+    tolerance: float,
+) -> None:
+    oracle_b_dir = tmp_path / "oracle_b"
+    oracle_b_dir.mkdir()
+    for name in ("oracle_trace.json", "oracle_summary.json", "output_latent.pt"):
+        (oracle_b_dir / name).write_bytes(b"x")
+    args = SimpleNamespace(
+        oracle="C",
+        oracle_b_dir=oracle_b_dir,
+        decode=True,
+        tolerance=tolerance,
+        output_dir=tmp_path / "should_not_exist",
+    )
+
+    with pytest.raises(ValueError, match="tolerance"):
+        inf.validate_oracle_c_cli_contract(args)
+    assert not args.output_dir.exists()
+
+
+def test_oracle_c_cli_contract_does_not_change_oracle_a_tolerance() -> None:
+    args = SimpleNamespace(
+        oracle="A",
+        oracle_b_dir=None,
+        decode=False,
+        tolerance=0.0,
+        output_dir=Path("unused"),
+    )
+
+    inf.validate_oracle_c_cli_contract(args)
 
 
 def test_oracle_b_cli_contract_requires_tolerance_and_nonempty_a_artifacts(
@@ -581,7 +692,10 @@ def test_each_chunk_has_four_forwards_each_rolled_back_and_one_clean_recache() -
             assert rollback == before
             assert temp > before
             assert step["kv"]["visible_data_restored"] is True
-        assert chunk["clean_recache"]["after"]["local_end_index"] > chunk["clean_recache"]["before"]["local_end_index"]
+        assert (
+            chunk["clean_recache"]["after"]["local_end_index"]
+            > chunk["clean_recache"]["before"]["local_end_index"]
+        )
 
 
 def test_final_solver_forward_is_rolled_back_before_clean_recache() -> None:
@@ -681,6 +795,75 @@ def test_oracle_a_and_b_do_not_call_mcp() -> None:
         assert result.trace["mcp_call_count"] == 0
 
 
+def test_oracle_c_runtime_is_main_only_and_does_not_call_mcp() -> None:
+    generator = FakeGenerator()
+    result, _ = run_fake_oracle(oracle_kind="C", generator=generator)
+
+    assert generator.mcp_call_count == 0
+    assert all(not call["mcp_requested"] for call in generator.calls)
+    assert result.trace["mcp_enabled"] is False
+    assert result.trace["mcp_call_count"] == 0
+
+
+def test_oracle_c_build_generator_loads_full_mcp_topology(monkeypatch) -> None:
+    instances = []
+
+    class FakeWanDiffusionWrapper(nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.kwargs = kwargs
+            self.add_mcp_calls = []
+            self.loaded_state = None
+            self.loaded_strict = None
+            instances.append(self)
+
+        def add_mcp_modules(self, **kwargs) -> None:
+            self.add_mcp_calls.append(kwargs)
+
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded_state = dict(state_dict)
+            self.loaded_strict = strict
+            return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "utils.wan_wrapper",
+        SimpleNamespace(WanDiffusionWrapper=FakeWanDiffusionWrapper),
+    )
+    checkpoint = m6.M6CheckpointRecord(
+        path="/tmp/step500.pt",
+        sha256=TEST_SHA256,
+        checkpoint_type=m6.M6_CHECKPOINT_FORMAL_STEP500,
+        load_mode="test",
+        generator_state_dict={
+            "main.weight": torch.zeros(1),
+            "mcp.depth1.weight": torch.ones(1),
+        },
+        global_step=500,
+        mcp_tensor_count=1,
+    )
+
+    generator = inf.build_generator(
+        oracle="C",
+        config=make_config(),
+        checkpoint_record=checkpoint,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert generator is instances[0]
+    assert generator.kwargs["is_causal"] is True
+    assert generator.add_mcp_calls == [
+        {
+            "num_modules": inf.M6_MCP_MODULE_COUNT,
+            "num_layers": 2,
+            "tap_layers": (1, 2),
+        }
+    ]
+    assert generator.loaded_strict is True
+    assert "mcp.depth1.weight" in generator.loaded_state
+
+
 def test_checkpoint_type_rejection_rules(monkeypatch) -> None:
     monkeypatch.setattr(m6, "file_sha256", lambda path: TEST_SHA256)
     monkeypatch.setattr(torch, "load", lambda *args, **kwargs: {"format": m6.M3_CHECKPOINT_FORMAT})
@@ -688,7 +871,11 @@ def test_checkpoint_type_rejection_rules(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="official"):
         m6.load_oracle_checkpoint(path=Path("formal.pt"), oracle_kind="A")
 
-    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: {"generator": {"w": torch.zeros(1)}})
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *args, **kwargs: {"generator": {"w": torch.zeros(1)}},
+    )
     with pytest.raises(RuntimeError, match="formal"):
         m6.load_oracle_checkpoint(path=Path("official.pt"), oracle_kind="B")
 
@@ -738,6 +925,33 @@ def test_checkpoint_type_rejection_rules(monkeypatch) -> None:
     assert record.mcp_tensor_count == 1
     assert record.formal_metadata["stage"] == "stage_a"
 
+    formal_step500_payload = make_formal_step0_payload(global_step=500)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: formal_step500_payload)
+    monkeypatch.setattr(
+        m6,
+        "load_m3_checkpoint",
+        lambda path: formal_step500_payload,
+    )
+    record = m6.load_oracle_checkpoint(path=Path("step500.pt"), oracle_kind="C")
+    assert record.checkpoint_type == m6.M6_CHECKPOINT_FORMAL_STEP500
+    assert record.global_step == 500
+    assert record.mcp_tensor_count == 1
+    assert record.formal_metadata["stage"] == "stage_a"
+
+
+@pytest.mark.parametrize("global_step", [0, 499, 501, 2000])
+def test_oracle_c_rejects_non_step500_formal_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    global_step: int,
+) -> None:
+    monkeypatch.setattr(m6, "file_sha256", lambda path: TEST_SHA256)
+    payload = make_formal_step0_payload(global_step=global_step)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(m6, "load_m3_checkpoint", lambda path: payload)
+
+    with pytest.raises(RuntimeError, match="global_step=500"):
+        m6.load_oracle_checkpoint(path=Path("step500.pt"), oracle_kind="C")
+
 
 @pytest.mark.parametrize(
     ("payload_kwargs", "path", "match"),
@@ -764,6 +978,34 @@ def test_formal_step0_checkpoint_rejects_bad_marker(
 
     with pytest.raises((RuntimeError, ValueError), match=match):
         m6.load_oracle_checkpoint(path=Path(path), oracle_kind="B")
+
+
+@pytest.mark.parametrize(
+    ("payload_kwargs", "path", "match"),
+    [
+        ({"metadata": {"status": "FAIL"}}, "bad_step500.pt", "status"),
+        ({"metadata": {"formal_enabled": False}}, "bad_step500.pt", "marker"),
+        ({"metadata": {"smoke_enabled": True}}, "bad_step500.pt", "smoke"),
+        ({"metadata": {"run_kind": "short_smoke"}}, "bad_step500.pt", "short_smoke"),
+        ({"top_level": {"git_sha": "not-a-git-sha"}}, "bad_step500.pt", "git"),
+        ({"metadata": {"sample_plan_sha256": "A" * 64}}, "bad_step500.pt", "lowercase"),
+        ({}, "bad_step500.pt.tmp", ".tmp"),
+        ({"top_level": {"m5_formal_smoke": {"status": "PASS"}}}, "bad_step500.pt", "smoke"),
+    ],
+)
+def test_formal_step500_checkpoint_rejects_bad_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    payload_kwargs: dict,
+    path: str,
+    match: str,
+) -> None:
+    monkeypatch.setattr(m6, "file_sha256", lambda path: TEST_SHA256)
+    bad_payload = make_formal_step0_payload(global_step=500, **payload_kwargs)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: bad_payload)
+    monkeypatch.setattr(m6, "load_m3_checkpoint", lambda path: bad_payload)
+
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        m6.load_oracle_checkpoint(path=Path(path), oracle_kind="C")
 
 
 def test_oracle_b_vs_a_comparison_reports_metrics_and_not_generation_only_pass() -> None:
@@ -840,6 +1082,105 @@ def test_oracle_b_target_comparison_is_diagnostic_not_gate() -> None:
     assert finalized.summary["gate_reasons"] == []
 
 
+def test_oracle_c_protocol_uses_four_step_rollback_and_clean_recache() -> None:
+    result, runtime = run_fake_oracle(oracle_kind="C")
+    comparison = m6.compare_latents(result.latent, result.latent, tolerance=None)
+    oracle_b_artifact = make_oracle_b_artifact_identity_for_c(result)
+    finalized = m6.finalize_oracle_gate(
+        result,
+        oracle_b_comparison=comparison,
+        oracle_b_artifact=oracle_b_artifact,
+    )
+
+    assert finalized.summary["protocol_pass"] is True
+    assert finalized.summary["status"] == "REPORT_ONLY"
+    assert finalized.summary["main_quality_pass"] is None
+    assert runtime.kv_cache[0]["local_end_index"].item() == 12
+    for chunk in finalized.trace["chunks"]:
+        assert len(chunk["solver_steps"]) == 4
+        assert chunk["commit"]["main_only"] is True
+        for step in chunk["solver_steps"]:
+            assert step["kv"]["rollback_after_forward"] == step["kv"]["before"]
+            assert step["kv"]["visible_data_restored"] is True
+
+
+def test_oracle_c_vs_b_latent_comparison_is_quality_evidence_not_equality_gate() -> None:
+    result, _ = run_fake_oracle(oracle_kind="C")
+    oracle_b_latent = result.latent + 1.0
+    comparison = m6.compare_latents(result.latent, oracle_b_latent, tolerance=None)
+    oracle_b_artifact = make_oracle_b_artifact_identity_for_c(
+        result,
+        latent_sha256=comparison["expected_sha256"],
+    )
+    finalized = m6.finalize_oracle_gate(
+        result,
+        oracle_b_comparison=comparison,
+        oracle_b_artifact=oracle_b_artifact,
+    )
+
+    assert finalized.summary["protocol_pass"] is True
+    assert finalized.summary["oracle_b_comparison"]["exact_equality"] is False
+    assert finalized.summary["oracle_b_comparison"]["reproduction_pass"] is None
+    assert finalized.summary["main_quality_pass"] is None
+    assert finalized.summary["oracle_gate_pass"] is None
+    assert finalized.summary["status"] == "REPORT_ONLY"
+    assert "MAIN_QUALITY_REVIEW_PENDING" in finalized.summary["gate_reasons"]
+
+
+def test_oracle_c_generation_path_cannot_set_main_quality_pass_true() -> None:
+    result, _ = run_fake_oracle(oracle_kind="C", tolerance=0.0)
+    comparison = m6.compare_latents(result.latent, result.latent, tolerance=0.0)
+    oracle_b_artifact = make_oracle_b_artifact_identity_for_c(result)
+    finalized = m6.finalize_oracle_gate(
+        result,
+        oracle_b_comparison=comparison,
+        oracle_b_artifact=oracle_b_artifact,
+    )
+
+    assert finalized.summary["protocol_pass"] is True
+    assert finalized.summary["target_reproduction_pass"] is False
+    assert finalized.summary["main_quality_pass"] is None
+    assert finalized.summary["review_status"] == "PENDING"
+    assert finalized.summary["status"] == "REPORT_ONLY"
+
+
+def test_oracle_c_requires_strict_b_artifact_for_protocol_pass() -> None:
+    result, _ = run_fake_oracle(oracle_kind="C")
+
+    assert result.summary["protocol_pass"] is False
+    assert result.summary["status"] == "FAIL"
+    assert "ORACLE_B_ARTIFACT_MISSING" in result.summary["gate_reasons"]
+    assert "ORACLE_B_COMPARISON_MISSING" in result.summary["gate_reasons"]
+
+
+def test_oracle_c_quality_contract_version_and_criteria_are_emitted() -> None:
+    result, _ = run_fake_oracle(oracle_kind="C")
+    contract = result.summary["oracle_c_main_quality_contract"]
+
+    assert contract["version"] == m6.M6_ORACLE_C_MAIN_QUALITY_CONTRACT_VERSION
+    assert contract["automatic_quality_threshold"] is None
+    assert len(contract["fail_criteria"]) == 4
+    assert contract["initial_review_status"] == "PENDING"
+
+
+def test_b_and_c_common_inputs_fingerprint_match_without_checkpoint_identity() -> None:
+    result_b, _ = run_fake_oracle(
+        oracle_kind="B",
+        checkpoint_sha256="b" * 64,
+    )
+    result_c, _ = run_fake_oracle(
+        oracle_kind="C",
+        checkpoint_sha256="c" * 64,
+    )
+
+    assert result_b.summary["common_inputs"] == result_c.summary["common_inputs"]
+    assert (
+        result_b.summary["common_inputs_fingerprint_sha256"]
+        == result_c.summary["common_inputs_fingerprint_sha256"]
+    )
+    assert "checkpoint_sha256" not in result_c.summary["common_inputs"]
+
+
 def test_oracle_stdout_payload_uses_final_gate_status() -> None:
     result, _ = run_fake_oracle()
     payload = m6.oracle_stdout_payload(
@@ -863,6 +1204,98 @@ def test_json_payload_rejects_tensors_and_nonfinite_numbers() -> None:
         m6.validate_json_payload({"tensor": torch.zeros(1)})
     with pytest.raises(ValueError, match="non-finite"):
         m6.validate_json_payload({"value": float("inf")})
+
+
+def test_pixel_comparison_is_json_safe_when_mse_is_zero() -> None:
+    frames = torch.zeros((2, 4, 4, 3), dtype=torch.uint8)
+    comparison = m6.compare_pixel_frames(frames, frames.clone())
+
+    assert comparison["exact_equal"] is True
+    assert comparison["mae"] == 0.0
+    assert comparison["mse"] == 0.0
+    assert comparison["psnr"] is None
+    assert comparison["per_frame"][0]["mse"] == 0.0
+    m6.validate_json_payload(comparison)
+
+
+def test_oracle_c_quality_evidence_writes_paired_videos_and_pending_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeWanVAEWrapper(nn.Module):
+        def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+            assert use_cache is False
+            return latent.float().repeat(1, 1, 3, 1, 1).clamp(-1, 1)
+
+    def fake_write_video(output_path: Path, frames: torch.Tensor, *, fps: int) -> None:
+        assert fps == 16
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(frames.detach().cpu().numpy().tobytes() or b"empty")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "utils.wan_wrapper",
+        SimpleNamespace(WanVAEWrapper=FakeWanVAEWrapper),
+    )
+    monkeypatch.setattr(inf, "write_video_frames", fake_write_video)
+
+    c_result, _ = run_fake_oracle(
+        oracle_kind="C",
+        generator=FakeGenerator(constant_clean=0.25),
+    )
+    b_result, _ = run_fake_oracle(
+        oracle_kind="B",
+        generator=FakeGenerator(constant_clean=0.0),
+    )
+    comparison = m6.compare_latents(c_result.latent, b_result.latent, tolerance=None)
+    oracle_b_record = m6.M6OracleBArtifactRecord(
+        artifact_dir=str(tmp_path / "oracle_b"),
+        trace=b_result.trace,
+        summary={
+            **b_result.summary,
+            "status": "PASS",
+            "protocol_pass": True,
+            "oracle_gate_pass": True,
+        },
+        latent_payload={},
+        latent=b_result.latent,
+        common_inputs=b_result.summary["common_inputs"],
+        common_inputs_fingerprint_sha256=b_result.summary[
+            "common_inputs_fingerprint_sha256"
+        ],
+        latent_sha256=m6.tensor_sha256(b_result.latent),
+        artifact_hashes={
+            "oracle_trace_json_sha256": "1" * 64,
+            "oracle_summary_json_sha256": "2" * 64,
+            "output_latent_pt_sha256": "3" * 64,
+        },
+        checkpoint=make_checkpoint("B").to_json(),
+    )
+    output_dir = tmp_path / "oracle_c"
+    output_dir.mkdir()
+
+    evidence = inf.save_oracle_c_quality_evidence(
+        c_result=c_result,
+        oracle_b_artifacts=oracle_b_record,
+        latent_comparison=comparison,
+        output_dir=output_dir,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        fps=16,
+    )
+
+    assert (output_dir / "quality" / "step0_reference.mp4").is_file()
+    assert (output_dir / "quality" / "step500_main.mp4").is_file()
+    assert (output_dir / "oracle_c_quality_evidence.json").is_file()
+    assert evidence["main_quality_pass"] is None
+    assert evidence["review_status"] == "PENDING"
+    assert evidence["b_latent_sha256"] == m6.tensor_sha256(b_result.latent)
+    assert evidence["c_latent_sha256"] == m6.tensor_sha256(c_result.latent)
+    assert evidence["c_checkpoint_sha256"] == c_result.summary["checkpoint"]["sha256"]
+    assert evidence["quality_contract_version"] == (
+        m6.M6_ORACLE_C_MAIN_QUALITY_CONTRACT_VERSION
+    )
+    assert evidence["pixel_comparison"]["mse"] is not None
 
 
 def test_non_empty_output_dir_is_rejected(tmp_path: Path) -> None:
@@ -1011,6 +1444,52 @@ def write_pass_oracle_a_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     return output_dir, result
 
 
+def write_pass_oracle_b_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    install_test_writers(monkeypatch)
+    result, _ = run_fake_oracle(
+        oracle_kind="B",
+        generator=FakeGenerator(constant_clean=0.0),
+        tolerance=0.0,
+    )
+    comparison = m6.compare_latents(result.latent, result.latent, tolerance=0.0)
+    result = m6.finalize_oracle_gate(result, oracle_a_comparison=comparison)
+    output_dir = tmp_path / "oracle_b"
+    m6.write_oracle_artifacts(
+        output_dir=output_dir,
+        resolved_config={"oracle": "B"},
+        result=result,
+    )
+    return output_dir, result
+
+
+def make_oracle_b_artifact_identity_for_c(
+    result,
+    *,
+    latent_sha256: str | None = None,
+    fingerprint: str | None = None,
+    status: str = "PASS",
+    protocol_pass: bool = True,
+    oracle_gate_pass: bool = True,
+) -> dict:
+    return {
+        "oracle_kind": "B",
+        "artifact_dir": "/tmp/oracle_b",
+        "status": status,
+        "protocol_pass": protocol_pass,
+        "oracle_gate_pass": oracle_gate_pass,
+        "checkpoint": make_checkpoint("B").to_json(),
+        "common_inputs_fingerprint_sha256": (
+            fingerprint or result.summary["common_inputs_fingerprint_sha256"]
+        ),
+        "latent_sha256": latent_sha256 or m6.tensor_sha256(result.latent),
+        "artifact_hashes": {
+            "oracle_trace_json_sha256": "1" * 64,
+            "oracle_summary_json_sha256": "2" * 64,
+            "output_latent_pt_sha256": "3" * 64,
+        },
+    }
+
+
 def test_validate_oracle_a_artifact_dir_accepts_strict_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1124,6 +1603,104 @@ def test_validate_oracle_a_artifact_dir_rejects_tampered_latent(
 
     with pytest.raises(RuntimeError, match="SHA256"):
         m6.validate_oracle_a_artifact_dir(
+            output_dir,
+            expected_common_inputs_fingerprint_sha256=result.summary[
+                "common_inputs_fingerprint_sha256"
+            ],
+        )
+
+
+def test_validate_oracle_b_artifact_dir_accepts_strict_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir, result = write_pass_oracle_b_artifacts(tmp_path, monkeypatch)
+
+    record = m6.validate_oracle_b_artifact_dir(
+        output_dir,
+        expected_common_inputs_fingerprint_sha256=result.summary[
+            "common_inputs_fingerprint_sha256"
+        ],
+    )
+    identity = m6.oracle_b_artifact_identity(record)
+
+    assert record.latent_sha256 == m6.tensor_sha256(record.latent)
+    assert record.common_inputs == result.summary["common_inputs"]
+    assert record.checkpoint["type"] == m6.M6_CHECKPOINT_FORMAL_STEP0
+    assert identity["status"] == "PASS"
+
+
+def test_validate_oracle_b_artifact_dir_rejects_a_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir, result = write_pass_oracle_a_artifacts(tmp_path, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Oracle B"):
+        m6.validate_oracle_b_artifact_dir(
+            output_dir,
+            expected_common_inputs_fingerprint_sha256=result.summary[
+                "common_inputs_fingerprint_sha256"
+            ],
+        )
+
+
+@pytest.mark.parametrize("mode", ["REPORT_ONLY", "FAIL"])
+def test_validate_oracle_b_artifact_dir_rejects_report_only_or_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    install_test_writers(monkeypatch)
+    result, _ = run_fake_oracle(
+        oracle_kind="B",
+        generator=FakeGenerator(constant_clean=0.0),
+        tolerance=0.0,
+    )
+    if mode == "REPORT_ONLY":
+        comparison = m6.compare_latents(result.latent, result.latent, tolerance=None)
+        result = m6.finalize_oracle_gate(result, oracle_a_comparison=comparison)
+    output_dir = tmp_path / f"oracle_b_{mode.lower()}"
+    m6.write_oracle_artifacts(
+        output_dir=output_dir,
+        resolved_config={"oracle": "B"},
+        result=result,
+    )
+
+    with pytest.raises(RuntimeError, match="status"):
+        m6.validate_oracle_b_artifact_dir(
+            output_dir,
+            expected_common_inputs_fingerprint_sha256=result.summary[
+                "common_inputs_fingerprint_sha256"
+            ],
+        )
+
+
+def test_validate_oracle_b_artifact_dir_rejects_fingerprint_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir, _ = write_pass_oracle_b_artifacts(tmp_path, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="fingerprint"):
+        m6.validate_oracle_b_artifact_dir(
+            output_dir,
+            expected_common_inputs_fingerprint_sha256="0" * 64,
+        )
+
+
+def test_validate_oracle_b_artifact_dir_rejects_tampered_latent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir, result = write_pass_oracle_b_artifacts(tmp_path, monkeypatch)
+    latent_path = output_dir / "output_latent.pt"
+    payload = torch.load(latent_path, map_location="cpu", weights_only=False)
+    payload["latent"] = payload["latent"] + 1.0
+    torch.save(payload, latent_path)
+
+    with pytest.raises(RuntimeError, match="SHA256"):
+        m6.validate_oracle_b_artifact_dir(
             output_dir,
             expected_common_inputs_fingerprint_sha256=result.summary[
                 "common_inputs_fingerprint_sha256"

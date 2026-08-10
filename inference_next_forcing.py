@@ -12,11 +12,17 @@ import torch
 
 from utils.nf_sf_m3 import M3_CHUNK_FRAMES, move_tensors_to_device
 from utils.nf_sf_m6 import (
+    M6_ORACLE_D_FIRST_BLOCK_POLICY,
+    M6_ORACLE_D_RNG_CONTRACT_VERSION,
+    M6_ORACLE_D_SCHEMA,
+    M6_ORACLE_D_VISUAL_QUALITY_CONTRACT_VERSION,
     M6_WAN_FRAME_SEQ_LENGTH,
     M6OracleRuntime,
     build_common_inputs,
+    build_oracle_d_mcp_scheduler,
     canonical_json_sha256,
     compare_latents,
+    compare_latents_by_chunk_roles,
     compare_pixel_frames,
     conditioning_json_summary,
     current_git_head,
@@ -25,13 +31,18 @@ from utils.nf_sf_m6 import (
     load_oracle_checkpoint,
     oracle_b_artifact_identity,
     oracle_c_main_quality_contract,
+    oracle_c_manual_review_identity,
+    oracle_d_visual_quality_contract,
     oracle_stdout_payload,
+    resolve_m6_oracle_d_schedule,
     resolve_m6_schedule,
     run_main_only_oracle,
+    run_oracle_d_parallel,
     select_m6_teacher_sample,
     validate_json_payload,
     validate_oracle_a_artifact_dir,
     validate_oracle_b_artifact_dir,
+    validate_oracle_c_manual_review,
     write_oracle_artifacts,
 )
 
@@ -41,9 +52,9 @@ M6_MCP_MODULE_COUNT = 3
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="NF-SF v1 M6.0 controlled four-step Oracle A/B/C entry."
+        description="NF-SF v1 M6.0 controlled four-step Oracle A/B/C/D entry."
     )
-    parser.add_argument("--oracle", required=True, choices=("A", "B", "C"))
+    parser.add_argument("--oracle", required=True, choices=("A", "B", "C", "D"))
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--teacher_manifest", required=True, type=Path)
@@ -69,6 +80,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Required strict PASS Oracle B output directory for Oracle C.",
+    )
+    parser.add_argument(
+        "--oracle_c_dir",
+        type=Path,
+        default=None,
+        help="Required reviewed Oracle C output directory for Oracle D.",
+    )
+    parser.add_argument(
+        "--oracle_c_manual_review_json",
+        type=Path,
+        default=None,
+        help="Required Oracle C manual review sidecar for Oracle D.",
     )
     return parser.parse_args(argv)
 
@@ -97,11 +120,11 @@ def resolved_config_dict(config: Any) -> dict[str, Any]:
 
 def validate_cli_config(config: Any) -> None:
     if bool(config.i2v):
-        raise ValueError("M6.0 Oracle A/B/C supports T2V only")
+        raise ValueError("M6.0 Oracle A/B/C/D supports T2V only")
     if int(config.num_frame_per_block) != M3_CHUNK_FRAMES:
-        raise ValueError("M6.0 Oracle A/B/C requires chunk_frames=3")
+        raise ValueError("M6.0 Oracle A/B/C/D requires chunk_frames=3")
     if int(config.mcp_num_modules) not in (0, M6_MCP_MODULE_COUNT):
-        raise ValueError("M6.0 Oracle B/C formal restore expects three MCP modules")
+        raise ValueError("M6.0 Oracle B/C/D formal restore expects three MCP modules")
 
 
 def validate_oracle_b_cli_contract(args: argparse.Namespace) -> None:
@@ -137,17 +160,56 @@ def validate_oracle_c_cli_contract(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Oracle C requires non-empty Oracle B artifact: {path}")
 
 
+def validate_oracle_d_cli_contract(args: argparse.Namespace) -> None:
+    if args.oracle != "D":
+        return
+    if args.oracle_c_dir is None:
+        raise ValueError("Oracle D requires --oracle_c_dir before output_dir creation")
+    if args.oracle_c_manual_review_json is None:
+        raise ValueError(
+            "Oracle D requires --oracle_c_manual_review_json before output_dir creation"
+        )
+    if not bool(args.decode):
+        raise ValueError("Oracle D canonical quality evidence requires --decode")
+    if args.tolerance is not None:
+        raise ValueError(
+            "Oracle D does not accept --tolerance; "
+            "visual quality requires manual review"
+        )
+    for name in (
+        "oracle_trace.json",
+        "oracle_summary.json",
+        "output_latent.pt",
+        "oracle_c_quality_evidence.json",
+    ):
+        path = args.oracle_c_dir / name
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"Oracle D requires non-empty Oracle C artifact: {path}")
+    for name in ("step0_reference.mp4", "step500_main.mp4"):
+        path = args.oracle_c_dir / "quality" / name
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"Oracle D requires non-empty Oracle C video: {path}")
+    if (
+        not args.oracle_c_manual_review_json.is_file()
+        or args.oracle_c_manual_review_json.stat().st_size <= 0
+    ):
+        raise FileNotFoundError(
+            "Oracle D requires non-empty Oracle C manual review sidecar: "
+            f"{args.oracle_c_manual_review_json}"
+        )
+
+
 def runtime_device(device_arg: str) -> tuple[torch.device, dict[str, Any]]:
     if os.environ.get("WORLD_SIZE", "1") != "1":
-        raise RuntimeError("M6.0 Oracle A/B/C requires WORLD_SIZE == 1")
+        raise RuntimeError("M6.0 Oracle A/B/C/D requires WORLD_SIZE == 1")
     if device_arg != "cuda:0":
-        raise RuntimeError("M6.0 Oracle A/B/C requires --device cuda:0")
+        raise RuntimeError("M6.0 Oracle A/B/C/D requires --device cuda:0")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
     cuda_device_count = int(torch.cuda.device_count())
     if cuda_device_count != 1:
         raise RuntimeError(
-            "M6.0 Oracle A/B/C requires torch.cuda.device_count() == 1, "
+            "M6.0 Oracle A/B/C/D requires torch.cuda.device_count() == 1, "
             f"actual={cuda_device_count}"
         )
     torch.cuda.set_device(0)
@@ -196,7 +258,7 @@ def build_generator(
 
     model_kwargs = dict(getattr(config, "model_kwargs", {}))
     generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
-    if oracle in ("B", "C"):
+    if oracle in ("B", "C", "D"):
         generator.add_mcp_modules(
             num_modules=M6_MCP_MODULE_COUNT,
             num_layers=int(config.mcp_num_layers),
@@ -373,6 +435,107 @@ def save_oracle_c_quality_evidence(
     return evidence
 
 
+def save_oracle_d_quality_evidence(
+    *,
+    d_result,
+    oracle_c_artifacts,
+    latent_comparison: dict[str, Any],
+    output_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    fps: int,
+) -> dict[str, Any]:
+    from utils.nf_sf_m3 import atomic_json_write, tensor_sha256
+    from utils.wan_wrapper import WanVAEWrapper
+
+    quality_dir = output_dir / "quality"
+    quality_dir.mkdir(parents=True, exist_ok=True)
+    vae = WanVAEWrapper().eval().requires_grad_(False)
+    vae.to(device=device, dtype=dtype)
+    try:
+        reference_frames = decode_latent_to_video_frames(
+            vae,
+            oracle_c_artifacts.latent,
+            device=device,
+            dtype=dtype,
+        )
+        parallel_frames = decode_latent_to_video_frames(
+            vae,
+            d_result.latent,
+            device=device,
+            dtype=dtype,
+        )
+    finally:
+        vae.to("cpu")
+        del vae
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    reference_path = quality_dir / "step500_main_reference.mp4"
+    parallel_path = quality_dir / "step500_depth1_parallel.mp4"
+    write_video_frames(reference_path, reference_frames, fps=fps)
+    write_video_frames(parallel_path, parallel_frames, fps=fps)
+
+    pixel_comparison = compare_pixel_frames(
+        parallel_frames.detach().cpu(),
+        reference_frames.detach().cpu(),
+    )
+    main_current_chunks = [
+        int(chunk)
+        for chunk in d_result.summary.get("main_current_chunks", [])
+        if int(chunk) != 0
+    ]
+    role_chunks = {
+        "bootstrap": [0],
+        "main_current": main_current_chunks,
+        "mcp_next": [
+            int(chunk)
+            for chunk in d_result.summary.get("accepted_mcp_next_chunks", [])
+        ],
+    }
+    role_metrics = compare_latents_by_chunk_roles(
+        d_result.latent,
+        oracle_c_artifacts.latent,
+        chunk_frames=M3_CHUNK_FRAMES,
+        role_chunks=role_chunks,
+    )
+    evidence = {
+        "schema": "nf_sf_m6_oracle_d_quality_evidence_v1",
+        "quality_contract_version": M6_ORACLE_D_VISUAL_QUALITY_CONTRACT_VERSION,
+        "quality_contract": oracle_d_visual_quality_contract(),
+        "common_inputs_fingerprint_sha256": d_result.summary[
+            "common_inputs_fingerprint_sha256"
+        ],
+        "oracle_c_manual_review": oracle_c_manual_review_identity(oracle_c_artifacts),
+        "c_latent_sha256": oracle_c_artifacts.latent_sha256,
+        "d_latent_sha256": tensor_sha256(d_result.latent),
+        "shared_checkpoint_sha256": d_result.summary["checkpoint"]["sha256"],
+        "d_rng_contract_version": M6_ORACLE_D_RNG_CONTRACT_VERSION,
+        "latent_comparison": dict(latent_comparison),
+        "role_aware_latent_metrics": role_metrics,
+        "pixel_comparison": pixel_comparison,
+        "videos": {
+            "step500_main_reference": {
+                "path": str(reference_path.resolve()),
+                "sha256": file_sha256(reference_path),
+                "fps": int(fps),
+            },
+            "step500_depth1_parallel": {
+                "path": str(parallel_path.resolve()),
+                "sha256": file_sha256(parallel_path),
+                "fps": int(fps),
+            },
+        },
+        "visual_quality_pass": None,
+        "visual_review_status": "PENDING",
+        "runtime_measurement_status": "NOT_MEASURED",
+    }
+    validate_json_payload(evidence)
+    atomic_json_write(evidence, output_dir / "oracle_d_quality_evidence.json")
+    return evidence
+
+
 def decode_latent_to_video_frames(
     vae,
     latent: torch.Tensor,
@@ -403,13 +566,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch.set_grad_enabled(False)
     validate_oracle_b_cli_contract(args)
     validate_oracle_c_cli_contract(args)
+    validate_oracle_d_cli_contract(args)
 
     device, device_runtime_contract = runtime_device(args.device)
     dtype = dtype_from_arg(args.dtype)
     git_sha = current_git_head()
     config = merge_config(args.config)
     validate_cli_config(config)
-    schedule = resolve_m6_schedule(config)
+    base_common_schedule = resolve_m6_schedule(config)
+    schedule = (
+        resolve_m6_oracle_d_schedule(config)
+        if args.oracle == "D"
+        else base_common_schedule
+    )
     resolved_config = resolved_config_dict(config)
     resolved_config_sha = canonical_json_sha256(resolved_config)
 
@@ -444,7 +613,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         teacher_payload=teacher_sample.payload,
         source_noise=source_noise,
         conditioning_summary=conditioning_summary,
-        schedule=schedule,
+        schedule=base_common_schedule,
         rollout_seed=int(teacher_sample.payload["rollout_seed"]),
         context_noise=int(config.context_noise),
         chunk_frames=int(config.num_frame_per_block),
@@ -455,6 +624,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     oracle_a_artifacts = None
     oracle_b_artifacts = None
+    oracle_c_artifacts = None
     if args.oracle == "B":
         assert args.oracle_a_dir is not None
         oracle_a_artifacts = validate_oracle_a_artifact_dir(
@@ -476,6 +646,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         oracle_kind=args.oracle,
         expected_official_sha256=expected_official_sha if args.oracle == "A" else None,
     )
+    if args.oracle == "D":
+        assert args.oracle_c_dir is not None
+        assert args.oracle_c_manual_review_json is not None
+        oracle_c_artifacts = validate_oracle_c_manual_review(
+            args.oracle_c_dir,
+            args.oracle_c_manual_review_json,
+            expected_common_inputs_fingerprint_sha256=common_fingerprint,
+            expected_checkpoint_sha256=checkpoint.sha256,
+        )
     generator = build_generator(
         oracle=args.oracle,
         config=config,
@@ -488,21 +667,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         config=config,
         source_noise=source_noise,
     )
-    result = run_main_only_oracle(
-        oracle_kind=args.oracle,
-        runtime=runtime,
-        source_noise=source_noise,
-        teacher_payload=teacher_sample.payload,
-        teacher_metadata=teacher_sample.metadata,
-        conditional_dict=conditional_dict,
-        schedule=schedule,
-        checkpoint=checkpoint,
-        git_sha=git_sha,
-        resolved_config_canonical_sha256=resolved_config_sha,
-        device_runtime_contract=device_runtime_contract,
-        expected_common_inputs=common_inputs,
-        tolerance=None if args.oracle == "C" else args.tolerance,
-    )
+    if args.oracle == "D":
+        assert oracle_c_artifacts is not None
+        mcp_scheduler = build_oracle_d_mcp_scheduler(device=device)
+        result = run_oracle_d_parallel(
+            runtime=runtime,
+            mcp_scheduler=mcp_scheduler,
+            source_noise=source_noise,
+            teacher_payload=teacher_sample.payload,
+            teacher_metadata=teacher_sample.metadata,
+            conditional_dict=conditional_dict,
+            schedule=schedule,
+            checkpoint=checkpoint,
+            git_sha=git_sha,
+            resolved_config_canonical_sha256=resolved_config_sha,
+            device_runtime_contract=device_runtime_contract,
+            oracle_c_manual_review=oracle_c_manual_review_identity(
+                oracle_c_artifacts
+            ),
+            expected_oracle_c_rng_trace=oracle_c_artifacts.trace,
+            expected_common_inputs=common_inputs,
+        )
+    else:
+        result = run_main_only_oracle(
+            oracle_kind=args.oracle,
+            runtime=runtime,
+            source_noise=source_noise,
+            teacher_payload=teacher_sample.payload,
+            teacher_metadata=teacher_sample.metadata,
+            conditional_dict=conditional_dict,
+            schedule=schedule,
+            checkpoint=checkpoint,
+            git_sha=git_sha,
+            resolved_config_canonical_sha256=resolved_config_sha,
+            device_runtime_contract=device_runtime_contract,
+            expected_common_inputs=common_inputs,
+            tolerance=None if args.oracle == "C" else args.tolerance,
+        )
 
     comparison = None
     if args.oracle == "B":
@@ -527,6 +728,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "actual_oracle": "C",
             "expected_oracle": "B",
         }
+    if args.oracle == "D":
+        assert oracle_c_artifacts is not None
+        comparison = compare_latents(
+            result.latent,
+            oracle_c_artifacts.latent,
+            tolerance=None,
+            chunk_frames=M3_CHUNK_FRAMES,
+        )
+        comparison = {
+            **comparison,
+            "comparison_kind": "oracle_d_depth1_parallel_vs_oracle_c_step500_main",
+            "actual_oracle": "D",
+            "expected_oracle": "C",
+        }
     result = finalize_oracle_gate(
         result,
         oracle_a_comparison=comparison if args.oracle == "B" else None,
@@ -536,6 +751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if oracle_b_artifacts is not None
             else None
         ),
+        oracle_c_comparison=comparison if args.oracle == "D" else None,
     )
 
     resolved_payload = {
@@ -572,10 +788,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if args.oracle_b_dir is None
                     else str(args.oracle_b_dir.resolve())
                 ),
+                "oracle_c_dir": (
+                    None
+                    if args.oracle_c_dir is None
+                    else str(args.oracle_c_dir.resolve())
+                ),
+                "oracle_c_manual_review_json": (
+                    None
+                    if args.oracle_c_manual_review_json is None
+                    else str(args.oracle_c_manual_review_json.resolve())
+                ),
                 "oracle_c_tolerance_applies_to_quality": False,
+                "oracle_d_tolerance_applies_to_quality": False,
             },
             "oracle_c_main_quality_contract": (
                 oracle_c_main_quality_contract() if args.oracle == "C" else None
+            ),
+            "oracle_d": (
+                {
+                    "schema": M6_ORACLE_D_SCHEMA,
+                    "first_block_policy": M6_ORACLE_D_FIRST_BLOCK_POLICY,
+                    "rng_contract_version": M6_ORACLE_D_RNG_CONTRACT_VERSION,
+                    "visual_quality_contract": oracle_d_visual_quality_contract(),
+                }
+                if args.oracle == "D"
+                else None
             ),
         },
     }
@@ -600,6 +837,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         artifact_hashes["oracle_c_quality_evidence_json_sha256"] = file_sha256(
             args.output_dir / "oracle_c_quality_evidence.json"
+        )
+    elif args.decode and args.oracle == "D":
+        assert oracle_c_artifacts is not None
+        assert comparison is not None
+        save_oracle_d_quality_evidence(
+            d_result=result,
+            oracle_c_artifacts=oracle_c_artifacts,
+            latent_comparison=comparison,
+            output_dir=args.output_dir,
+            device=device,
+            dtype=dtype,
+            fps=args.fps,
+        )
+        artifact_hashes["oracle_d_quality_evidence_json_sha256"] = file_sha256(
+            args.output_dir / "oracle_d_quality_evidence.json"
         )
     elif args.decode:
         save_decoded_video(

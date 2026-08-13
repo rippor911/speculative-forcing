@@ -1,4 +1,5 @@
 import types
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 import torch
@@ -15,6 +16,21 @@ from wan.modules.mcp import MCPStack, MCP_INPUT_TIMESTEP
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WAN_MODELS_ROOT = REPO_ROOT / "wan_models"
+FULL_SEQUENCE_FRAME_SEQ_LENGTH = 1560
+FULL_SEQUENCE_CHUNK_FRAMES = 3
+FULL_SEQUENCE_NUM_CHUNKS = 7
+FULL_SEQUENCE_DEPTHS = (1, 2, 3)
+FULL_SEQUENCE_FUTURE_EMBEDDING_ORDER = "depth_major"
+
+
+@dataclass(frozen=True)
+class FullSequenceNFSFModelOutputs:
+    main_flow_pred: torch.Tensor
+    mcp_flow_preds_by_depth: tuple[torch.Tensor, ...]
+    tap_shapes: tuple[tuple[int, ...], ...]
+    anchor_token_slices: tuple[tuple[int, int], ...]
+    future_embedding_order: str = FULL_SEQUENCE_FUTURE_EMBEDDING_ORDER
+    main_backbone_forward_count: int = 1
 
 
 def drop_mcp_weights(state_dict: dict) -> dict:
@@ -164,6 +180,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # Multi-Chunk Prediction heads; opt-in via add_mcp_modules().
         self.mcp = None
         self.mcp_tap_layers = None
+        self.mcp_initialized_from_backbone = False
 
         self.post_init()
 
@@ -228,6 +245,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.mcp.init_from_backbone(m.blocks)
         self.mcp.requires_grad_(True)
         self.mcp_tap_layers = tuple(tap_layers)
+        self.mcp_initialized_from_backbone = True
 
     def adding_cls_branch(self, atten_dim=1536, num_class=4, time_embed_dim=0) -> None:
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
@@ -299,6 +317,213 @@ class WanDiffusionWrapper(torch.nn.Module):
         sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
         flow_pred = (xt - x0_pred) / sigma_t
         return flow_pred.to(original_dtype)
+
+    def forward_full_sequence_next_forcing(
+        self,
+        *,
+        noisy_image_or_video: torch.Tensor,
+        clean_x: torch.Tensor,
+        conditional_dict: dict,
+        timestep_main: torch.Tensor,
+        mcp_anchor_inputs=(),
+        aug_t: Optional[torch.Tensor] = None,
+    ) -> FullSequenceNFSFModelOutputs:
+        """Training-only full-sequence Next-Forcing route.
+
+        The main teacher-forced backbone runs exactly once over clean21+noisy21.
+        All valid MCP future chunks are embedded by the backbone's shared
+        patch_embedding inside that same model forward, then this wrapper slices
+        noisy-half taps and runs the existing single-chunk MCP chain per anchor.
+        """
+        if clean_x is None:
+            raise ValueError("full-sequence Next-Forcing requires clean_x")
+        if tuple(clean_x.shape) != tuple(noisy_image_or_video.shape):
+            raise ValueError("clean_x and noisy_image_or_video must have the same shape")
+        if noisy_image_or_video.ndim != 5:
+            raise ValueError("full-sequence tensors must have shape [B, F, C, H, W]")
+        if noisy_image_or_video.shape[1] != FULL_SEQUENCE_CHUNK_FRAMES * FULL_SEQUENCE_NUM_CHUNKS:
+            raise ValueError("full-sequence Next-Forcing requires 21 latent frames")
+        if tuple(timestep_main.shape) != tuple(noisy_image_or_video.shape[:2]):
+            raise ValueError("timestep_main must have shape [B, 21]")
+        if int(getattr(self.model, "num_frame_per_block", 0)) != FULL_SEQUENCE_CHUNK_FRAMES:
+            raise ValueError("model.num_frame_per_block must be 3")
+
+        anchors = tuple(mcp_anchor_inputs or ())
+        run_mcp = bool(anchors)
+        if run_mcp:
+            if self.mcp is None:
+                raise ValueError("MCP anchor inputs require add_mcp_modules()")
+            if self.mcp_tap_layers is None:
+                raise ValueError("mcp_tap_layers missing; call add_mcp_modules() first")
+
+        if self.uniform_timestep:
+            input_timestep = timestep_main[:, 0]
+        else:
+            input_timestep = timestep_main
+
+        prompt_embeds = conditional_dict["prompt_embeds"]
+        if aug_t is None:
+            aug_t = torch.zeros_like(timestep_main)
+
+        mcp_patch_inputs = None
+        flat_mcp_entries = ()
+        if run_mcp:
+            flat_mcp_entries = self._flatten_full_sequence_mcp_anchor_inputs(anchors)
+            mcp_patch_inputs = [
+                entry["future_noise"].permute(0, 2, 1, 3, 4)
+                for entry in flat_mcp_entries
+            ]
+
+        model_kwargs = {}
+        if run_mcp:
+            model_kwargs = {
+                "return_features": self.mcp_tap_layers,
+                "mcp_patch_inputs": mcp_patch_inputs,
+            }
+
+        out = self.model(
+            noisy_image_or_video.permute(0, 2, 1, 3, 4),
+            t=input_timestep,
+            context=prompt_embeds,
+            seq_len=self.seq_len,
+            clean_x=clean_x.permute(0, 2, 1, 3, 4),
+            aug_t=aug_t,
+            **model_kwargs,
+        )
+
+        if run_mcp:
+            main_flow_pred, aux = out
+            mcp_flow_preds_by_depth, tap_shapes, anchor_slices = (
+                self._run_full_sequence_anchor_mcp(
+                    aux=aux,
+                    anchors=anchors,
+                    flat_mcp_entries=flat_mcp_entries,
+                )
+            )
+        else:
+            main_flow_pred = out
+            mcp_flow_preds_by_depth = ()
+            tap_shapes = ()
+            anchor_slices = self._full_sequence_anchor_token_slices()
+
+        return FullSequenceNFSFModelOutputs(
+            main_flow_pred=main_flow_pred.permute(0, 2, 1, 3, 4),
+            mcp_flow_preds_by_depth=mcp_flow_preds_by_depth,
+            tap_shapes=tap_shapes,
+            anchor_token_slices=anchor_slices,
+        )
+
+    def _flatten_full_sequence_mcp_anchor_inputs(self, anchors) -> tuple[dict, ...]:
+        entries = []
+        for depth in FULL_SEQUENCE_DEPTHS:
+            for anchor in anchors:
+                anchor_index = int(self._anchor_value(anchor, "anchor_index"))
+                depths = tuple(int(value) for value in self._anchor_value(anchor, "depths"))
+                if depth not in depths:
+                    continue
+                local_index = depths.index(depth)
+                future_noises = tuple(self._anchor_value(anchor, "future_noises"))
+                future_start_frames = tuple(self._anchor_value(anchor, "future_start_frames"))
+                timesteps = tuple(self._anchor_value(anchor, "timesteps"))
+                future_noise = future_noises[local_index]
+                timestep = timesteps[local_index]
+                if future_noise.shape[1] != FULL_SEQUENCE_CHUNK_FRAMES:
+                    raise ValueError("each MCP future noise must be one 3-frame chunk")
+                if tuple(timestep.shape) != tuple(future_noise.shape[:2]):
+                    raise ValueError("each MCP timestep must have shape [B, 3]")
+                entries.append(
+                    {
+                        "anchor_index": anchor_index,
+                        "depth": depth,
+                        "future_noise": future_noise,
+                        "future_start_frame": int(future_start_frames[local_index]),
+                    }
+                )
+        expected = sum(FULL_SEQUENCE_NUM_CHUNKS - depth for depth in FULL_SEQUENCE_DEPTHS)
+        if len(entries) != expected:
+            raise ValueError(f"full-sequence MCP expected {expected} valid futures")
+        for flat_index, entry in enumerate(entries):
+            entry["flat_index"] = flat_index
+        return tuple(entries)
+
+    def _run_full_sequence_anchor_mcp(self, *, aux, anchors, flat_mcp_entries):
+        features = tuple(aux["features"])
+        if len(features) != len(self.mcp_tap_layers):
+            raise ValueError("MCP feature tap count mismatch")
+        embeds = tuple(aux["mcp_embeds"])
+        grids = tuple(aux["mcp_grid_sizes"])
+        if len(embeds) != len(flat_mcp_entries) or len(grids) != len(flat_mcp_entries):
+            raise ValueError("embedded MCP future count mismatch")
+
+        embed_index = {
+            (int(entry["anchor_index"]), int(entry["depth"])): index
+            for index, entry in enumerate(flat_mcp_entries)
+        }
+        flow_preds_by_depth = {depth: [] for depth in FULL_SEQUENCE_DEPTHS}
+        for anchor in anchors:
+            anchor_index = int(self._anchor_value(anchor, "anchor_index"))
+            token_slice = self._full_sequence_anchor_token_slice(anchor_index)
+            anchor_features = tuple(feature[:, token_slice, :] for feature in features)
+            depths = tuple(int(value) for value in self._anchor_value(anchor, "depths"))
+            starts = tuple(int(value) for value in self._anchor_value(anchor, "future_start_frames"))
+            timesteps = tuple(self._anchor_value(anchor, "timesteps"))
+
+            future_embeds = []
+            future_grids = []
+            for depth in depths:
+                index = embed_index[(anchor_index, depth)]
+                future_embeds.append(embeds[index])
+                future_grids.append(grids[index])
+
+            flow_preds = self.mcp(
+                features=anchor_features,
+                future_embeds=future_embeds,
+                future_grid_sizes=future_grids,
+                future_start_frames=list(starts),
+                timesteps=list(timesteps),
+                freqs=self.model.freqs,
+            )
+            if len(flow_preds) != len(depths):
+                raise RuntimeError("MCP chain output count mismatch for anchor")
+            for depth, pred in zip(depths, flow_preds):
+                flow_preds_by_depth[depth].append(pred.permute(0, 2, 1, 3, 4))
+
+        stacked = []
+        for depth in FULL_SEQUENCE_DEPTHS:
+            preds = flow_preds_by_depth[depth]
+            expected_count = FULL_SEQUENCE_NUM_CHUNKS - depth
+            if len(preds) != expected_count:
+                raise RuntimeError(
+                    f"MCP depth {depth} expected {expected_count} anchors, got {len(preds)}"
+                )
+            stacked.append(torch.stack(preds, dim=1))
+        tap_shapes = tuple(tuple(int(dim) for dim in feature.shape) for feature in features)
+        anchor_slices = self._full_sequence_anchor_token_slices()
+        return tuple(stacked), tap_shapes, tuple(anchor_slices)
+
+    @staticmethod
+    def _full_sequence_anchor_token_slice(anchor_index: int) -> slice:
+        if not (0 <= int(anchor_index) < FULL_SEQUENCE_NUM_CHUNKS):
+            raise ValueError("anchor_index out of range for full-sequence v1")
+        chunk_tokens = FULL_SEQUENCE_FRAME_SEQ_LENGTH * FULL_SEQUENCE_CHUNK_FRAMES
+        start = int(anchor_index) * chunk_tokens
+        return slice(start, start + chunk_tokens)
+
+    @classmethod
+    def _full_sequence_anchor_token_slices(cls) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (
+                cls._full_sequence_anchor_token_slice(index).start,
+                cls._full_sequence_anchor_token_slice(index).stop,
+            )
+            for index in range(FULL_SEQUENCE_NUM_CHUNKS)
+        )
+
+    @staticmethod
+    def _anchor_value(anchor, key: str):
+        if isinstance(anchor, dict):
+            return anchor[key]
+        return getattr(anchor, key)
 
     def forward(
         self,

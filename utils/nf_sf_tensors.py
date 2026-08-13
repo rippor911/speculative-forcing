@@ -9,6 +9,11 @@ MAX_FUTURE_DEPTH = 3
 DEFAULT_S_MAIN = 5.0
 DEFAULT_S_MCP = 10.0
 DEFAULT_NUM_TRAIN_TIMESTEPS = 1000
+FULL_SEQUENCE_FRAME_COUNT = 21
+FULL_SEQUENCE_CHUNK_FRAMES = 3
+FULL_SEQUENCE_NUM_CHUNKS = 7
+FULL_SEQUENCE_DEPTHS = (1, 2, 3)
+FULL_SEQUENCE_RNG_DRAW_ORDER_VERSION = "nf_sf_full_sequence_rng_v1"
 
 
 def make_generator(seed: int, device: torch.device | str) -> torch.Generator:
@@ -40,6 +45,17 @@ class NFSFTensorInputs:
     main_target: torch.Tensor
     future_targets: tuple[FutureChunkTarget, ...]
     samples: NFSFTensorSamples
+
+
+@dataclass(frozen=True)
+class NFSFFullSequenceTensorSamples:
+    epsilon_main: torch.Tensor
+    epsilon_mcp_depths: tuple[torch.Tensor, ...]
+    raw_timestep_main: torch.Tensor
+    raw_timestep_mcp_depths: tuple[torch.Tensor, ...]
+    timestep_main: torch.Tensor
+    timestep_mcp_depths: tuple[torch.Tensor, ...]
+    rng_draw_order_version: str = FULL_SEQUENCE_RNG_DRAW_ORDER_VERSION
 
 
 def make_cpu_generator(seed: int) -> torch.Generator:
@@ -214,6 +230,141 @@ def sample_nf_sf_noise_and_timesteps(
     )
 
 
+def full_sequence_num_chunks(
+    *,
+    num_frames: int = FULL_SEQUENCE_FRAME_COUNT,
+    chunk_frames: int = FULL_SEQUENCE_CHUNK_FRAMES,
+) -> int:
+    _validate_chunk_frames(chunk_frames)
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive")
+    if num_frames % chunk_frames != 0:
+        raise ValueError("num_frames must be divisible by chunk_frames")
+    return num_frames // chunk_frames
+
+
+def full_sequence_mcp_anchor_counts(
+    *,
+    num_chunks: int = FULL_SEQUENCE_NUM_CHUNKS,
+    depths: Iterable[int] = FULL_SEQUENCE_DEPTHS,
+) -> tuple[int, ...]:
+    if num_chunks <= 0:
+        raise ValueError("num_chunks must be positive")
+    normalized_depths = _normalize_depths(depths)
+    return tuple(max(num_chunks - depth, 0) for depth in normalized_depths)
+
+
+def expand_raw_chunk_timesteps(
+    raw_timesteps: torch.Tensor,
+    *,
+    chunk_frames: int,
+    shift: float,
+    num_train_timesteps: int = DEFAULT_NUM_TRAIN_TIMESTEPS,
+) -> torch.Tensor:
+    _validate_chunk_frames(chunk_frames)
+    if not torch.is_tensor(raw_timesteps):
+        raise TypeError("raw_timesteps must be a torch.Tensor")
+    if raw_timesteps.ndim != 2:
+        raise ValueError("raw_timesteps must have shape [B, chunks]")
+    if raw_timesteps.dtype != torch.int64:
+        raise ValueError("raw_timesteps must use int64 dtype")
+    if bool((raw_timesteps < 0).any().item()) or bool(
+        (raw_timesteps >= num_train_timesteps).any().item()
+    ):
+        raise ValueError("raw_timesteps must be in [0, num_train_timesteps)")
+    shifted = flow_match_shift_timesteps(
+        raw_timesteps,
+        shift=shift,
+        num_train_timesteps=num_train_timesteps,
+    )
+    return shifted.unsqueeze(-1).expand(-1, -1, chunk_frames).contiguous()
+
+
+def sample_nf_sf_full_sequence_noise_and_timesteps(
+    target_latent: torch.Tensor,
+    *,
+    chunk_frames: int = FULL_SEQUENCE_CHUNK_FRAMES,
+    depths: Iterable[int] = FULL_SEQUENCE_DEPTHS,
+    s_main: float = DEFAULT_S_MAIN,
+    s_mcp: float = DEFAULT_S_MCP,
+    generator: torch.Generator | None = None,
+    chunk_axis: int = LATENT_FRAME_AXIS,
+    num_train_timesteps: int = DEFAULT_NUM_TRAIN_TIMESTEPS,
+) -> NFSFFullSequenceTensorSamples:
+    num_frames = _validate_latent_chunks(target_latent, chunk_frames, chunk_axis)
+    _validate_random_device(device=target_latent.device, generator=generator)
+    normalized_depths = _normalize_depths(depths)
+    if not target_latent.is_floating_point():
+        raise ValueError("target_latent must use a floating dtype to sample noise")
+
+    batch_size = target_latent.shape[0]
+    num_chunks = num_frames // chunk_frames
+    channel_tail = tuple(target_latent.shape[2:])
+
+    # Locked draw order: all epsilons first, then all raw timestep ids.
+    epsilon_main = _randn_like(target_latent, generator=generator)
+    epsilon_mcp_depths = []
+    for count in full_sequence_mcp_anchor_counts(
+        num_chunks=num_chunks,
+        depths=normalized_depths,
+    ):
+        epsilon_mcp_depths.append(
+            torch.randn(
+                (batch_size, count, chunk_frames, *channel_tail),
+                dtype=target_latent.dtype,
+                device=target_latent.device,
+                generator=generator,
+            )
+        )
+
+    raw_timestep_main = _sample_raw_chunk_timesteps(
+        batch_size=batch_size,
+        num_chunks=num_chunks,
+        device=target_latent.device,
+        generator=generator,
+        num_train_timesteps=num_train_timesteps,
+    )
+    raw_timestep_mcp_depths = []
+    for count in full_sequence_mcp_anchor_counts(
+        num_chunks=num_chunks,
+        depths=normalized_depths,
+    ):
+        raw_timestep_mcp_depths.append(
+            _sample_raw_chunk_timesteps(
+                batch_size=batch_size,
+                num_chunks=count,
+                device=target_latent.device,
+                generator=generator,
+                num_train_timesteps=num_train_timesteps,
+            )
+        )
+
+    timestep_main = expand_raw_chunk_timesteps(
+        raw_timestep_main,
+        chunk_frames=chunk_frames,
+        shift=s_main,
+        num_train_timesteps=num_train_timesteps,
+    ).reshape(batch_size, num_frames)
+    timestep_mcp_depths = tuple(
+        expand_raw_chunk_timesteps(
+            raw,
+            chunk_frames=chunk_frames,
+            shift=s_mcp,
+            num_train_timesteps=num_train_timesteps,
+        )
+        for raw in raw_timestep_mcp_depths
+    )
+
+    return NFSFFullSequenceTensorSamples(
+        epsilon_main=epsilon_main,
+        epsilon_mcp_depths=tuple(epsilon_mcp_depths),
+        raw_timestep_main=raw_timestep_main,
+        raw_timestep_mcp_depths=tuple(raw_timestep_mcp_depths),
+        timestep_main=timestep_main,
+        timestep_mcp_depths=timestep_mcp_depths,
+    )
+
+
 def prepare_nf_sf_tensor_inputs(
     main_target: torch.Tensor,
     *,
@@ -275,6 +426,30 @@ def _randn_like(
         latent.shape,
         dtype=latent.dtype,
         device=latent.device,
+        generator=generator,
+    )
+
+
+def _sample_raw_chunk_timesteps(
+    *,
+    batch_size: int,
+    num_chunks: int,
+    device: torch.device | str,
+    generator: torch.Generator | None,
+    num_train_timesteps: int,
+) -> torch.Tensor:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_chunks < 0:
+        raise ValueError("num_chunks must be non-negative")
+    if num_train_timesteps <= 0:
+        raise ValueError("num_train_timesteps must be positive")
+    return torch.randint(
+        0,
+        num_train_timesteps,
+        (batch_size, num_chunks),
+        device=device,
+        dtype=torch.int64,
         generator=generator,
     )
 

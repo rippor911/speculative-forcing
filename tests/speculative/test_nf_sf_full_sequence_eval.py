@@ -354,6 +354,27 @@ def preflight_facts(**overrides) -> dict:
     return facts
 
 
+def test_repo_preflight_facts_computes_output_inside_repo(monkeypatch) -> None:
+    repo_root = Path("D:/repo")
+    monkeypatch.setattr(ev, "git_top_level", lambda: repo_root)
+    monkeypatch.setattr(ev, "current_git_head", lambda: RUNTIME_GIT_SHA)
+    monkeypatch.setattr(ev, "git_changed_paths", lambda *, cached: ())
+
+    outside = ev.repo_preflight_facts(
+        expected_runtime_git_sha=RUNTIME_GIT_SHA,
+        output_dir=Path("D:/eval-output"),
+        repo_root=repo_root,
+    )
+    inside = ev.repo_preflight_facts(
+        expected_runtime_git_sha=RUNTIME_GIT_SHA,
+        output_dir=repo_root / "eval-output",
+        repo_root=repo_root,
+    )
+
+    assert outside["output_dir_inside_repo"] is False
+    assert inside["output_dir_inside_repo"] is True
+
+
 def test_repo_preflight_runtime_git_mismatch_rejects() -> None:
     with pytest.raises(RuntimeError, match="runtime git SHA"):
         ev.validate_repo_preflight_facts(

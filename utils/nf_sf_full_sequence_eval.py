@@ -235,7 +235,7 @@ def repo_preflight_facts(
         "tracked_worktree_dirty_paths": list(git_changed_paths(cached=False)),
         "staged_index_dirty_paths": list(git_changed_paths(cached=True)),
         "output_dir": str(out),
-        "output_dir_inside_repo": _path_is_relative_to(out, root),
+        "output_dir_inside_repo": out.is_relative_to(root),
     }
 
 

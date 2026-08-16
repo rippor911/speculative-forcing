@@ -38,6 +38,7 @@ EVAL_COMMON_INPUTS_SCHEMA = "nf_sf_full_sequence_deployment_common_inputs_v1"
 EVAL_MODE_OUTPUT_SCHEMA = "nf_sf_full_sequence_deployment_mode_output_v1"
 EVAL_COMPARISON_SCHEMA = "nf_sf_full_sequence_deployment_comparison_v1"
 EVAL_RNG_PLAN_SCHEMA = "nf_sf_full_sequence_deployment_rng_plan_v1"
+HISTORY_DIAGNOSTIC_SCHEMA = "nf_sf_full_sequence_history_intervention_diagnostic_v1"
 CHECKPOINT_VALIDATION_SCHEMA = "nf_sf_full_sequence_checkpoint_validation_v1"
 TRAINING_CHECKPOINT_GIT_SHA = "2ab9b3a7c08b09140b6cbae23df21107817fe3be"
 EXPECTED_CANONICAL_GIT_SHA = TRAINING_CHECKPOINT_GIT_SHA
@@ -67,7 +68,24 @@ MCP_DEPLOYMENT_SCHEDULE = (
 MODE_OFFICIAL_MAIN = "official_main"
 MODE_TRAINED_MAIN = "trained_main"
 MODE_TRAINED_MCP1 = "trained_mcp1"
-EvalMode = Literal["official_main", "trained_main", "trained_mcp1"]
+DIAG_MODE_TRAINED_MAIN_REFERENCE = "trained_main_reference"
+DIAG_MODE_MCP1_LIVE_HISTORY = "mcp1_live_history"
+DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR = "mcp1_main_history_repair"
+DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE = "mcp1_teacher_history_oracle"
+DIAGNOSTIC_MCP_MODES = (
+    DIAG_MODE_MCP1_LIVE_HISTORY,
+    DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR,
+    DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE,
+)
+EvalMode = Literal[
+    "official_main",
+    "trained_main",
+    "trained_mcp1",
+    "trained_main_reference",
+    "mcp1_live_history",
+    "mcp1_main_history_repair",
+    "mcp1_teacher_history_oracle",
+]
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_MEASUREMENT_STATUS = "SANITY_ONLY_NOT_BENCHMARK"
 
@@ -840,8 +858,15 @@ def run_main_only_deployment(
     common_inputs: Mapping[str, Any],
     common_inputs_fingerprint_sha256: str,
 ) -> DeploymentResult:
-    if mode not in (MODE_OFFICIAL_MAIN, MODE_TRAINED_MAIN):
-        raise ValueError("main-only deployment requires official_main or trained_main mode")
+    if mode not in (
+        MODE_OFFICIAL_MAIN,
+        MODE_TRAINED_MAIN,
+        DIAG_MODE_TRAINED_MAIN_REFERENCE,
+    ):
+        raise ValueError(
+            "main-only deployment requires official_main, trained_main, "
+            "or trained_main_reference mode"
+        )
     elapsed_start = time.perf_counter()
     _validate_runtime(runtime)
     _validate_source_noise(source_noise, teacher_payload=teacher_payload)
@@ -1004,6 +1029,701 @@ def run_mcp1_deployment(
     )
 
 
+def run_mcp1_history_intervention_deployment(
+    *,
+    mode: EvalMode,
+    runtime: DeploymentRuntime,
+    mcp_scheduler: Any,
+    source_noise: torch.Tensor,
+    teacher_payload: Mapping[str, Any],
+    teacher_metadata: Mapping[str, Any],
+    conditional_dict: Mapping[str, Any],
+    checkpoint: DeploymentCheckpointRecord,
+    git_sha: str,
+    common_inputs: Mapping[str, Any],
+    common_inputs_fingerprint_sha256: str,
+    history_recache_tensor: torch.Tensor | None,
+    history_source: str,
+) -> DeploymentResult:
+    if mode not in DIAGNOSTIC_MCP_MODES:
+        raise ValueError("history intervention runner requires a diagnostic MCP mode")
+    if mode == DIAG_MODE_MCP1_LIVE_HISTORY:
+        if history_recache_tensor is not None:
+            raise RuntimeError("live history intervention must not receive history tensor")
+        if str(history_source) != "generated_output":
+            raise RuntimeError("live history intervention must recache generated output")
+    else:
+        if history_recache_tensor is None:
+            raise RuntimeError("repair/oracle intervention requires history tensor")
+        validate_history_recache_tensor(
+            history_recache_tensor,
+            source_noise=source_noise,
+            name=f"{mode}.history_recache_tensor",
+        )
+    history_provenance = _history_recache_provenance(
+        history_recache_tensor,
+        source_noise=source_noise,
+    )
+    elapsed_start = time.perf_counter()
+    _validate_runtime(runtime)
+    _validate_source_noise(source_noise, teacher_payload=teacher_payload)
+    if not hasattr(mcp_scheduler, "add_noise") or not hasattr(mcp_scheduler, "step"):
+        raise TypeError("mcp_scheduler must provide add_noise and step")
+    schedule = resolve_deployment_schedule()
+    rng_plan = build_absolute_chunk_rng_plan(
+        source_noise=source_noise,
+        rollout_seed=int(teacher_payload["rollout_seed"]),
+        num_denoising_steps=len(schedule.raw_schedule),
+        chunk_frames=int(runtime.num_frame_per_block),
+    )
+    output = torch.empty_like(source_noise)
+    chunks: list[dict[str, Any]] = []
+    rounds: list[dict[str, Any]] = []
+    counts = {
+        "main_solver_forward_count": 0,
+        "mcp_call_count": 0,
+        "mcp_depth1_call_count": 0,
+        "mcp_depth2_call_count": 0,
+        "mcp_depth3_call_count": 0,
+        "clean_recache_forward_count": 0,
+        "returned_mcp_output_count": 0,
+    }
+    plan = build_mcp1_execution_plan()
+    runtime.generator.eval()
+    with torch.no_grad():
+        for item in plan:
+            phase = str(item["phase"])
+            if phase == "bootstrap":
+                chunks.append(
+                    _run_main_chunk_history_intervention(
+                        runtime=runtime,
+                        source_noise=source_noise,
+                        output=output,
+                        conditional_dict=conditional_dict,
+                        schedule=schedule,
+                        rng_plan=rng_plan,
+                        counts=counts,
+                        chunk_index=int(item["main_chunk_index"]),
+                        role="bootstrap",
+                        cursor_before=int(item["cursor_before"]),
+                        cursor_after=int(item["cursor_after"]),
+                        history_recache_tensor=history_recache_tensor,
+                        history_source=str(history_source),
+                    )
+                )
+            elif phase == "paired_round":
+                current, next_chunk, round_record = _run_mcp1_pair_history_intervention(
+                    runtime=runtime,
+                    mcp_scheduler=mcp_scheduler,
+                    source_noise=source_noise,
+                    output=output,
+                    conditional_dict=conditional_dict,
+                    schedule=schedule,
+                    rng_plan=rng_plan,
+                    counts=counts,
+                    current_chunk_index=int(item["main_chunk_index"]),
+                    next_chunk_index=int(item["next_chunk_index"]),
+                    round_index=int(item["round_index"]),
+                    cursor_before=int(item["cursor_before"]),
+                    cursor_after=int(item["cursor_after"]),
+                    history_recache_tensor=history_recache_tensor,
+                    history_source=str(history_source),
+                )
+                chunks.extend([current, next_chunk])
+                rounds.append(round_record)
+            else:
+                raise RuntimeError(f"unsupported deployment plan phase: {phase}")
+    _ensure_finite_tensor(output, name=f"{mode}.output_latent")
+    result = _deployment_result(
+        mode=mode,
+        output=output,
+        checkpoint=checkpoint,
+        schedule=schedule,
+        common_inputs=common_inputs,
+        common_inputs_fingerprint_sha256=common_inputs_fingerprint_sha256,
+        actual_source_noise_sha256=tensor_sha256(source_noise.detach().cpu()),
+        actual_conditioning_sha256=conditioning_json_summary(conditional_dict)["sha256"],
+        git_sha=git_sha,
+        chunks=chunks,
+        parallel_rounds=rounds,
+        execution_plan=plan,
+        counts=counts,
+        rng_trace=rng_plan["trace"],
+        generation_elapsed_ms=(time.perf_counter() - elapsed_start) * 1000.0,
+    )
+    result.trace["diagnostic_only"] = True
+    result.trace["non_deployable"] = mode != DIAG_MODE_MCP1_LIVE_HISTORY
+    result.trace["canonical_behavior_diagnostic"] = mode == DIAG_MODE_MCP1_LIVE_HISTORY
+    result.trace["history_recache_source"] = str(history_source)
+    result.trace.update(history_provenance)
+    if mode == DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR:
+        result.trace["trained_main_reference_latent_sha256"] = history_provenance[
+            "history_recache_full_tensor_sha256"
+        ]
+    if mode == DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE:
+        result.trace["teacher_target_sha256"] = history_provenance[
+            "history_recache_full_tensor_sha256"
+        ]
+    result.summary["diagnostic_only"] = True
+    result.summary["non_deployable"] = mode != DIAG_MODE_MCP1_LIVE_HISTORY
+    result.summary["canonical_behavior_diagnostic"] = (
+        mode == DIAG_MODE_MCP1_LIVE_HISTORY
+    )
+    result.summary["history_recache_source"] = str(history_source)
+    result.summary.update(history_provenance)
+    if mode == DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR:
+        result.summary["trained_main_reference_latent_sha256"] = history_provenance[
+            "history_recache_full_tensor_sha256"
+        ]
+    if mode == DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE:
+        result.summary["teacher_target_sha256"] = history_provenance[
+            "history_recache_full_tensor_sha256"
+        ]
+    validate_history_diagnostic_trace(result.trace)
+    return result
+
+
+def validate_history_recache_tensor(
+    history_recache_tensor: torch.Tensor,
+    *,
+    source_noise: torch.Tensor,
+    name: str,
+) -> None:
+    if not torch.is_tensor(history_recache_tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if history_recache_tensor.ndim != 5:
+        raise ValueError(f"{name} must have layout [B, 21, C, H, W]")
+    if tuple(history_recache_tensor.shape) != tuple(source_noise.shape):
+        raise RuntimeError(f"{name} must match source_noise shape")
+    if int(history_recache_tensor.shape[1]) != FULL_SEQUENCE_FRAME_COUNT:
+        raise RuntimeError(f"{name} must contain 21 latent frames")
+    _ensure_finite_tensor(history_recache_tensor, name=name)
+
+
+def _history_chunk(
+    history: torch.Tensor,
+    *,
+    chunk_index: int,
+    chunk_frames: int,
+) -> torch.Tensor:
+    start = int(chunk_index) * int(chunk_frames)
+    return history[:, start:start + int(chunk_frames)]
+
+
+def _history_recache_provenance(
+    history_recache_tensor: torch.Tensor | None,
+    *,
+    source_noise: torch.Tensor,
+) -> dict[str, Any]:
+    if history_recache_tensor is None:
+        return {
+            "history_recache_full_tensor_sha256": None,
+            "history_recache_chunk_sha256_by_chunk": None,
+        }
+    validate_history_recache_tensor(
+        history_recache_tensor,
+        source_noise=source_noise,
+        name="history_recache_tensor",
+    )
+    return {
+        "history_recache_full_tensor_sha256": tensor_sha256(
+            history_recache_tensor.detach().cpu()
+        ),
+        "history_recache_chunk_sha256_by_chunk": {
+            str(chunk_index): tensor_sha256(
+                _history_chunk(
+                    history_recache_tensor,
+                    chunk_index=chunk_index,
+                    chunk_frames=FULL_SEQUENCE_CHUNK_FRAMES,
+                )
+                .detach()
+                .cpu()
+            )
+            for chunk_index in range(FULL_SEQUENCE_NUM_CHUNKS)
+        },
+    }
+
+
+def _recache_chunk_for_intervention(
+    *,
+    generated_output: torch.Tensor,
+    history_recache_tensor: torch.Tensor | None,
+    chunk_index: int,
+    chunk_frames: int,
+) -> torch.Tensor:
+    if history_recache_tensor is None:
+        return generated_output
+    return _history_chunk(
+        history_recache_tensor,
+        chunk_index=chunk_index,
+        chunk_frames=chunk_frames,
+    ).to(device=generated_output.device, dtype=generated_output.dtype)
+
+
+def _clean_recache_with_history(
+    *,
+    runtime: DeploymentRuntime,
+    conditional_dict: Mapping[str, Any],
+    rng_plan: Mapping[str, Any],
+    counts: dict[str, int],
+    generated_output: torch.Tensor,
+    recache_chunk: torch.Tensor,
+    chunk_index: int,
+    start_frame: int,
+    expected_before: Mapping[str, Any] | None,
+    history_source: str,
+) -> dict[str, Any]:
+    if tuple(recache_chunk.shape) != tuple(generated_output.shape):
+        raise RuntimeError("history recache chunk shape differs from generated output")
+    recache = _clean_recache(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        counts=counts,
+        clean_chunk=recache_chunk,
+        chunk_index=chunk_index,
+        start_frame=start_frame,
+        expected_before=expected_before,
+    )
+    generated_sha = tensor_sha256(generated_output.detach().cpu())
+    recache_sha = tensor_sha256(recache_chunk.detach().cpu())
+    recache.update(
+        {
+            "diagnostic_only": True,
+            "history_recache_source": str(history_source),
+            "history_recache_tensor_sha256": recache_sha,
+            "generated_output_tensor_sha256": generated_sha,
+            "history_recache_matches_generated_output": recache_sha == generated_sha,
+        }
+    )
+    return recache
+
+
+def _run_main_chunk_history_intervention(
+    *,
+    runtime: DeploymentRuntime,
+    source_noise: torch.Tensor,
+    output: torch.Tensor,
+    conditional_dict: Mapping[str, Any],
+    schedule: DeploymentSchedule,
+    rng_plan: Mapping[str, Any],
+    counts: dict[str, int],
+    chunk_index: int,
+    role: str,
+    cursor_before: int,
+    cursor_after: int,
+    history_recache_tensor: torch.Tensor | None,
+    history_source: str,
+) -> dict[str, Any]:
+    chunk_frames = int(runtime.num_frame_per_block)
+    start_frame = int(chunk_index) * chunk_frames
+    current = source_noise[:, start_frame:start_frame + chunk_frames].detach().clone()
+    step_records: list[dict[str, Any]] = []
+    last_rollback = None
+    for step_index, warped_timestep in enumerate(schedule.main_warped_schedule):
+        forward_input = current.detach()
+        snapshot = KVSnapshot.capture(runtime.kv_cache)
+        kv_before = kv_boundary_summary(runtime.kv_cache)
+        _require_kv_boundary_consistent(kv_before, label="diagnostic main before forward")
+        timestep = _timestep_chunk(float(warped_timestep), current)
+
+        def call_main(
+            current_chunk: torch.Tensor = current,
+            current_timestep: torch.Tensor = timestep,
+        ):
+            return runtime.generator(
+                noisy_image_or_video=current_chunk,
+                conditional_dict=dict(conditional_dict),
+                timestep=current_timestep,
+                kv_cache=runtime.kv_cache,
+                crossattn_cache=runtime.crossattn_cache,
+                current_start=start_frame * int(runtime.frame_seq_length),
+            )
+
+        outputs, rng_guard = _call_with_rng_guard(
+            device=current.device,
+            label="diagnostic_main_solver_forward",
+            fn=call_main,
+        )
+        counts["main_solver_forward_count"] = int(
+            counts.get("main_solver_forward_count", 0)
+        ) + 1
+        flow_pred, clean_pred = _unpack_main_outputs(outputs)
+        _ensure_finite_tensor(flow_pred, name="diagnostic_main_flow_pred")
+        _ensure_finite_tensor(clean_pred, name="diagnostic_main_clean_pred")
+        kv_temp = kv_boundary_summary(runtime.kv_cache)
+        _require_kv_boundary_consistent(kv_temp, label="diagnostic main temporary forward")
+        restored = snapshot.restore(runtime.kv_cache)
+        if not restored:
+            raise RuntimeError("KV snapshot restore failed")
+        kv_rollback = kv_boundary_summary(runtime.kv_cache)
+        _require_kv_rollback_matches(kv_before, kv_rollback)
+        last_rollback = kv_rollback
+        transition = None
+        if step_index < len(schedule.main_warped_schedule) - 1:
+            next_t = float(schedule.main_warped_schedule[step_index + 1])
+            noise, noise_record = _plan_transition_noise(
+                rng_plan,
+                chunk_index=chunk_index,
+                step_index=step_index,
+                template=clean_pred.flatten(0, 1),
+            )
+            current = runtime.scheduler.add_noise(
+                clean_pred.flatten(0, 1),
+                noise,
+                torch.full(
+                    (clean_pred.flatten(0, 1).shape[0],),
+                    next_t,
+                    device=clean_pred.device,
+                    dtype=torch.float32,
+                ),
+            ).unflatten(0, clean_pred.shape[:2])
+            _ensure_finite_tensor(current, name="diagnostic_main_re_noised_state")
+            transition = {
+                "next_warped_timestep": next_t,
+                "rng_plan_record": noise_record,
+                "re_noised_tensor": tensor_json_summary(current),
+            }
+        else:
+            output[:, start_frame:start_frame + chunk_frames] = clean_pred
+        step_records.append(
+            {
+                "raw_index": int(step_index),
+                "raw_timestep": float(schedule.raw_schedule[step_index]),
+                "warped_timestep": float(warped_timestep),
+                "input_tensor": tensor_json_summary(forward_input),
+                "flow_tensor": tensor_json_summary(flow_pred),
+                "output_x0_tensor": tensor_json_summary(clean_pred),
+                "forward_rng": rng_guard,
+                "kv": {
+                    "before": kv_before,
+                    "temporary_after_forward": kv_temp,
+                    "rollback_after_forward": kv_rollback,
+                    "visible_data_restored": True,
+                },
+                "transition": transition,
+            }
+        )
+    generated_chunk = output[:, start_frame:start_frame + chunk_frames]
+    recache_chunk = _recache_chunk_for_intervention(
+        generated_output=generated_chunk,
+        history_recache_tensor=history_recache_tensor,
+        chunk_index=chunk_index,
+        chunk_frames=chunk_frames,
+    )
+    clean_recache = _clean_recache_with_history(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        counts=counts,
+        generated_output=generated_chunk,
+        recache_chunk=recache_chunk,
+        chunk_index=chunk_index,
+        start_frame=start_frame,
+        expected_before=last_rollback,
+        history_source=history_source,
+    )
+    role_name = {"bootstrap": "bootstrap", "main": "main_only"}.get(role, role)
+    return {
+        "chunk_index": int(chunk_index),
+        "role": role_name,
+        "produced_by": "Main",
+        "output_produced_by": "Main",
+        "start_frame": int(start_frame),
+        "num_frames": int(chunk_frames),
+        "solver_steps": step_records,
+        "clean_recache": clean_recache,
+        "commit": {
+            "main_only": role_name == "main_only",
+            "next_commit": None,
+            "commit_order": [int(chunk_index)],
+            "cursor_before": int(cursor_before),
+            "cursor_after": int(cursor_after),
+        },
+    }
+
+
+def _run_mcp1_pair_history_intervention(
+    *,
+    runtime: DeploymentRuntime,
+    mcp_scheduler: Any,
+    source_noise: torch.Tensor,
+    output: torch.Tensor,
+    conditional_dict: Mapping[str, Any],
+    schedule: DeploymentSchedule,
+    rng_plan: Mapping[str, Any],
+    counts: dict[str, int],
+    current_chunk_index: int,
+    next_chunk_index: int,
+    round_index: int,
+    cursor_before: int,
+    cursor_after: int,
+    history_recache_tensor: torch.Tensor | None,
+    history_source: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    chunk_frames = int(runtime.num_frame_per_block)
+    current_start = int(current_chunk_index) * chunk_frames
+    next_start = int(next_chunk_index) * chunk_frames
+    current_state = source_noise[:, current_start:current_start + chunk_frames].detach().clone()
+    next_state = source_noise[:, next_start:next_start + chunk_frames].detach().clone()
+    current_steps: list[dict[str, Any]] = []
+    next_steps: list[dict[str, Any]] = []
+    joint_steps: list[dict[str, Any]] = []
+    last_rollback = None
+    for step_index, (raw_timestep, main_t, mcp_t) in enumerate(
+        zip(
+            schedule.raw_schedule,
+            schedule.main_warped_schedule,
+            schedule.mcp_warped_schedule,
+        )
+    ):
+        snapshot = KVSnapshot.capture(runtime.kv_cache)
+        kv_before = kv_boundary_summary(runtime.kv_cache)
+        _require_kv_boundary_consistent(kv_before, label="diagnostic mcp1 pair before forward")
+        main_timestep = _timestep_chunk(float(main_t), current_state)
+        mcp_timestep = _timestep_chunk(float(mcp_t), next_state)
+
+        def call_joint(
+            current_chunk: torch.Tensor = current_state,
+            current_timestep: torch.Tensor = main_timestep,
+            future_chunk: torch.Tensor = next_state,
+            future_timestep: torch.Tensor = mcp_timestep,
+        ):
+            return runtime.generator(
+                noisy_image_or_video=current_chunk,
+                conditional_dict=dict(conditional_dict),
+                timestep=current_timestep,
+                kv_cache=runtime.kv_cache,
+                crossattn_cache=runtime.crossattn_cache,
+                current_start=current_start * int(runtime.frame_seq_length),
+                mcp_future_noises=[future_chunk],
+                mcp_future_start_frames=[next_start],
+                mcp_timesteps=[future_timestep],
+            )
+
+        outputs, rng_guard = _call_with_rng_guard(
+            device=current_state.device,
+            label="diagnostic_mcp1_joint_solver_forward",
+            fn=call_joint,
+        )
+        counts["main_solver_forward_count"] = int(
+            counts.get("main_solver_forward_count", 0)
+        ) + 1
+        counts["mcp_call_count"] = int(counts.get("mcp_call_count", 0)) + 1
+        counts["mcp_depth1_call_count"] = int(counts.get("mcp_depth1_call_count", 0)) + 1
+        if not isinstance(outputs, (tuple, list)) or len(outputs) != 3:
+            raise RuntimeError("MCP1 diagnostic forward must return main outputs and MCP outputs")
+        main_flow, main_clean = _unpack_main_outputs(outputs)
+        mcp_outputs = outputs[2]
+        if not isinstance(mcp_outputs, (tuple, list)) or len(mcp_outputs) != 1:
+            raise RuntimeError("MCP1 diagnostic must request and return depth1 only")
+        counts["returned_mcp_output_count"] = int(
+            counts.get("returned_mcp_output_count", 0)
+        ) + 1
+        mcp_flow = mcp_outputs[0]
+        if not torch.is_tensor(mcp_flow):
+            raise TypeError("MCP1 flow output must be a tensor")
+        mcp_clean = mcp_flow_to_x0(
+            mcp_scheduler,
+            mcp_flow=mcp_flow,
+            next_state=next_state,
+            mcp_timestep=mcp_timestep,
+        )
+        for name, tensor in (
+            ("diagnostic_mcp1_main_flow", main_flow),
+            ("diagnostic_mcp1_main_clean", main_clean),
+            ("diagnostic_mcp1_flow", mcp_flow),
+            ("diagnostic_mcp1_clean", mcp_clean),
+        ):
+            _ensure_finite_tensor(tensor, name=name)
+        kv_temp = kv_boundary_summary(runtime.kv_cache)
+        _require_kv_boundary_consistent(kv_temp, label="diagnostic mcp1 pair temporary forward")
+        restored = snapshot.restore(runtime.kv_cache)
+        if not restored:
+            raise RuntimeError("KV snapshot restore failed")
+        kv_rollback = kv_boundary_summary(runtime.kv_cache)
+        _require_kv_rollback_matches(kv_before, kv_rollback)
+        last_rollback = kv_rollback
+        current_transition = None
+        next_transition = None
+        if step_index < len(schedule.raw_schedule) - 1:
+            next_main_t = float(schedule.main_warped_schedule[step_index + 1])
+            current_noise, current_noise_record = _plan_transition_noise(
+                rng_plan,
+                chunk_index=current_chunk_index,
+                step_index=step_index,
+                template=main_clean.flatten(0, 1),
+            )
+            current_state = runtime.scheduler.add_noise(
+                main_clean.flatten(0, 1),
+                current_noise,
+                torch.full(
+                    (main_clean.flatten(0, 1).shape[0],),
+                    next_main_t,
+                    device=main_clean.device,
+                    dtype=torch.float32,
+                ),
+            ).unflatten(0, main_clean.shape[:2])
+            current_transition = {
+                "next_warped_timestep": next_main_t,
+                "rng_plan_record": current_noise_record,
+                "re_noised_tensor": tensor_json_summary(current_state),
+            }
+            next_mcp_t = float(schedule.mcp_warped_schedule[step_index + 1])
+            next_noise, next_noise_record = _plan_transition_noise(
+                rng_plan,
+                chunk_index=next_chunk_index,
+                step_index=step_index,
+                template=mcp_clean.flatten(0, 1),
+            )
+            next_state = mcp_scheduler.add_noise(
+                mcp_clean.flatten(0, 1),
+                next_noise,
+                torch.full(
+                    (mcp_clean.flatten(0, 1).shape[0],),
+                    next_mcp_t,
+                    device=mcp_clean.device,
+                    dtype=torch.float32,
+                ),
+            ).unflatten(0, mcp_clean.shape[:2])
+            next_transition = {
+                "next_warped_timestep": next_mcp_t,
+                "rng_plan_record": next_noise_record,
+                "re_noised_tensor": tensor_json_summary(next_state),
+            }
+        else:
+            output[:, current_start:current_start + chunk_frames] = main_clean
+            output[:, next_start:next_start + chunk_frames] = mcp_clean
+        joint_kv = {
+            "before": kv_before,
+            "temporary_after_forward": kv_temp,
+            "rollback_after_forward": kv_rollback,
+            "visible_data_restored": True,
+        }
+        current_steps.append(
+            {
+                "raw_index": int(step_index),
+                "raw_timestep": float(raw_timestep),
+                "warped_timestep": float(main_t),
+                "flow_tensor": tensor_json_summary(main_flow),
+                "output_x0_tensor": tensor_json_summary(main_clean),
+                "forward_rng": rng_guard,
+                "kv": joint_kv,
+                "transition": current_transition,
+            }
+        )
+        next_steps.append(
+            {
+                "raw_index": int(step_index),
+                "raw_timestep": float(raw_timestep),
+                "mcp_warped_timestep": float(mcp_t),
+                "flow_tensor": tensor_json_summary(mcp_flow),
+                "output_x0_tensor": tensor_json_summary(mcp_clean),
+                "returned_mcp_output_count": 1,
+                "mcp_depths_requested": [1],
+                "transition": next_transition,
+            }
+        )
+        joint_steps.append(
+            {
+                "raw_index": int(step_index),
+                "raw_timestep": float(raw_timestep),
+                "main_warped_timestep": float(main_t),
+                "mcp_warped_timestep": float(mcp_t),
+                "raw_index_aligned": True,
+                "returned_mcp_output_count": 1,
+                "forward_rng": rng_guard,
+                "kv": joint_kv,
+            }
+        )
+    current_generated = output[:, current_start:current_start + chunk_frames]
+    next_generated = output[:, next_start:next_start + chunk_frames]
+    current_recache_chunk = _recache_chunk_for_intervention(
+        generated_output=current_generated,
+        history_recache_tensor=history_recache_tensor,
+        chunk_index=current_chunk_index,
+        chunk_frames=chunk_frames,
+    )
+    next_recache_chunk = _recache_chunk_for_intervention(
+        generated_output=next_generated,
+        history_recache_tensor=history_recache_tensor,
+        chunk_index=next_chunk_index,
+        chunk_frames=chunk_frames,
+    )
+    current_recache = _clean_recache_with_history(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        counts=counts,
+        generated_output=current_generated,
+        recache_chunk=current_recache_chunk,
+        chunk_index=current_chunk_index,
+        start_frame=current_start,
+        expected_before=last_rollback,
+        history_source=history_source,
+    )
+    next_recache = _clean_recache_with_history(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        counts=counts,
+        generated_output=next_generated,
+        recache_chunk=next_recache_chunk,
+        chunk_index=next_chunk_index,
+        start_frame=next_start,
+        expected_before=None,
+        history_source=history_source,
+    )
+    current_record = {
+        "chunk_index": int(current_chunk_index),
+        "role": "main_current",
+        "produced_by": "Main",
+        "output_produced_by": "Main",
+        "start_frame": int(current_start),
+        "num_frames": int(chunk_frames),
+        "solver_steps": current_steps,
+        "clean_recache": current_recache,
+        "commit": {
+            "main_only": False,
+            "next_commit": int(next_chunk_index),
+            "commit_order": [int(current_chunk_index), int(next_chunk_index)],
+            "cursor_before": int(cursor_before),
+            "cursor_after": int(cursor_after),
+        },
+    }
+    next_record = {
+        "chunk_index": int(next_chunk_index),
+        "role": "mcp_next",
+        "produced_by": "MCP1",
+        "output_produced_by": "MCP1",
+        "start_frame": int(next_start),
+        "num_frames": int(chunk_frames),
+        "solver_steps": next_steps,
+        "clean_recache": next_recache,
+        "commit": {
+            "main_only": False,
+            "accepted_next": True,
+            "recomputed_by_main": False,
+            "commit_order": [int(current_chunk_index), int(next_chunk_index)],
+            "cursor_before": int(cursor_before),
+            "cursor_after": int(cursor_after),
+        },
+    }
+    round_record = {
+        "round_index": int(round_index),
+        "current_chunk_index": int(current_chunk_index),
+        "next_chunk_index": int(next_chunk_index),
+        "cursor_before": int(cursor_before),
+        "cursor_after": int(cursor_after),
+        "commit_order": [int(current_chunk_index), int(next_chunk_index)],
+        "joint_solver_steps": joint_steps,
+        "clean_recache_order": [int(current_chunk_index), int(next_chunk_index)],
+        "temporary_kv_writes_rolled_back": True,
+        "diagnostic_history_recache_source": str(history_source),
+    }
+    return current_record, next_record, round_record
+
+
 def compare_latents(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -1157,6 +1877,69 @@ def build_comparison_report(
     return report
 
 
+def chunk_subset_latent_metrics(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    chunks: Sequence[int],
+    chunk_frames: int = FULL_SEQUENCE_CHUNK_FRAMES,
+) -> dict[str, Any]:
+    if tuple(left.shape) != tuple(right.shape):
+        raise RuntimeError("latent shape mismatch")
+    diff = left.detach().float().cpu() - right.detach().float().cpu()
+    parts = []
+    chunk_list = [int(chunk) for chunk in chunks]
+    for chunk_index in chunk_list:
+        start = int(chunk_index) * int(chunk_frames)
+        parts.append(diff[:, start:start + int(chunk_frames)])
+    if not parts:
+        raise ValueError("chunks must be non-empty")
+    value = torch.cat(parts, dim=1)
+    return {
+        "chunks": chunk_list,
+        "max_abs": float(value.abs().max().item()),
+        "mean_abs": float(value.abs().mean().item()),
+        "mse": float(value.square().mean().item()),
+    }
+
+
+def build_history_diagnostic_comparison(
+    *,
+    name: str,
+    left_mode: str,
+    right_mode: str,
+    latent_left: torch.Tensor,
+    latent_right: torch.Tensor,
+    pixel_left: torch.Tensor | None = None,
+    pixel_right: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    report = build_comparison_report(
+        name=name,
+        left_mode=left_mode,
+        right_mode=right_mode,
+        latent_left=latent_left,
+        latent_right=latent_right,
+        pixel_left=pixel_left,
+        pixel_right=pixel_right,
+        role_map=full_sequence_role_map(),
+    )
+    report["diagnostic_metrics"] = {
+        "later_main_recovery_chunks": [3, 5],
+        "later_main_recovery": chunk_subset_latent_metrics(
+            latent_left,
+            latent_right,
+            chunks=[3, 5],
+        ),
+        "mcp_direct_quality_chunks": [2, 4, 6],
+        "mcp_direct_quality": chunk_subset_latent_metrics(
+            latent_left,
+            latent_right,
+            chunks=[2, 4, 6],
+        ),
+    }
+    return report
+
+
 def write_mode_outputs(
     *,
     mode_dir: Path | str,
@@ -1282,6 +2065,275 @@ def build_eval_manifest(
     return manifest
 
 
+def build_history_diagnostic_manifest(
+    *,
+    common_inputs: Mapping[str, Any],
+    common_inputs_fingerprint_sha256: str,
+    mode_summaries: Mapping[str, Mapping[str, Any]],
+    mode_traces: Mapping[str, Mapping[str, Any]],
+    comparisons: Mapping[str, Mapping[str, Any]],
+    output_dir: Path | str,
+    git_sha: str,
+) -> dict[str, Any]:
+    expected_modes = {
+        DIAG_MODE_TRAINED_MAIN_REFERENCE,
+        DIAG_MODE_MCP1_LIVE_HISTORY,
+        DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR,
+        DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE,
+    }
+    if set(mode_summaries.keys()) != expected_modes:
+        raise RuntimeError("history diagnostic requires all four diagnostic modes")
+    if set(mode_traces.keys()) != expected_modes:
+        raise RuntimeError("history diagnostic requires all four diagnostic traces")
+    fingerprint = assert_common_input_fingerprints(mode_summaries)
+    if fingerprint != common_inputs_fingerprint_sha256:
+        raise RuntimeError("diagnostic common input fingerprint mismatch")
+    rng_fingerprint = assert_rng_plan_fingerprints(mode_summaries)
+    assert_mode_inputs_match_common(mode_summaries, common_inputs)
+    trained_main_reference_sha = _require_sha256_string(
+        mode_summaries[DIAG_MODE_TRAINED_MAIN_REFERENCE].get("latent_sha256"),
+        name="trained_main_reference.latent_sha256",
+    )
+    teacher_target_sha = _require_sha256_string(
+        common_inputs.get("teacher_target_sha256"),
+        name="common_inputs.teacher_target_sha256",
+    )
+    for mode, trace in mode_traces.items():
+        validate_history_diagnostic_trace(trace)
+        if trace.get("common_inputs_fingerprint_sha256") != common_inputs_fingerprint_sha256:
+            raise RuntimeError("diagnostic trace common input fingerprint mismatch")
+        if trace.get("rng_plan_fingerprint_sha256") != mode_summaries[mode].get(
+            "rng_plan_fingerprint_sha256"
+        ):
+            raise RuntimeError("diagnostic trace RNG fingerprint mismatch")
+        if trace.get("latent_sha256") != mode_summaries[mode].get("latent_sha256"):
+            raise RuntimeError("diagnostic trace latent SHA mismatch")
+        for field in (
+            "history_recache_source",
+            "history_recache_full_tensor_sha256",
+            "trained_main_reference_latent_sha256",
+            "teacher_target_sha256",
+            "diagnostic_only",
+            "non_deployable",
+            "canonical_behavior_diagnostic",
+        ):
+            if trace.get(field) != mode_summaries[mode].get(field):
+                raise RuntimeError("diagnostic summary/trace provenance mismatch")
+    _validate_history_cross_source_bindings(
+        mode_summaries=mode_summaries,
+        mode_traces=mode_traces,
+        trained_main_reference_sha=trained_main_reference_sha,
+        teacher_target_sha=teacher_target_sha,
+    )
+    manifest = {
+        "schema": HISTORY_DIAGNOSTIC_SCHEMA,
+        "status": "PASS",
+        "diagnostic_only": True,
+        "non_deployable": True,
+        "runtime_git_sha": str(git_sha),
+        "training_checkpoint_git_sha": str(
+            common_inputs.get("training_checkpoint_git_sha")
+        ),
+        "output_dir": str(Path(output_dir).resolve()),
+        "common_inputs": dict(common_inputs),
+        "common_inputs_fingerprint_sha256": str(common_inputs_fingerprint_sha256),
+        "rng_plan_fingerprint_sha256": rng_fingerprint,
+        "modes": {
+            key: {
+                "status": value.get("status"),
+                "latent_sha256": value.get("latent_sha256"),
+                "source_noise_sha256": value.get("source_noise_sha256"),
+                "conditioning_sha256": value.get("conditioning_sha256"),
+                "rng_plan_fingerprint_sha256": value.get(
+                    "rng_plan_fingerprint_sha256"
+                ),
+                "generation_elapsed_ms": value.get("generation_elapsed_ms"),
+                "runtime_measurement_status": value.get(
+                    "runtime_measurement_status"
+                ),
+                "video_sha256": (
+                    value.get("video", {}).get("sha256")
+                    if isinstance(value.get("video"), Mapping)
+                    else None
+                ),
+                "mcp_call_count": value.get("mcp_call_count"),
+                "history_recache_source": value.get("history_recache_source"),
+                "history_recache_full_tensor_sha256": value.get(
+                    "history_recache_full_tensor_sha256"
+                ),
+                "trained_main_reference_latent_sha256": value.get(
+                    "trained_main_reference_latent_sha256"
+                ),
+                "teacher_target_sha256": value.get("teacher_target_sha256"),
+                "diagnostic_only": value.get("diagnostic_only"),
+                "non_deployable": value.get("non_deployable"),
+                "canonical_behavior_diagnostic": value.get(
+                    "canonical_behavior_diagnostic"
+                ),
+            }
+            for key, value in mode_summaries.items()
+        },
+        "comparisons": {
+            key: {
+                "visual_review_status": value.get("visual_review_status"),
+                "visual_quality_pass": value.get("visual_quality_pass"),
+                "diagnostic_metrics": value.get("diagnostic_metrics"),
+            }
+            for key, value in comparisons.items()
+        },
+        "engineering_acceptance": {
+            "all_4_runs_complete": set(mode_summaries.keys()) == expected_modes,
+            "common_input_fingerprints_exact": True,
+            "rng_plan_fingerprints_exact": True,
+            "trained_main_reference_zero_mcp_calls": int(
+                mode_summaries[DIAG_MODE_TRAINED_MAIN_REFERENCE]["mcp_call_count"]
+            )
+            == 0,
+            "mcp_modes_depth1_only": all(
+                mode_summaries[mode].get("per_depth_call_counts", {}).get("1")
+                == 3 * len(RAW_DEPLOYMENT_SCHEDULE)
+                and mode_summaries[mode].get("per_depth_call_counts", {}).get("2") == 0
+                and mode_summaries[mode].get("per_depth_call_counts", {}).get("3") == 0
+                for mode in DIAGNOSTIC_MCP_MODES
+            ),
+            "diagnostic_interventions_declared_non_deployable": (
+                mode_summaries[DIAG_MODE_MCP1_LIVE_HISTORY].get(
+                    "diagnostic_only"
+                )
+                is True
+                and mode_summaries[DIAG_MODE_MCP1_LIVE_HISTORY].get(
+                    "canonical_behavior_diagnostic"
+                )
+                is True
+                and mode_summaries[
+                    DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR
+                ].get("non_deployable")
+                is True
+                and mode_summaries[
+                    DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE
+                ].get("non_deployable")
+                is True
+            ),
+            "history_source_provenance_exact": _history_source_provenance_exact(
+                mode_summaries,
+                trained_main_reference_sha=trained_main_reference_sha,
+                teacher_target_sha=teacher_target_sha,
+            ),
+            "videos_present_non_empty": all(
+                isinstance(summary.get("video"), Mapping)
+                and int(summary["video"].get("size_bytes", 1)) != 0
+                for summary in mode_summaries.values()
+            ),
+            "no_auto_visual_threshold": True,
+        },
+        "teacher_target_sha256": teacher_target_sha,
+        "interpretation_contract": {
+            "history_contamination_supported": None,
+            "teacher_history_rescues_mcp": None,
+            "mcp_intrinsic_generation_failure_supported": None,
+            "case_descriptions": {
+                "case_1": (
+                    "main_history_repair makes later Main chunks 3/5 much "
+                    "closer to trained_main_reference: MCP history "
+                    "contamination confirmed."
+                ),
+                "case_2": (
+                    "teacher_history_oracle makes MCP chunks 2/4/6 much "
+                    "closer or sharper than live: history distribution gap "
+                    "is a primary MCP failure source."
+                ),
+                "case_3": (
+                    "teacher_history_oracle MCP chunks remain similarly bad: "
+                    "MCP generation/objective/flow-to-x0 mismatch is primary."
+                ),
+                "case_4": (
+                    "different components improve under different "
+                    "interventions: both mechanisms contribute."
+                ),
+            },
+        },
+        "visual_review_status": "PENDING",
+        "visual_quality_pass": None,
+    }
+    if not all(bool(value) for value in manifest["engineering_acceptance"].values()):
+        manifest["status"] = "FAIL"
+    return manifest
+
+
+def _history_source_provenance_exact(
+    mode_summaries: Mapping[str, Mapping[str, Any]],
+    *,
+    trained_main_reference_sha: str,
+    teacher_target_sha: str,
+) -> bool:
+    live = mode_summaries[DIAG_MODE_MCP1_LIVE_HISTORY]
+    repair = mode_summaries[DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR]
+    oracle = mode_summaries[DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE]
+    return (
+        live.get("history_recache_source") == "generated_output"
+        and live.get("history_recache_full_tensor_sha256") is None
+        and live.get("canonical_behavior_diagnostic") is True
+        and repair.get("history_recache_source") == "trained_main_reference"
+        and repair.get("non_deployable") is True
+        and repair.get("history_recache_full_tensor_sha256")
+        == trained_main_reference_sha
+        and repair.get("trained_main_reference_latent_sha256")
+        == trained_main_reference_sha
+        and oracle.get("history_recache_source") == "teacher_target"
+        and oracle.get("non_deployable") is True
+        and oracle.get("history_recache_full_tensor_sha256")
+        == teacher_target_sha
+        and oracle.get("teacher_target_sha256")
+        == teacher_target_sha
+    )
+
+
+def _validate_history_cross_source_bindings(
+    *,
+    mode_summaries: Mapping[str, Mapping[str, Any]],
+    mode_traces: Mapping[str, Mapping[str, Any]],
+    trained_main_reference_sha: str,
+    teacher_target_sha: str,
+) -> None:
+    live = mode_summaries[DIAG_MODE_MCP1_LIVE_HISTORY]
+    if live.get("history_recache_full_tensor_sha256") is not None:
+        raise RuntimeError("live history must not bind an external history tensor")
+    if live.get("history_recache_source") != "generated_output":
+        raise RuntimeError("live history source must be generated_output")
+    if live.get("canonical_behavior_diagnostic") is not True:
+        raise RuntimeError("live history must be canonical-behavior diagnostic")
+    if live.get("non_deployable") is not False:
+        raise RuntimeError("live history must remain deployable canonical behavior")
+
+    repair_summary = mode_summaries[DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR]
+    repair_trace = mode_traces[DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR]
+    for record in (repair_summary, repair_trace):
+        if record.get("non_deployable") is not True:
+            raise RuntimeError("main-history repair must be non_deployable")
+        if record.get("history_recache_full_tensor_sha256") != trained_main_reference_sha:
+            raise RuntimeError("repair history source differs from trained_main_reference")
+        if record.get("trained_main_reference_latent_sha256") != trained_main_reference_sha:
+            raise RuntimeError("repair trained_main_reference SHA binding mismatch")
+
+    oracle_summary = mode_summaries[DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE]
+    oracle_trace = mode_traces[DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE]
+    for record in (oracle_summary, oracle_trace):
+        if record.get("non_deployable") is not True:
+            raise RuntimeError("teacher-history oracle must be non_deployable")
+        if record.get("history_recache_full_tensor_sha256") != teacher_target_sha:
+            raise RuntimeError("oracle history source differs from teacher_target")
+        if record.get("teacher_target_sha256") != teacher_target_sha:
+            raise RuntimeError("oracle teacher_target SHA binding mismatch")
+
+
+def _require_sha256_string(value: Any, *, name: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} missing")
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise RuntimeError(f"{name} invalid")
+    return value
+
+
 def validate_trained_main_trace(trace: Mapping[str, Any]) -> None:
     if trace.get("mode") != MODE_TRAINED_MAIN:
         raise RuntimeError("trace is not trained_main")
@@ -1317,6 +2369,163 @@ def validate_trained_mcp1_trace(trace: Mapping[str, Any]) -> None:
         joint_steps = round_record.get("joint_solver_steps")
         if not isinstance(joint_steps, Sequence) or len(joint_steps) != len(RAW_DEPLOYMENT_SCHEDULE):
             raise RuntimeError("trained_mcp1 paired round must have four solver steps")
+
+
+def validate_history_diagnostic_trace(trace: Mapping[str, Any]) -> None:
+    mode = str(trace.get("mode"))
+    if mode == DIAG_MODE_TRAINED_MAIN_REFERENCE:
+        _validate_diagnostic_main_reference_trace(trace)
+        return
+    if mode not in DIAGNOSTIC_MCP_MODES:
+        raise RuntimeError("trace is not a history diagnostic mode")
+    if trace.get("diagnostic_only") is not True:
+        raise RuntimeError("diagnostic trace must be marked diagnostic_only")
+    if trace.get("role_map") != full_sequence_role_map():
+        raise RuntimeError("diagnostic role map mismatch")
+    expected_source = {
+        DIAG_MODE_MCP1_LIVE_HISTORY: "generated_output",
+        DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR: "trained_main_reference",
+        DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE: "teacher_target",
+    }[mode]
+    if trace.get("history_recache_source") != expected_source:
+        raise RuntimeError("diagnostic history source mismatch")
+    if trace.get("mcp_depths_used") != [1]:
+        raise RuntimeError("diagnostic MCP mode must use depth1 only")
+    if int(trace.get("mcp_call_count", -1)) != 3 * len(RAW_DEPLOYMENT_SCHEDULE):
+        raise RuntimeError("diagnostic MCP call count mismatch")
+    per_depth = trace.get("per_depth_call_counts")
+    if not isinstance(per_depth, Mapping):
+        raise RuntimeError("diagnostic per-depth call counts missing")
+    if int(per_depth.get("1", -1)) != 3 * len(RAW_DEPLOYMENT_SCHEDULE):
+        raise RuntimeError("diagnostic MCP depth1 call count mismatch")
+    if int(per_depth.get("2", -1)) != 0 or int(per_depth.get("3", -1)) != 0:
+        raise RuntimeError("diagnostic MCP depth2/3 must be unused")
+
+    rounds = trace.get("parallel_rounds")
+    if not isinstance(rounds, Sequence) or len(rounds) != 3:
+        raise RuntimeError("diagnostic MCP mode must contain exactly three paired rounds")
+    for round_index, round_record in enumerate(rounds):
+        if not isinstance(round_record, Mapping):
+            raise RuntimeError("diagnostic paired round must be a mapping")
+        expected_current = 1 + 2 * int(round_index)
+        expected_next = expected_current + 1
+        if round_record.get("current_chunk_index") != expected_current:
+            raise RuntimeError("diagnostic current chunk mapping mismatch")
+        if round_record.get("next_chunk_index") != expected_next:
+            raise RuntimeError("diagnostic next chunk mapping mismatch")
+        if round_record.get("clean_recache_order") != [expected_current, expected_next]:
+            raise RuntimeError("diagnostic clean recache order mismatch")
+        _require_four_joint_solver_steps(round_record.get("joint_solver_steps"))
+
+    chunks = trace.get("chunks")
+    if not isinstance(chunks, Sequence) or len(chunks) != FULL_SEQUENCE_NUM_CHUNKS:
+        raise RuntimeError("diagnostic MCP mode must contain seven chunk records")
+    chunk_by_index = _chunk_records_by_index(chunks)
+    expected_roles = {
+        0: "bootstrap",
+        1: "main_current",
+        2: "mcp_next",
+        3: "main_current",
+        4: "mcp_next",
+        5: "main_current",
+        6: "mcp_next",
+    }
+    expected_chunk_shas = trace.get("history_recache_chunk_sha256_by_chunk")
+    if mode == DIAG_MODE_MCP1_LIVE_HISTORY:
+        if trace.get("history_recache_full_tensor_sha256") is not None:
+            raise RuntimeError("live diagnostic must not record a history full tensor SHA")
+        if expected_chunk_shas not in (None, {}):
+            raise RuntimeError("live diagnostic must not record history chunk SHAs")
+        if trace.get("canonical_behavior_diagnostic") is not True:
+            raise RuntimeError("live diagnostic must declare canonical behavior")
+    else:
+        if not isinstance(trace.get("history_recache_full_tensor_sha256"), str):
+            raise RuntimeError("intervention diagnostic history full tensor SHA missing")
+        if not isinstance(expected_chunk_shas, Mapping):
+            raise RuntimeError("intervention diagnostic history chunk SHA map missing")
+        if len(expected_chunk_shas) != FULL_SEQUENCE_NUM_CHUNKS:
+            raise RuntimeError("intervention diagnostic history chunk SHA map incomplete")
+        if mode == DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR and trace.get(
+            "trained_main_reference_latent_sha256"
+        ) != trace.get("history_recache_full_tensor_sha256"):
+            raise RuntimeError("trained_main_reference latent SHA provenance mismatch")
+        if mode == DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE and trace.get(
+            "teacher_target_sha256"
+        ) != trace.get("history_recache_full_tensor_sha256"):
+            raise RuntimeError("teacher target SHA provenance mismatch")
+    for chunk_index, expected_role in expected_roles.items():
+        chunk = chunk_by_index[chunk_index]
+        if chunk.get("role") != expected_role:
+            raise RuntimeError("diagnostic chunk role mismatch")
+        schedule_key = "mcp_warped_timestep" if expected_role == "mcp_next" else "warped_timestep"
+        _require_four_solver_steps(chunk, schedule_key=schedule_key)
+        recache = chunk.get("clean_recache")
+        if not isinstance(recache, Mapping):
+            raise RuntimeError("diagnostic chunk recache record missing")
+        if recache.get("history_recache_source") != expected_source:
+            raise RuntimeError("diagnostic chunk history source mismatch")
+        recache_sha = recache.get("history_recache_tensor_sha256")
+        generated_sha = recache.get("generated_output_tensor_sha256")
+        if mode == DIAG_MODE_MCP1_LIVE_HISTORY:
+            if recache.get("history_recache_matches_generated_output") is not True:
+                raise RuntimeError("live diagnostic must recache generated output")
+            if recache_sha != generated_sha:
+                raise RuntimeError("live diagnostic recache SHA must equal generated output SHA")
+        else:
+            expected_sha = expected_chunk_shas.get(str(chunk_index))  # type: ignore[union-attr]
+            if recache_sha != expected_sha:
+                raise RuntimeError("intervention diagnostic recache chunk SHA mismatch")
+
+
+def _validate_diagnostic_main_reference_trace(trace: Mapping[str, Any]) -> None:
+    if int(trace.get("mcp_call_count", -1)) != 0:
+        raise RuntimeError("trained_main_reference must have zero MCP calls")
+    per_depth = trace.get("per_depth_call_counts")
+    if not isinstance(per_depth, Mapping):
+        raise RuntimeError("trained_main_reference per-depth counts missing")
+    if any(int(per_depth.get(str(depth), -1)) != 0 for depth in (1, 2, 3)):
+        raise RuntimeError("trained_main_reference must not call MCP depths")
+    chunks = trace.get("chunks")
+    if not isinstance(chunks, Sequence) or len(chunks) != FULL_SEQUENCE_NUM_CHUNKS:
+        raise RuntimeError("trained_main_reference must contain seven chunks")
+    if trace.get("role_map") != {"main_only": list(range(FULL_SEQUENCE_NUM_CHUNKS))}:
+        raise RuntimeError("trained_main_reference role map mismatch")
+    chunk_by_index = _chunk_records_by_index(chunks)
+    for chunk_index in range(FULL_SEQUENCE_NUM_CHUNKS):
+        chunk = chunk_by_index[chunk_index]
+        if chunk.get("role") != "main_only":
+            raise RuntimeError("trained_main_reference chunk role mismatch")
+        _require_four_solver_steps(chunk, schedule_key="warped_timestep")
+
+
+def _chunk_records_by_index(chunks: Sequence[Any]) -> dict[int, Mapping[str, Any]]:
+    records: dict[int, Mapping[str, Any]] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, Mapping):
+            raise RuntimeError("chunk record must be a mapping")
+        index = int(chunk.get("chunk_index", -1))
+        if index in records:
+            raise RuntimeError("duplicate diagnostic chunk record")
+        records[index] = chunk
+    expected = set(range(FULL_SEQUENCE_NUM_CHUNKS))
+    if set(records) != expected:
+        raise RuntimeError("diagnostic chunk index set mismatch")
+    return records
+
+
+def _require_four_joint_solver_steps(steps: Any) -> None:
+    if not isinstance(steps, Sequence) or len(steps) != len(RAW_DEPLOYMENT_SCHEDULE):
+        raise RuntimeError("diagnostic paired round must have four raw solver steps")
+    for step_index, step in enumerate(steps):
+        if not isinstance(step, Mapping):
+            raise RuntimeError("diagnostic paired solver step must be a mapping")
+        if int(step.get("raw_index", -1)) != step_index:
+            raise RuntimeError("diagnostic paired solver raw_index mismatch")
+        if abs(float(step.get("raw_timestep")) - RAW_DEPLOYMENT_SCHEDULE[step_index]) > 1e-4:
+            raise RuntimeError("diagnostic paired solver raw_timestep mismatch")
+        for key in ("main_warped_timestep", "mcp_warped_timestep"):
+            if not isinstance(step.get(key), (int, float)):
+                raise RuntimeError("diagnostic paired solver warped timestep missing")
 
 
 def tensor_json_summary(tensor: torch.Tensor) -> dict[str, Any]:
@@ -1457,7 +2666,7 @@ def _deployment_result(
         raise RuntimeError("mode source_noise SHA differs from common inputs")
     if str(actual_conditioning_sha256) != str(common_inputs["conditioning_sha256"]):
         raise RuntimeError("mode conditioning SHA differs from common inputs")
-    include_mcp = mode == MODE_TRAINED_MCP1
+    include_mcp = mode == MODE_TRAINED_MCP1 or mode in DIAGNOSTIC_MCP_MODES
     role_map = (
         {"main_only": list(range(FULL_SEQUENCE_NUM_CHUNKS))}
         if not include_mcp
@@ -1542,6 +2751,8 @@ def _deployment_result(
         validate_trained_main_trace(trace)
     if mode == MODE_TRAINED_MCP1:
         validate_trained_mcp1_trace(trace)
+    if mode == DIAG_MODE_TRAINED_MAIN_REFERENCE:
+        validate_history_diagnostic_trace(trace)
     return DeploymentResult(latent=output.detach().cpu(), trace=trace, summary=summary)
 
 
@@ -2284,7 +3495,7 @@ def _require_four_solver_steps(chunk: Mapping[str, Any], *, schedule_key: str) -
             raise RuntimeError("solver raw_index mismatch")
         if abs(float(step.get("raw_timestep")) - RAW_DEPLOYMENT_SCHEDULE[step_index]) > 1e-4:
             raise RuntimeError("solver raw_timestep mismatch")
-        if schedule_key in step and not isinstance(step[schedule_key], (int, float)):
+        if not isinstance(step.get(schedule_key), (int, float)):
             raise RuntimeError("solver warped timestep missing")
 
 
@@ -2335,10 +3546,16 @@ def _set_cache_index(layer: Mapping[str, Any], key: str, value: int) -> None:
 
 __all__ = [
     "CHECKPOINT_VALIDATION_SCHEMA",
+    "DIAG_MODE_MCP1_LIVE_HISTORY",
+    "DIAG_MODE_MCP1_MAIN_HISTORY_REPAIR",
+    "DIAG_MODE_MCP1_TEACHER_HISTORY_ORACLE",
+    "DIAG_MODE_TRAINED_MAIN_REFERENCE",
+    "DIAGNOSTIC_MCP_MODES",
     "EVAL_SCHEMA",
     "EXPECTED_CANONICAL_GIT_SHA",
     "FULL_SEQUENCE_CHUNK_FRAMES",
     "FULL_SEQUENCE_GLOBAL_STEP",
+    "HISTORY_DIAGNOSTIC_SCHEMA",
     "FULL_SEQUENCE_NUM_CHUNKS",
     "FULL_SEQUENCE_OBJECTIVE_MODE",
     "MODE_OFFICIAL_MAIN",
@@ -2358,6 +3575,8 @@ __all__ = [
     "build_common_inputs_record",
     "build_comparison_report",
     "build_eval_manifest",
+    "build_history_diagnostic_comparison",
+    "build_history_diagnostic_manifest",
     "build_mcp1_execution_plan",
     "checkpoint_sidecar_paths",
     "compare_latents",
@@ -2373,12 +3592,15 @@ __all__ = [
     "rng_plan_fingerprint",
     "role_aware_latent_metrics",
     "run_main_only_deployment",
+    "run_mcp1_history_intervention_deployment",
     "run_mcp1_deployment",
     "sample_plan_validation_identities",
     "selected_validation_position",
     "validate_eval_artifact_identity",
     "validate_full_sequence_checkpoint_payload",
     "validate_full_sequence_checkpoint_sidecars",
+    "validate_history_diagnostic_trace",
+    "validate_history_recache_tensor",
     "validate_repo_preflight_facts",
     "validate_trained_main_trace",
     "validate_trained_mcp1_trace",

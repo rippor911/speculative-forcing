@@ -4,12 +4,14 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 
 import utils.nf_sf_full_sequence_eval as deployment
-from utils.nf_sf_m3 import tensor_sha256, tensor_summary
+from utils.checkpoint import is_mcp_state_key
+from utils.nf_sf_m3 import file_sha256, tensor_sha256, tensor_summary
 from utils.nf_sf_tensors import (
     DEFAULT_NUM_TRAIN_TIMESTEPS,
     DEFAULT_S_MAIN,
@@ -21,9 +23,14 @@ from utils.nf_sf_tensors import (
     flow_match_shift_timesteps,
 )
 from utils.nf_sf_training import (
+    FULL_SEQUENCE_CHECKPOINT_STEPS,
+    FULL_SEQUENCE_OBJECTIVE_VERSION,
+    FULL_SEQUENCE_RUN_KIND,
+    FULL_SEQUENCE_TRAINER_SCHEMA,
     NFSFFullSequenceNoisyBatch,
     build_full_sequence_mcp_anchor_inputs,
     build_full_sequence_mcp_anchor_specs,
+    nf_sf_full_sequence_train_cursor,
 )
 from utils.scheduler import FlowMatchScheduler
 
@@ -43,6 +50,8 @@ CURRENT_CHUNK_INDEX = 1
 FUTURE_CHUNK_INDEX = 2
 FUTURE_START_FRAME = FUTURE_CHUNK_INDEX * FULL_SEQUENCE_CHUNK_FRAMES
 CURRENT_START_FRAME = CURRENT_CHUNK_INDEX * FULL_SEQUENCE_CHUNK_FRAMES
+CHECKPOINT_LOADER_MODE_FINAL = "CANONICAL_FINAL_STEP5000"
+CHECKPOINT_LOADER_MODE_INTERMEDIATE = "DIAGNOSTIC_INTERMEDIATE_STRICT"
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,68 @@ def build_flow_match_scheduler(*, shift: float, device: torch.device | str) -> F
 def raw_timestep_in_training_support(raw_timestep: int) -> bool:
     value = int(raw_timestep)
     return 0 <= value < DEFAULT_NUM_TRAIN_TIMESTEPS
+
+
+def route_equivalence_checkpoint_loader_mode(expected_checkpoint_step: int) -> str:
+    step = _validate_expected_checkpoint_step(expected_checkpoint_step)
+    if step == deployment.FULL_SEQUENCE_GLOBAL_STEP:
+        return CHECKPOINT_LOADER_MODE_FINAL
+    return CHECKPOINT_LOADER_MODE_INTERMEDIATE
+
+
+def load_route_equivalence_checkpoint_record(
+    path: Path | str,
+    *,
+    expected_checkpoint_step: int,
+    expected_training_git_sha: str = deployment.TRAINING_CHECKPOINT_GIT_SHA,
+    expected_official_sha256: str = deployment.OFFICIAL_SELF_FORCING_CHECKPOINT_SHA256,
+) -> deployment.DeploymentCheckpointRecord:
+    step = _validate_expected_checkpoint_step(expected_checkpoint_step)
+    if step == deployment.FULL_SEQUENCE_GLOBAL_STEP:
+        return deployment.load_full_sequence_checkpoint_record(
+            path,
+            expected_training_git_sha=expected_training_git_sha,
+            expected_official_sha256=expected_official_sha256,
+        )
+    checkpoint_path = Path(path)
+    expected_name = f"checkpoint_step{step:06d}.pt"
+    if checkpoint_path.name != expected_name:
+        raise RuntimeError(
+            "route-equivalence intermediate checkpoint filename mismatch: "
+            f"expected {expected_name}"
+        )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"route-equivalence checkpoint not found: {checkpoint_path}"
+        )
+    actual_sha = file_sha256(checkpoint_path)
+    validation = _validate_intermediate_checkpoint_sidecars(
+        checkpoint_path,
+        expected_sha256=actual_sha,
+        expected_checkpoint_step=step,
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    _validate_intermediate_checkpoint_payload(
+        payload,
+        checkpoint_sha256=actual_sha,
+        expected_checkpoint_step=step,
+        expected_training_git_sha=str(expected_training_git_sha),
+        expected_official_sha256=str(expected_official_sha256),
+    )
+    state_dict = payload["generator"]
+    if int(validation.get("generator_key_count", -1)) != len(state_dict):
+        raise RuntimeError("intermediate checkpoint validation generator_key_count mismatch")
+    return deployment.DeploymentCheckpointRecord(
+        path=str(checkpoint_path.resolve()),
+        sha256=actual_sha,
+        checkpoint_type=f"full_sequence_step{step}",
+        load_mode=CHECKPOINT_LOADER_MODE_INTERMEDIATE,
+        generator_state_dict=state_dict,
+        global_step=int(payload["global_step"]),
+        training_git_sha=str(payload["git_sha"]),
+        payload=payload,
+        validation_sidecar=validation,
+    )
 
 
 def build_route_equivalence_point(raw_timestep: int) -> dict[str, Any]:
@@ -105,6 +176,7 @@ def run_first_mcp_route_equivalence_audit(
     training_checkpoint_git_sha: str,
 ) -> FirstMCPRouteEquivalenceResult:
     _validate_source_and_teacher(source_noise, teacher_target)
+    checkpoint_summary_dict = dict(checkpoint_summary)
     rng_plan = deployment.build_absolute_chunk_rng_plan(
         source_noise=source_noise,
         rollout_seed=int(teacher_payload["rollout_seed"]),
@@ -171,7 +243,20 @@ def run_first_mcp_route_equivalence_audit(
         "non_deployable": True,
         "runtime_git_sha": str(runtime_git_sha),
         "training_checkpoint_git_sha": str(training_checkpoint_git_sha),
-        "checkpoint": dict(checkpoint_summary),
+        "checkpoint": checkpoint_summary_dict,
+        "expected_checkpoint_step": int(
+            checkpoint_summary_dict["expected_checkpoint_step"]
+        ),
+        "loaded_checkpoint_global_step": int(
+            checkpoint_summary_dict["loaded_checkpoint_global_step"]
+        ),
+        "checkpoint_loader_mode": str(
+            checkpoint_summary_dict["checkpoint_loader_mode"]
+        ),
+        "diagnostic_intermediate_checkpoint": bool(
+            checkpoint_summary_dict["diagnostic_intermediate_checkpoint"]
+        ),
+        "checkpoint_sha256": str(checkpoint_summary_dict["sha256"]),
         "common_inputs_fingerprint_sha256": str(common_inputs_fingerprint_sha256),
         "common_inputs": dict(common_inputs),
         "rng_plan_fingerprint_sha256": rng_plan["trace"][
@@ -250,6 +335,26 @@ def validate_first_mcp_route_equivalence_manifest(manifest: Mapping[str, Any]) -
         raise RuntimeError("first MCP route equivalence schema mismatch")
     if manifest.get("status") != "PASS":
         raise RuntimeError("first MCP route equivalence status must be PASS")
+    expected_step = _validate_expected_checkpoint_step(
+        int(manifest.get("expected_checkpoint_step", -1))
+    )
+    if int(manifest.get("loaded_checkpoint_global_step", -1)) != expected_step:
+        raise RuntimeError("loaded checkpoint global_step must match expected step")
+    expected_loader_mode = route_equivalence_checkpoint_loader_mode(expected_step)
+    if manifest.get("checkpoint_loader_mode") != expected_loader_mode:
+        raise RuntimeError("checkpoint loader mode mismatch")
+    expected_intermediate = expected_step != deployment.FULL_SEQUENCE_GLOBAL_STEP
+    if manifest.get("diagnostic_intermediate_checkpoint") is not expected_intermediate:
+        raise RuntimeError("diagnostic intermediate checkpoint flag mismatch")
+    checkpoint = manifest.get("checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError("checkpoint summary missing")
+    if int(checkpoint.get("global_step", -1)) != expected_step:
+        raise RuntimeError("checkpoint summary global_step mismatch")
+    if checkpoint.get("checkpoint_loader_mode") != expected_loader_mode:
+        raise RuntimeError("checkpoint summary loader mode mismatch")
+    if str(manifest.get("checkpoint_sha256")) != str(checkpoint.get("sha256")):
+        raise RuntimeError("checkpoint summary SHA mismatch")
     support = manifest.get("training_raw_support_contract")
     if not isinstance(support, Mapping):
         raise RuntimeError("training raw support contract missing")
@@ -1093,6 +1198,182 @@ def _validate_route_summary(summary: Any, *, route: str) -> None:
             "target_chunk_index": FUTURE_CHUNK_INDEX,
         }:
             raise RuntimeError("training route selected output mismatch")
+
+
+def _validate_expected_checkpoint_step(value: int) -> int:
+    step = int(value)
+    if step not in tuple(int(item) for item in FULL_SEQUENCE_CHECKPOINT_STEPS):
+        raise ValueError("expected checkpoint step must be one of 0, 500, 2000, 5000")
+    return step
+
+
+def _checkpoint_sidecar_paths(path: Path) -> dict[str, Path]:
+    stem = Path(path).with_suffix("")
+    return {
+        "sha256": stem.with_suffix(".sha256.txt"),
+        "validation": stem.with_suffix(".validation.json"),
+    }
+
+
+def _validate_intermediate_checkpoint_sidecars(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_checkpoint_step: int,
+) -> dict[str, Any]:
+    sidecars = _checkpoint_sidecar_paths(path)
+    if not sidecars["sha256"].is_file():
+        raise RuntimeError("intermediate checkpoint SHA256 sidecar is missing")
+    if not sidecars["validation"].is_file():
+        raise RuntimeError("intermediate checkpoint validation sidecar is missing")
+    actual_sha = file_sha256(path)
+    if actual_sha != str(expected_sha256):
+        raise RuntimeError("intermediate checkpoint SHA256 mismatch")
+    sha_tokens = sidecars["sha256"].read_text(encoding="utf-8").strip().split()
+    if not sha_tokens or sha_tokens[0] != actual_sha:
+        raise RuntimeError("intermediate checkpoint SHA256 sidecar mismatch")
+    validation = json.loads(sidecars["validation"].read_text(encoding="utf-8"))
+    if validation.get("status") != "PASS":
+        raise RuntimeError("intermediate checkpoint validation status must be PASS")
+    if validation.get("schema") != deployment.CHECKPOINT_VALIDATION_SCHEMA:
+        raise RuntimeError("intermediate checkpoint validation schema mismatch")
+    if validation.get("sha256") != actual_sha:
+        raise RuntimeError("intermediate checkpoint validation SHA mismatch")
+    if validation.get("path") != str(path.resolve()):
+        raise RuntimeError("intermediate checkpoint validation path mismatch")
+    if int(validation.get("size_bytes", -1)) != int(path.stat().st_size):
+        raise RuntimeError("intermediate checkpoint validation size mismatch")
+    if validation.get("run_kind") != FULL_SEQUENCE_RUN_KIND:
+        raise RuntimeError("intermediate checkpoint validation run_kind mismatch")
+    if validation.get("objective_version") != FULL_SEQUENCE_OBJECTIVE_VERSION:
+        raise RuntimeError("intermediate checkpoint validation objective_version mismatch")
+    if validation.get("objective_mode") != deployment.FULL_SEQUENCE_OBJECTIVE_MODE:
+        raise RuntimeError("intermediate checkpoint validation objective_mode mismatch")
+    if int(validation.get("global_step", -1)) != int(expected_checkpoint_step):
+        raise RuntimeError("intermediate checkpoint validation global_step mismatch")
+    if not isinstance(validation.get("generator_key_count"), int):
+        raise RuntimeError("intermediate checkpoint validation generator_key_count missing")
+    if not isinstance(validation.get("optimizer_state_entry_count"), int):
+        raise RuntimeError(
+            "intermediate checkpoint validation optimizer_state_entry_count missing"
+        )
+    return validation
+
+
+def _validate_intermediate_checkpoint_payload(
+    payload: Any,
+    *,
+    checkpoint_sha256: str,
+    expected_checkpoint_step: int,
+    expected_training_git_sha: str,
+    expected_official_sha256: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError("intermediate checkpoint payload must be a mapping")
+    required = {
+        "schema",
+        "run_kind",
+        "objective_version",
+        "objective_mode",
+        "status",
+        "global_step",
+        "git_sha",
+        "generator",
+        "optimizer",
+        "train_rng_state",
+        "validation_seed",
+        "validation_base_rng_state",
+        "python_random_state",
+        "torch_cpu_global_rng_state",
+        "torch_cuda_global_rng_state",
+        "sample_cursor",
+        "sample_plan_sha256",
+        "manifest_sha256",
+        "conditionals_artifact_sha256",
+        "resolved_config",
+        "provenance",
+        "reference_checkpoint",
+        "optimizer_contract",
+    }
+    missing = required - set(payload.keys())
+    if missing:
+        raise RuntimeError(
+            f"intermediate checkpoint missing fields: {sorted(missing)}"
+        )
+    if payload["schema"] != FULL_SEQUENCE_TRAINER_SCHEMA:
+        raise RuntimeError("intermediate checkpoint schema mismatch")
+    if payload["run_kind"] != FULL_SEQUENCE_RUN_KIND:
+        raise RuntimeError("intermediate checkpoint run_kind mismatch")
+    if payload["objective_version"] != FULL_SEQUENCE_OBJECTIVE_VERSION:
+        raise RuntimeError("intermediate checkpoint objective_version mismatch")
+    if payload["objective_mode"] != deployment.FULL_SEQUENCE_OBJECTIVE_MODE:
+        raise RuntimeError("intermediate checkpoint objective_mode mismatch")
+    if payload["status"] != "PRODUCTION":
+        raise RuntimeError("intermediate checkpoint status must be PRODUCTION")
+    if int(payload["global_step"]) != int(expected_checkpoint_step):
+        raise RuntimeError("intermediate checkpoint global_step mismatch")
+    if str(payload["git_sha"]) != str(expected_training_git_sha):
+        raise RuntimeError("intermediate checkpoint training git_sha mismatch")
+    if not _is_sha256(checkpoint_sha256):
+        raise RuntimeError("intermediate checkpoint SHA256 must be valid")
+    reference = payload["reference_checkpoint"]
+    if not isinstance(reference, Mapping):
+        raise TypeError("intermediate checkpoint reference_checkpoint must be mapping")
+    if reference.get("sha256") != str(expected_official_sha256):
+        raise RuntimeError("intermediate checkpoint official parent SHA mismatch")
+    if payload["sample_cursor"] != nf_sf_full_sequence_train_cursor(
+        int(expected_checkpoint_step)
+    ):
+        raise RuntimeError("intermediate checkpoint sample_cursor mismatch")
+    state_dict = payload["generator"]
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("intermediate checkpoint generator must be a state dict")
+    if _count_mcp_tensors(state_dict) <= 0:
+        raise RuntimeError("intermediate checkpoint generator missing MCP tensors")
+    for key in ("sample_plan_sha256", "manifest_sha256", "conditionals_artifact_sha256"):
+        value = payload.get(key)
+        if not _is_sha256(value):
+            raise RuntimeError(f"intermediate checkpoint {key} missing or invalid")
+    for key in ("train_rng_state", "validation_base_rng_state", "torch_cpu_global_rng_state"):
+        if not torch.is_tensor(payload.get(key)):
+            raise RuntimeError(f"intermediate checkpoint {key} must be a tensor")
+    resolved = payload["resolved_config"]
+    if not isinstance(resolved, Mapping):
+        raise TypeError("intermediate checkpoint resolved_config must be mapping")
+    if int(resolved.get("num_frame_per_block", -1)) != FULL_SEQUENCE_CHUNK_FRAMES:
+        raise RuntimeError("intermediate checkpoint resolved_config nfpb mismatch")
+    if resolved.get("gradient_checkpointing") is not True:
+        raise RuntimeError(
+            "intermediate checkpoint resolved_config gradient_checkpointing mismatch"
+        )
+    provenance = payload["provenance"]
+    if not isinstance(provenance, Mapping):
+        raise TypeError("intermediate checkpoint provenance must be mapping")
+    if provenance.get("paper_exact_reproduction") is not False:
+        raise RuntimeError(
+            "intermediate checkpoint must record paper_exact_reproduction=false"
+        )
+    if provenance.get("schema") != FULL_SEQUENCE_TRAINER_SCHEMA:
+        raise RuntimeError("intermediate checkpoint provenance schema mismatch")
+    if provenance.get("run_kind") != FULL_SEQUENCE_RUN_KIND:
+        raise RuntimeError("intermediate checkpoint provenance run_kind mismatch")
+    if provenance.get("objective_version") != FULL_SEQUENCE_OBJECTIVE_VERSION:
+        raise RuntimeError("intermediate checkpoint provenance objective_version mismatch")
+
+
+def _count_mcp_tensors(state_dict: Mapping[str, Any]) -> int:
+    return sum(
+        1
+        for key, value in state_dict.items()
+        if is_mcp_state_key(str(key)) and torch.is_tensor(value)
+    )
+
+
+def _is_sha256(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.lower()
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
 def _model_with_block_mask(generator: Any) -> Any:

@@ -24,7 +24,9 @@ from scripts.eval_nf_sf_full_sequence_deployment import (
 from utils.nf_sf_first_mcp_route_equivalence import (
     FIRST_MCP_ROUTE_EQUIVALENCE_SCHEMA,
     build_flow_match_scheduler,
+    load_route_equivalence_checkpoint_record,
     run_first_mcp_route_equivalence_audit,
+    route_equivalence_checkpoint_loader_mode,
 )
 from utils.nf_sf_full_sequence_eval import (
     FULL_SEQUENCE_FRAME_COUNT,
@@ -35,7 +37,6 @@ from utils.nf_sf_full_sequence_eval import (
     build_common_inputs_record,
     current_git_head,
     file_sha256,
-    load_full_sequence_checkpoint_record,
     tensor_sha256,
     validate_eval_artifact_identity,
 )
@@ -55,6 +56,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("configs/self_forcing_dmd_mcp.yaml"),
     )
     parser.add_argument("--full_sequence_checkpoint", required=True, type=Path)
+    parser.add_argument(
+        "--expected_checkpoint_step",
+        type=int,
+        choices=(0, 500, 2000, 5000),
+        required=True,
+    )
     parser.add_argument("--sample_plan", required=True, type=Path)
     parser.add_argument("--teacher_manifest", required=True, type=Path)
     parser.add_argument("--dataset_root", required=True, type=Path)
@@ -91,8 +98,9 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         num_samples=int(args.num_samples),
     )
     teacher_manifest_sha256 = file_sha256(args.teacher_manifest)
-    full_checkpoint = load_full_sequence_checkpoint_record(
+    full_checkpoint = load_route_equivalence_checkpoint_record(
         args.full_sequence_checkpoint,
+        expected_checkpoint_step=int(args.expected_checkpoint_step),
         expected_training_git_sha=str(args.expected_training_git_sha),
     )
     if full_checkpoint.payload is None:
@@ -155,11 +163,21 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             artifact_identity["selected_validation_position"]
         ),
     )
+    checkpoint_loader_mode = route_equivalence_checkpoint_loader_mode(
+        int(args.expected_checkpoint_step)
+    )
+    diagnostic_intermediate = int(args.expected_checkpoint_step) != 5000
     common_inputs.update(
         {
             "audit_schema": FIRST_MCP_ROUTE_EQUIVALENCE_SCHEMA,
             "diagnostic_only": True,
             "non_deployable": True,
+            "expected_checkpoint_step": int(args.expected_checkpoint_step),
+            "loaded_checkpoint_global_step": int(full_checkpoint.global_step),
+            "checkpoint_loader_mode": checkpoint_loader_mode,
+            "diagnostic_intermediate_checkpoint": diagnostic_intermediate,
+            "production_training_git_sha": str(full_checkpoint.training_git_sha),
+            "checkpoint_sha256": str(full_checkpoint.sha256),
             "runtime_contract": runtime_contract,
             "repo_preflight": repo_preflight,
             "artifact_identity": artifact_identity,
@@ -211,7 +229,13 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             teacher_target=teacher_target,
             teacher_payload=teacher_payload,
             conditional_dict=conditional_dict,
-            checkpoint_summary=full_checkpoint.to_json(),
+            checkpoint_summary={
+                **full_checkpoint.to_json(),
+                "expected_checkpoint_step": int(args.expected_checkpoint_step),
+                "loaded_checkpoint_global_step": int(full_checkpoint.global_step),
+                "checkpoint_loader_mode": checkpoint_loader_mode,
+                "diagnostic_intermediate_checkpoint": diagnostic_intermediate,
+            },
             common_inputs=common_inputs,
             common_inputs_fingerprint_sha256=common_fingerprint,
             runtime_git_sha=git_sha,

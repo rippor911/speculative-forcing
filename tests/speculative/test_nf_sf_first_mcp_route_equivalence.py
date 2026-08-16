@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -289,12 +290,108 @@ def make_audit_result(
         teacher_target=teacher,
         teacher_payload={"rollout_seed": 123, "prompt": "prompt"},
         conditional_dict={"prompt_embeds": torch.zeros((1, 2, 3))},
-        checkpoint_summary={"type": "full_sequence_step5000", "sha256": TEST_SHA},
+        checkpoint_summary={
+            "type": "full_sequence_step5000",
+            "checkpoint_type": "full_sequence_step5000",
+            "load_mode": "FULL_SEQUENCE_GENERATOR_STRICT_WITH_MCP",
+            "sha256": TEST_SHA,
+            "global_step": 5000,
+            "training_git_sha": TRAINING_GIT_SHA,
+            "expected_checkpoint_step": 5000,
+            "loaded_checkpoint_global_step": 5000,
+            "checkpoint_loader_mode": audit.CHECKPOINT_LOADER_MODE_FINAL,
+            "diagnostic_intermediate_checkpoint": False,
+        },
         common_inputs=common,
         common_inputs_fingerprint_sha256=fingerprint,
         runtime_git_sha=RUNTIME_GIT_SHA,
         training_checkpoint_git_sha=TRAINING_GIT_SHA,
     )
+
+
+def make_intermediate_payload(step: int) -> dict[str, Any]:
+    return {
+        "schema": audit.FULL_SEQUENCE_TRAINER_SCHEMA,
+        "run_kind": audit.FULL_SEQUENCE_RUN_KIND,
+        "objective_version": audit.FULL_SEQUENCE_OBJECTIVE_VERSION,
+        "objective_mode": ev.FULL_SEQUENCE_OBJECTIVE_MODE,
+        "status": "PRODUCTION",
+        "global_step": int(step),
+        "git_sha": TRAINING_GIT_SHA,
+        "generator": {
+            "model.weight": torch.zeros(1),
+            "mcp.depth1.weight": torch.ones(1),
+        },
+        "optimizer": {"state": {}},
+        "train_rng_state": torch.get_rng_state(),
+        "validation_seed": 456,
+        "validation_base_rng_state": torch.get_rng_state(),
+        "python_random_state": (3, (), None),
+        "torch_cpu_global_rng_state": torch.get_rng_state(),
+        "torch_cuda_global_rng_state": None,
+        "sample_cursor": audit.nf_sf_full_sequence_train_cursor(int(step)),
+        "sample_plan_sha256": "b" * 64,
+        "manifest_sha256": "c" * 64,
+        "conditionals_artifact_sha256": "d" * 64,
+        "resolved_config": {
+            "num_frame_per_block": 3,
+            "gradient_checkpointing": True,
+        },
+        "provenance": {
+            "schema": audit.FULL_SEQUENCE_TRAINER_SCHEMA,
+            "run_kind": audit.FULL_SEQUENCE_RUN_KIND,
+            "objective_version": audit.FULL_SEQUENCE_OBJECTIVE_VERSION,
+            "paper_exact_reproduction": False,
+        },
+        "reference_checkpoint": {
+            "path": "checkpoints/self_forcing_dmd.pt",
+            "sha256": ev.OFFICIAL_SELF_FORCING_CHECKPOINT_SHA256,
+            "size_bytes": 11,
+        },
+        "optimizer_contract": {"class": "AdamW"},
+    }
+
+
+def write_intermediate_checkpoint(
+    tmp_path: Path,
+    *,
+    step: int,
+    payload_updates: dict[str, Any] | None = None,
+    validation_updates: dict[str, Any] | None = None,
+    filename: str | None = None,
+    sha_sidecar_text: str | None = None,
+) -> Path:
+    payload = make_intermediate_payload(step)
+    if payload_updates:
+        payload.update(payload_updates)
+    path = tmp_path / (filename or f"checkpoint_step{int(step):06d}.pt")
+    torch.save(payload, path)
+    actual_sha = ev.file_sha256(path)
+    stem = path.with_suffix("")
+    sha_text = sha_sidecar_text or f"{actual_sha}  {path.name}\n"
+    stem.with_suffix(".sha256.txt").write_text(sha_text, encoding="utf-8")
+    validation = {
+        "status": "PASS",
+        "path": str(path.resolve()),
+        "sha256": actual_sha,
+        "size_bytes": int(path.stat().st_size),
+        "schema": ev.CHECKPOINT_VALIDATION_SCHEMA,
+        "run_kind": audit.FULL_SEQUENCE_RUN_KIND,
+        "objective_version": audit.FULL_SEQUENCE_OBJECTIVE_VERSION,
+        "objective_mode": ev.FULL_SEQUENCE_OBJECTIVE_MODE,
+        "global_step": int(step),
+        "generator_key_count": len(payload["generator"])
+        if isinstance(payload.get("generator"), dict)
+        else 0,
+        "optimizer_state_entry_count": 0,
+    }
+    if validation_updates:
+        validation.update(validation_updates)
+    stem.with_suffix(".validation.json").write_text(
+        json.dumps(validation),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_raw_timestep_support_contract() -> None:
@@ -307,6 +404,193 @@ def test_raw_timestep_support_contract() -> None:
     support = result.manifest["training_raw_support_contract"]
     assert support["training_raw_min"] == 0
     assert support["training_raw_max_inclusive"] == 999
+
+
+@pytest.mark.parametrize("step", [0, 500, 2000])
+def test_intermediate_checkpoint_loader_accepts_strict_payload(
+    tmp_path: Path,
+    step: int,
+) -> None:
+    path = write_intermediate_checkpoint(tmp_path, step=step)
+    record = audit.load_route_equivalence_checkpoint_record(
+        path,
+        expected_checkpoint_step=step,
+        expected_training_git_sha=TRAINING_GIT_SHA,
+    )
+    assert record.global_step == step
+    assert record.checkpoint_type == f"full_sequence_step{step}"
+    assert record.load_mode == audit.CHECKPOINT_LOADER_MODE_INTERMEDIATE
+    assert record.training_git_sha == TRAINING_GIT_SHA
+    assert record.validation_sidecar["global_step"] == step
+    assert record.payload["generator"]["mcp.depth1.weight"].item() == 1.0
+
+
+def test_intermediate_checkpoint_loader_rejects_wrong_expected_step(
+    tmp_path: Path,
+) -> None:
+    path = write_intermediate_checkpoint(tmp_path, step=500)
+    with pytest.raises(RuntimeError, match="filename"):
+        audit.load_route_equivalence_checkpoint_record(
+            path,
+            expected_checkpoint_step=0,
+            expected_training_git_sha=TRAINING_GIT_SHA,
+        )
+
+
+def test_intermediate_checkpoint_loader_rejects_unsupported_step() -> None:
+    with pytest.raises(ValueError, match="0, 500, 2000, 5000"):
+        audit.load_route_equivalence_checkpoint_record(
+            Path("checkpoint_step000125.pt"),
+            expected_checkpoint_step=125,
+            expected_training_git_sha=TRAINING_GIT_SHA,
+        )
+
+
+def test_final_checkpoint_loader_delegates_to_canonical(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_canonical_loader(path, *, expected_training_git_sha, expected_official_sha256):
+        calls.append(
+            {
+                "path": Path(path),
+                "expected_training_git_sha": expected_training_git_sha,
+                "expected_official_sha256": expected_official_sha256,
+            }
+        )
+        return ev.DeploymentCheckpointRecord(
+            path=str(Path(path)),
+            sha256=TEST_SHA,
+            checkpoint_type="full_sequence_step5000",
+            load_mode="FULL_SEQUENCE_GENERATOR_STRICT_WITH_MCP",
+            generator_state_dict={"mcp.depth1.weight": torch.ones(1)},
+            global_step=5000,
+            training_git_sha=expected_training_git_sha,
+            payload={"global_step": 5000, "git_sha": expected_training_git_sha},
+            validation_sidecar={"global_step": 5000},
+        )
+
+    monkeypatch.setattr(
+        audit.deployment,
+        "load_full_sequence_checkpoint_record",
+        fake_canonical_loader,
+    )
+    record = audit.load_route_equivalence_checkpoint_record(
+        Path("checkpoint_step005000.pt"),
+        expected_checkpoint_step=5000,
+        expected_training_git_sha=TRAINING_GIT_SHA,
+    )
+    assert len(calls) == 1
+    assert record.checkpoint_type == "full_sequence_step5000"
+    assert audit.route_equivalence_checkpoint_loader_mode(5000) == (
+        audit.CHECKPOINT_LOADER_MODE_FINAL
+    )
+
+
+def test_route_equivalence_cli_requires_expected_checkpoint_step() -> None:
+    from scripts import diagnose_nf_sf_first_mcp_route_equivalence as route_cli
+
+    argv = [
+        "--full_sequence_checkpoint",
+        "checkpoint_step000500.pt",
+        "--sample_plan",
+        "sample_plan.json",
+        "--teacher_manifest",
+        "manifest.json",
+        "--dataset_root",
+        "dataset",
+        "--output_dir",
+        "out",
+        "--expected_runtime_git_sha",
+        RUNTIME_GIT_SHA,
+    ]
+    with pytest.raises(SystemExit):
+        route_cli.parse_args(argv)
+    parsed = route_cli.parse_args(
+        argv[:2] + ["--expected_checkpoint_step", "500"] + argv[2:]
+    )
+    assert parsed.expected_checkpoint_step == 500
+    with pytest.raises(SystemExit):
+        route_cli.parse_args(
+            argv[:2] + ["--expected_checkpoint_step", "125"] + argv[2:]
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"filename": "checkpoint_step000500.pt"}, "filename"),
+        ({"sha_sidecar_text": "0" * 64 + "  checkpoint_step000000.pt\n"}, "SHA256 sidecar"),
+        ({"validation_updates": {"global_step": 500}}, "global_step"),
+        ({"validation_updates": {"sha256": "1" * 64}}, "validation SHA"),
+        ({"validation_updates": {"path": "wrong.pt"}}, "validation path"),
+        ({"validation_updates": {"status": "FAIL"}}, "status"),
+        ({"validation_updates": {"schema": "bad"}}, "schema"),
+        ({"payload_updates": {"schema": "bad"}}, "schema mismatch"),
+        ({"payload_updates": {"global_step": 500}}, "global_step"),
+        ({"validation_updates": {"objective_version": "bad"}}, "objective_version"),
+        ({"payload_updates": {"git_sha": "f" * 40}}, "training git_sha"),
+        (
+            {
+                "payload_updates": {
+                    "reference_checkpoint": {
+                        "path": "checkpoints/self_forcing_dmd.pt",
+                        "sha256": "e" * 64,
+                        "size_bytes": 11,
+                    }
+                }
+            },
+            "official parent",
+        ),
+        (
+            {
+                "payload_updates": {
+                    "provenance": {
+                        "schema": audit.FULL_SEQUENCE_TRAINER_SCHEMA,
+                        "run_kind": audit.FULL_SEQUENCE_RUN_KIND,
+                        "objective_version": audit.FULL_SEQUENCE_OBJECTIVE_VERSION,
+                        "paper_exact_reproduction": True,
+                    }
+                }
+            },
+            "paper_exact_reproduction",
+        ),
+    ],
+)
+def test_intermediate_checkpoint_loader_rejects_tamper(
+    tmp_path: Path,
+    kwargs: dict[str, Any],
+    match: str,
+) -> None:
+    path = write_intermediate_checkpoint(tmp_path, step=0, **kwargs)
+    with pytest.raises(RuntimeError, match=match):
+        audit.load_route_equivalence_checkpoint_record(
+            path,
+            expected_checkpoint_step=0,
+            expected_training_git_sha=TRAINING_GIT_SHA,
+        )
+
+
+def test_intermediate_checkpoint_loader_rejects_missing_mcp(tmp_path: Path) -> None:
+    path = write_intermediate_checkpoint(
+        tmp_path,
+        step=0,
+        payload_updates={"generator": {"model.weight": torch.zeros(1)}},
+    )
+    with pytest.raises(RuntimeError, match="MCP tensors"):
+        audit.load_route_equivalence_checkpoint_record(
+            path,
+            expected_checkpoint_step=0,
+            expected_training_git_sha=TRAINING_GIT_SHA,
+        )
+
+
+def test_route_manifest_records_checkpoint_progression_metadata() -> None:
+    result = make_audit_result()
+    assert result.manifest["expected_checkpoint_step"] == 5000
+    assert result.manifest["loaded_checkpoint_global_step"] == 5000
+    assert result.manifest["checkpoint_loader_mode"] == audit.CHECKPOINT_LOADER_MODE_FINAL
+    assert result.manifest["diagnostic_intermediate_checkpoint"] is False
+    assert result.manifest["checkpoint_sha256"] == TEST_SHA
 
 
 def test_warped_timestep_uses_repo_function(monkeypatch) -> None:

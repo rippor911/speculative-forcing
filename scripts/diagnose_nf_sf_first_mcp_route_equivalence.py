@@ -59,7 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--expected_checkpoint_step",
         type=int,
-        choices=(0, 500, 2000, 5000),
+        choices=(0, 500, 2000, 5000, 6500, 8000),
         required=True,
     )
     parser.add_argument("--sample_plan", required=True, type=Path)
@@ -98,10 +98,15 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         num_samples=int(args.num_samples),
     )
     teacher_manifest_sha256 = file_sha256(args.teacher_manifest)
+    expected_checkpoint_git_sha = (
+        git_sha
+        if int(args.expected_checkpoint_step) in (6500, 8000)
+        else str(args.expected_training_git_sha)
+    )
     full_checkpoint = load_route_equivalence_checkpoint_record(
         args.full_sequence_checkpoint,
         expected_checkpoint_step=int(args.expected_checkpoint_step),
-        expected_training_git_sha=str(args.expected_training_git_sha),
+        expected_training_git_sha=expected_checkpoint_git_sha,
     )
     if full_checkpoint.payload is None:
         raise RuntimeError("full-sequence checkpoint payload missing after validation")

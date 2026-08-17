@@ -509,6 +509,10 @@ def test_route_equivalence_cli_requires_expected_checkpoint_step() -> None:
         argv[:2] + ["--expected_checkpoint_step", "500"] + argv[2:]
     )
     assert parsed.expected_checkpoint_step == 500
+    parsed = route_cli.parse_args(
+        argv[:2] + ["--expected_checkpoint_step", "6500"] + argv[2:]
+    )
+    assert parsed.expected_checkpoint_step == 6500
     with pytest.raises(SystemExit):
         route_cli.parse_args(
             argv[:2] + ["--expected_checkpoint_step", "125"] + argv[2:]

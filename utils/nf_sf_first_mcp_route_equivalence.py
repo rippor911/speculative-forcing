@@ -23,7 +23,6 @@ from utils.nf_sf_tensors import (
     flow_match_shift_timesteps,
 )
 from utils.nf_sf_training import (
-    FULL_SEQUENCE_CHECKPOINT_STEPS,
     FULL_SEQUENCE_OBJECTIVE_VERSION,
     FULL_SEQUENCE_RUN_KIND,
     FULL_SEQUENCE_TRAINER_SCHEMA,
@@ -33,6 +32,11 @@ from utils.nf_sf_training import (
     nf_sf_full_sequence_train_cursor,
 )
 from utils.scheduler import FlowMatchScheduler
+from utils.nf_sf_full_sequence_continuation import (
+    BASE_TRAINING_GIT_SHA,
+    CONTINUATION_SCHEMA,
+    validate_continuation_lineage,
+)
 
 
 FIRST_MCP_ROUTE_EQUIVALENCE_SCHEMA = (
@@ -52,6 +56,14 @@ FUTURE_START_FRAME = FUTURE_CHUNK_INDEX * FULL_SEQUENCE_CHUNK_FRAMES
 CURRENT_START_FRAME = CURRENT_CHUNK_INDEX * FULL_SEQUENCE_CHUNK_FRAMES
 CHECKPOINT_LOADER_MODE_FINAL = "CANONICAL_FINAL_STEP5000"
 CHECKPOINT_LOADER_MODE_INTERMEDIATE = "DIAGNOSTIC_INTERMEDIATE_STRICT"
+ROUTE_EQUIVALENCE_SUPPORTED_CHECKPOINT_STEPS = (
+    0,
+    500,
+    2000,
+    5000,
+    6500,
+    8000,
+)
 
 
 @dataclass(frozen=True)
@@ -1202,8 +1214,10 @@ def _validate_route_summary(summary: Any, *, route: str) -> None:
 
 def _validate_expected_checkpoint_step(value: int) -> int:
     step = int(value)
-    if step not in tuple(int(item) for item in FULL_SEQUENCE_CHECKPOINT_STEPS):
-        raise ValueError("expected checkpoint step must be one of 0, 500, 2000, 5000")
+    if step not in ROUTE_EQUIVALENCE_SUPPORTED_CHECKPOINT_STEPS:
+        raise ValueError(
+            "expected checkpoint step must be one of 0, 500, 2000, 5000, 6500, 8000"
+        )
     return step
 
 
@@ -1359,6 +1373,19 @@ def _validate_intermediate_checkpoint_payload(
         raise RuntimeError("intermediate checkpoint provenance run_kind mismatch")
     if provenance.get("objective_version") != FULL_SEQUENCE_OBJECTIVE_VERSION:
         raise RuntimeError("intermediate checkpoint provenance objective_version mismatch")
+    if int(expected_checkpoint_step) in (6500, 8000):
+        validate_continuation_lineage(
+            payload,
+            expected_target_step=int(expected_checkpoint_step),
+        )
+        resolved_base_git = resolved.get("base_training_git_sha")
+        if resolved_base_git != BASE_TRAINING_GIT_SHA:
+            raise RuntimeError("continuation checkpoint base training git mismatch")
+        continuation = provenance.get("continuation")
+        if not isinstance(continuation, Mapping):
+            raise RuntimeError("continuation checkpoint provenance missing")
+        if continuation.get("schema") != CONTINUATION_SCHEMA:
+            raise RuntimeError("continuation checkpoint schema mismatch")
 
 
 def _count_mcp_tensors(state_dict: Mapping[str, Any]) -> int:

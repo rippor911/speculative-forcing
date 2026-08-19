@@ -624,7 +624,7 @@ def test_ablation_plan_provenance_decision_rules_and_guards() -> None:
     assert decision["auto_declare_go"] is False
     assert decision["baseline_step6500"]["raw999_mcp1"] == pytest.approx(0.11986814439296722)
 
-    outside = Path("D:/nf_sf_direct_clean_kv_ablation_outside_repo")
+    outside = ROOT.parent / "nf_sf_direct_clean_kv_ablation_outside_repo"
     validate_ablation_real_run_guards(
         arm="control",
         parent_step=6500,
@@ -940,7 +940,7 @@ def test_smoke_plan_dry_run_and_log_interval_guard() -> None:
             "--expected_runtime_git_sha",
             "c3f89888bf6da31b48650f0a680dd6534943f56f",
             "--output_dir",
-            "D:/nf_sf_direct_clean_kv_ablation_outside_repo",
+            str(ROOT.parent / "nf_sf_direct_clean_kv_ablation_outside_repo"),
         ]
     )
     summary = runner.run_ablation(args)
@@ -958,7 +958,7 @@ def test_smoke_plan_dry_run_and_log_interval_guard() -> None:
             "--expected_runtime_git_sha",
             "c3f89888bf6da31b48650f0a680dd6534943f56f",
             "--output_dir",
-            "D:/nf_sf_direct_clean_kv_ablation_outside_repo",
+            str(ROOT.parent / "nf_sf_direct_clean_kv_ablation_outside_repo"),
             "--log_interval",
             "0",
         ]

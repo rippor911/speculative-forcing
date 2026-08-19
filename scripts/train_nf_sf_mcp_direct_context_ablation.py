@@ -487,6 +487,44 @@ def _mean_or_none(values: Sequence[float]) -> float | None:
     return float(sum(values) / len(values))
 
 
+def run_fixed_probe_memory_preflight(
+    *,
+    device: torch.device,
+    model,
+) -> dict[str, Any]:
+    cuda_active = torch.device(device).type == "cuda" and torch.cuda.is_available()
+
+    def cuda_memory_snapshot() -> dict[str, int | None]:
+        if not cuda_active:
+            return {
+                "allocated_bytes": None,
+                "reserved_bytes": None,
+                "device_total_bytes": None,
+            }
+        properties = torch.cuda.get_device_properties(device)
+        return {
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "device_total_bytes": int(properties.total_memory),
+        }
+
+    before = cuda_memory_snapshot()
+    gc.collect()
+    if cuda_active:
+        torch.cuda.empty_cache()
+    after = cuda_memory_snapshot()
+    return {
+        "schema": f"{NF_SF_MCP_DIRECT_CLEAN_KV_ABLATION_SCHEMA}_fixed_probe_memory_preflight_v1",
+        "diagnostic_only": True,
+        "allocated_before_gc_empty_cache": before["allocated_bytes"],
+        "reserved_before_gc_empty_cache": before["reserved_bytes"],
+        "allocated_after_gc_empty_cache": after["allocated_bytes"],
+        "reserved_after_gc_empty_cache": after["reserved_bytes"],
+        "device_total": after["device_total_bytes"],
+        "block_mask_cached_before_probe": getattr(model, "block_mask", None) is not None,
+    }
+
+
 def save_ablation_checkpoint(
     *,
     helpers: Mapping[str, Any],
@@ -766,6 +804,15 @@ def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     )
     validation_path = args.output_dir / f"validation_step{plan.target_step:06d}.json"
     helpers["write_m4_json"](validation, validation_path)
+    fixed_probe_memory_preflight = run_fixed_probe_memory_preflight(
+        device=device,
+        model=getattr(generator, "model", None),
+    )
+    fixed_probe_memory_preflight_path = args.output_dir / "fixed_probe_memory_preflight.json"
+    helpers["write_m4_json"](
+        fixed_probe_memory_preflight,
+        fixed_probe_memory_preflight_path,
+    )
     fixed_identity = str(sample_plan["fixed_decode_validation_identity"])
     with teacher_store.acquire(fixed_identity) as teacher_sample:
         source_noise = teacher_sample.source_noise.detach().cpu().to(
@@ -799,6 +846,8 @@ def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         **metadata,
         "fixed_probe": fixed_probe,
         "fixed_probe_path": str(fixed_probe_path.resolve()),
+        "fixed_probe_memory_preflight": fixed_probe_memory_preflight,
+        "fixed_probe_memory_preflight_path": str(fixed_probe_memory_preflight_path.resolve()),
     }
     checkpoint_path = save_ablation_checkpoint(
         helpers=helpers,
@@ -834,6 +883,8 @@ def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         "validation": helpers["compact_validation_summary"](validation, path=validation_path),
         "fixed_probe": fixed_probe,
         "fixed_probe_path": str(fixed_probe_path.resolve()),
+        "fixed_probe_memory_preflight": fixed_probe_memory_preflight,
+        "fixed_probe_memory_preflight_path": str(fixed_probe_memory_preflight_path.resolve()),
         "primary_fixed_probe_required": True,
         "checkpoint_path": str(checkpoint_path.resolve()),
         "checkpoint_sha256": file_sha256(checkpoint_path),

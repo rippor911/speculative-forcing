@@ -390,20 +390,29 @@ class _ProbeFakeMCP(nn.Module):
 
 
 class _ProbeFakeGenerator(nn.Module):
-    def __init__(self, *, create_block_mask: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        create_block_mask: bool = True,
+        replace_cached_block_mask: bool = False,
+    ) -> None:
         super().__init__()
         self.model = _ProbeFakeModel()
         self.mcp = _ProbeFakeMCP()
         self.grad_enabled = []
         self.create_block_mask = bool(create_block_mask)
+        self.replace_cached_block_mask = bool(replace_cached_block_mask)
         self.created_block_mask = object()
+        self.replacement_block_mask = object()
         self.forward_saw_block_mask_none = []
 
     def forward_full_sequence_next_forcing(self, **kwargs):
         self.grad_enabled.append(torch.is_grad_enabled())
         self.forward_saw_block_mask_none.append(self.model.block_mask is None)
-        if self.create_block_mask:
+        if self.model.block_mask is None and self.create_block_mask:
             self.model.block_mask = self.created_block_mask
+        elif self.model.block_mask is not None and self.replace_cached_block_mask:
+            self.model.block_mask = self.replacement_block_mask
         direct = bool(kwargs.get("direct_clean_context_kv", False))
         noisy = kwargs["noisy_image_or_video"]
         batch, _frames, channels, height, width = noisy.shape
@@ -521,8 +530,9 @@ def test_fixed_raw999_probe_contract_control_and_treatment() -> None:
     assert control["clean_context_token_count"] == 0
     assert control["block_mask_before_was_none"] is True
     assert control["block_mask_recreated_for_probe"] is True
+    assert control["block_mask_reused_cached"] is False
     assert control["block_mask_restored_exact"] is True
-    assert control["block_mask_policy"] == "reset_to_none_recreate_teacher_forcing_then_restore"
+    assert control["block_mask_policy"] == "create_teacher_forcing_from_none_then_restore_none"
     assert treatment["direct_clean_context_kv"] is True
     assert treatment["clean_context_token_count"] == 4680
     assert treatment["clean_context_grid_frames"] == 3
@@ -545,18 +555,23 @@ def test_fixed_raw999_probe_contract_control_and_treatment() -> None:
     assert all(value is False for value in treatment_generator.grad_enabled)
 
 
-def test_fixed_raw999_probe_resets_cached_block_mask_and_restores_identity() -> None:
+def test_fixed_raw999_probe_reuses_cached_block_mask_and_preserves_identity() -> None:
     generator = _ProbeFakeGenerator()
     original = object()
     generator.model.block_mask = original
 
     record = _run_probe(generator)
 
-    assert generator.forward_saw_block_mask_none == [True]
+    assert generator.forward_saw_block_mask_none == [False]
     assert generator.model.block_mask is original
     assert record["block_mask_before_was_none"] is False
-    assert record["block_mask_recreated_for_probe"] is True
+    assert record["block_mask_reused_cached"] is True
+    assert record["block_mask_recreated_for_probe"] is False
     assert record["block_mask_restored_exact"] is True
+    assert (
+        record["block_mask_policy"]
+        == "reuse_existing_teacher_forcing_cache_then_preserve_identity"
+    )
 
 
 def test_fixed_raw999_probe_fresh_block_mask_restores_none() -> None:
@@ -567,19 +582,31 @@ def test_fixed_raw999_probe_fresh_block_mask_restores_none() -> None:
     assert generator.forward_saw_block_mask_none == [True]
     assert generator.model.block_mask is None
     assert record["block_mask_before_was_none"] is True
+    assert record["block_mask_reused_cached"] is False
     assert record["block_mask_recreated_for_probe"] is True
     assert record["block_mask_restored_exact"] is True
+    assert record["block_mask_policy"] == "create_teacher_forcing_from_none_then_restore_none"
 
 
-def test_fixed_raw999_probe_fails_closed_if_block_mask_not_recreated_and_restores() -> None:
+def test_fixed_raw999_probe_fresh_fails_closed_if_block_mask_not_created() -> None:
     generator = _ProbeFakeGenerator(create_block_mask=False)
-    original = object()
-    generator.model.block_mask = original
 
-    with pytest.raises(RuntimeError, match="did not recreate teacher-forcing block_mask"):
+    with pytest.raises(RuntimeError, match="did not create teacher-forcing block_mask"):
         _run_probe(generator)
 
     assert generator.forward_saw_block_mask_none == [True]
+    assert generator.model.block_mask is None
+
+
+def test_fixed_raw999_probe_fails_closed_if_cached_block_mask_replaced_and_restores() -> None:
+    generator = _ProbeFakeGenerator(replace_cached_block_mask=True)
+    original = object()
+    generator.model.block_mask = original
+
+    with pytest.raises(RuntimeError, match="replaced cached teacher-forcing block_mask"):
+        _run_probe(generator)
+
+    assert generator.forward_saw_block_mask_none == [False]
     assert generator.model.block_mask is original
 
 
@@ -793,6 +820,57 @@ def test_validation_runs_no_grad_and_preserves_rng() -> None:
     assert result["schema"].endswith("_validation_v1")
     assert generator.grad_enabled == [False]
     assert torch.equal(before, train_rng.get_state())
+
+
+def test_fixed_probe_memory_preflight_cleans_allocator_and_source_order(monkeypatch) -> None:
+    from scripts import train_nf_sf_mcp_direct_context_ablation as runner
+
+    calls = []
+    allocated = iter((100, 40))
+    reserved = iter((200, 80))
+
+    monkeypatch.setattr(runner.gc, "collect", lambda: calls.append("gc") or 0)
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        runner.torch.cuda,
+        "memory_allocated",
+        lambda device=None: next(allocated),
+    )
+    monkeypatch.setattr(
+        runner.torch.cuda,
+        "memory_reserved",
+        lambda device=None: next(reserved),
+    )
+    monkeypatch.setattr(
+        runner.torch.cuda,
+        "get_device_properties",
+        lambda device=None: types.SimpleNamespace(total_memory=1000),
+    )
+    monkeypatch.setattr(runner.torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+
+    model = types.SimpleNamespace(block_mask=object())
+    record = runner.run_fixed_probe_memory_preflight(
+        device=torch.device("cuda"),
+        model=model,
+    )
+
+    assert calls == ["gc", "empty_cache"]
+    assert record["allocated_before_gc_empty_cache"] == 100
+    assert record["reserved_before_gc_empty_cache"] == 200
+    assert record["allocated_after_gc_empty_cache"] == 40
+    assert record["reserved_after_gc_empty_cache"] == 80
+    assert record["device_total"] == 1000
+    assert record["block_mask_cached_before_probe"] is True
+
+    runner_text = (
+        ROOT / "scripts" / "train_nf_sf_mcp_direct_context_ablation.py"
+    ).read_text(encoding="utf-8")
+    assert runner_text.index("helpers[\"write_m4_json\"](validation, validation_path)") < runner_text.index(
+        "fixed_probe_memory_preflight = run_fixed_probe_memory_preflight"
+    )
+    assert runner_text.index(
+        "fixed_probe_memory_preflight = run_fixed_probe_memory_preflight"
+    ) < runner_text.index("fixed_identity = str(sample_plan")
 
 
 def test_control_train_step_delegates_to_canonical_runner() -> None:

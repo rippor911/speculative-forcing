@@ -454,11 +454,16 @@ def run_fixed_raw999_probe_for_ablation(
     original_block_mask = model.block_mask
     block_mask_before_was_none = original_block_mask is None
     block_mask_recreated_for_probe = False
+    block_mask_reused_cached = original_block_mask is not None
     treatment = direct_clean_context_kv_enabled(arm)
     was_training = generator.training
     generator.eval()
     try:
-        model.block_mask = None
+        # Formal runs call this immediately after same-shape full-sequence
+        # validation. The cached mask is the already-used teacher-forcing mask;
+        # timestep and noise changes do not alter the attention topology.
+        if block_mask_before_was_none:
+            model.block_mask = None
         with _capture_selected_mcp_stack_kwargs(generator.mcp) as capture:
             def call_training():
                 return generator.forward_full_sequence_next_forcing(
@@ -475,9 +480,12 @@ def run_fixed_raw999_probe_for_ablation(
                 label="direct_clean_kv_ablation_fixed_raw999_training_route_probe",
                 fn=call_training,
             )
-        block_mask_recreated_for_probe = model.block_mask is not None
-        if not block_mask_recreated_for_probe:
-            raise RuntimeError("fixed raw999 probe did not recreate teacher-forcing block_mask")
+        if block_mask_before_was_none:
+            block_mask_recreated_for_probe = model.block_mask is not None
+            if not block_mask_recreated_for_probe:
+                raise RuntimeError("fixed raw999 probe did not create teacher-forcing block_mask")
+        elif model.block_mask is not original_block_mask:
+            raise RuntimeError("fixed raw999 probe replaced cached teacher-forcing block_mask")
     finally:
         model.block_mask = original_block_mask
         generator.train(was_training)
@@ -563,8 +571,13 @@ def run_fixed_raw999_probe_for_ablation(
         "forward_rng": dict(rng_guard),
         "block_mask_before_was_none": bool(block_mask_before_was_none),
         "block_mask_recreated_for_probe": bool(block_mask_recreated_for_probe),
+        "block_mask_reused_cached": bool(block_mask_reused_cached),
         "block_mask_restored_exact": bool(block_mask_restored_exact),
-        "block_mask_policy": "reset_to_none_recreate_teacher_forcing_then_restore",
+        "block_mask_policy": (
+            "create_teacher_forcing_from_none_then_restore_none"
+            if block_mask_before_was_none
+            else "reuse_existing_teacher_forcing_cache_then_preserve_identity"
+        ),
         "paper_exact_reproduction": False,
         "canonical_training_eligible": False,
         "canonical_deployment_eligible": False,

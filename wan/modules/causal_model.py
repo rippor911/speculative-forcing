@@ -910,6 +910,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         y=None,
         mcp_patch_inputs: list = None,
         return_features: tuple = None,
+        return_feature_halves: bool = False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -933,6 +934,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Features are sliced to the noisy half exactly as the head's input is,
                 so they always align with the tokens being predicted. Default None
                 keeps the single-tensor return every existing caller expects.
+            return_feature_halves (bool, *optional*):
+                Experimental opt-in for NF-SF direct clean-context MCP ablations.
+                When teacher-forcing with clean_x and return_features, aux also
+                exposes clean_features/noisy_features. Default False preserves the
+                current return schema and values.
 
         Returns:
             List[Tensor]:
@@ -1048,6 +1054,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return module(*inputs, **kwargs)
             return custom_forward
 
+        if return_feature_halves and not return_features:
+            raise ValueError("return_feature_halves requires return_features")
+
         features = [] if return_features else None
 
         for block_index, block in enumerate(self.blocks):
@@ -1066,11 +1075,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 # would silently lose the autograd graph.
                 features.append(x)
 
+        clean_features = noisy_features = None
         if clean_x is not None:
-            x = x[:, x.shape[1] // 2:]
+            half_tokens = x.shape[1] // 2
+            if features is not None and return_feature_halves:
+                clean_features = [f[:, :half_tokens] for f in features]
+                noisy_features = [f[:, half_tokens:] for f in features]
+            x = x[:, half_tokens:]
             # Keep the taps aligned with what the head predicts: drop the clean half.
             if features is not None:
-                features = [f[:, f.shape[1] // 2:] for f in features]
+                features = [f[:, half_tokens:] for f in features]
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
@@ -1083,11 +1097,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     f"return_features={return_features} requested but only {len(features)} of "
                     f"{len(self.blocks)} blocks matched; indices must be < num_layers."
                 )
-            return torch.stack(x), {
+            aux = {
                 "features": features,
                 "mcp_embeds": mcp_embeds,
                 "mcp_grid_sizes": mcp_grid_sizes,
             }
+            if return_feature_halves:
+                if clean_features is None or noisy_features is None:
+                    raise RuntimeError("return_feature_halves requires teacher-forced clean_x")
+                aux["clean_features"] = clean_features
+                aux["noisy_features"] = noisy_features
+            return torch.stack(x), aux
         return torch.stack(x)
 
     def forward(

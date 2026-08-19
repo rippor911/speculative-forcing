@@ -327,6 +327,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         timestep_main: torch.Tensor,
         mcp_anchor_inputs=(),
         aug_t: Optional[torch.Tensor] = None,
+        direct_clean_context_kv: bool = False,
     ) -> FullSequenceNFSFModelOutputs:
         """Training-only full-sequence Next-Forcing route.
 
@@ -350,6 +351,8 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         anchors = tuple(mcp_anchor_inputs or ())
         run_mcp = bool(anchors)
+        if direct_clean_context_kv and not run_mcp:
+            raise ValueError("direct_clean_context_kv requires MCP anchor inputs")
         if run_mcp:
             if self.mcp is None:
                 raise ValueError("MCP anchor inputs require add_mcp_modules()")
@@ -380,6 +383,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 "return_features": self.mcp_tap_layers,
                 "mcp_patch_inputs": mcp_patch_inputs,
             }
+            if direct_clean_context_kv:
+                model_kwargs["return_feature_halves"] = True
 
         out = self.model(
             noisy_image_or_video.permute(0, 2, 1, 3, 4),
@@ -398,6 +403,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     aux=aux,
                     anchors=anchors,
                     flat_mcp_entries=flat_mcp_entries,
+                    direct_clean_context_kv=direct_clean_context_kv,
                 )
             )
         else:
@@ -446,10 +452,22 @@ class WanDiffusionWrapper(torch.nn.Module):
             entry["flat_index"] = flat_index
         return tuple(entries)
 
-    def _run_full_sequence_anchor_mcp(self, *, aux, anchors, flat_mcp_entries):
+    def _run_full_sequence_anchor_mcp(
+        self,
+        *,
+        aux,
+        anchors,
+        flat_mcp_entries,
+        direct_clean_context_kv: bool = False,
+    ):
         features = tuple(aux["features"])
         if len(features) != len(self.mcp_tap_layers):
             raise ValueError("MCP feature tap count mismatch")
+        clean_features = None
+        if direct_clean_context_kv:
+            clean_features = tuple(aux["clean_features"])
+            if len(clean_features) != len(self.mcp_tap_layers):
+                raise ValueError("MCP clean feature tap count mismatch")
         embeds = tuple(aux["mcp_embeds"])
         grids = tuple(aux["mcp_grid_sizes"])
         if len(embeds) != len(flat_mcp_entries) or len(grids) != len(flat_mcp_entries):
@@ -475,6 +493,21 @@ class WanDiffusionWrapper(torch.nn.Module):
                 future_embeds.append(embeds[index])
                 future_grids.append(grids[index])
 
+            mcp_kwargs = {}
+            if direct_clean_context_kv and anchor_index > 0:
+                clean_stop = token_slice.start
+                mcp_kwargs = {
+                    "direct_clean_context_kv": True,
+                    "clean_context_features": tuple(
+                        feature[:, :clean_stop, :] for feature in clean_features
+                    ),
+                    "clean_context_grid_sizes": self._full_sequence_clean_context_grid_sizes(
+                        future_grids[0],
+                        anchor_index,
+                    ),
+                    "clean_context_start_frame": 0,
+                }
+
             flow_preds = self.mcp(
                 features=anchor_features,
                 future_embeds=future_embeds,
@@ -482,6 +515,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 future_start_frames=list(starts),
                 timesteps=list(timesteps),
                 freqs=self.model.freqs,
+                **mcp_kwargs,
             )
             if len(flow_preds) != len(depths):
                 raise RuntimeError("MCP chain output count mismatch for anchor")
@@ -508,6 +542,17 @@ class WanDiffusionWrapper(torch.nn.Module):
         chunk_tokens = FULL_SEQUENCE_FRAME_SEQ_LENGTH * FULL_SEQUENCE_CHUNK_FRAMES
         start = int(anchor_index) * chunk_tokens
         return slice(start, start + chunk_tokens)
+
+    @staticmethod
+    def _full_sequence_clean_context_grid_sizes(
+        target_grid_sizes: torch.Tensor,
+        anchor_index: int,
+    ) -> torch.Tensor:
+        if int(anchor_index) <= 0:
+            raise ValueError("clean context requires anchor_index > 0")
+        grid_sizes = target_grid_sizes.clone()
+        grid_sizes[:, 0] = int(anchor_index) * FULL_SEQUENCE_CHUNK_FRAMES
+        return grid_sizes
 
     @classmethod
     def _full_sequence_anchor_token_slices(cls) -> tuple[tuple[int, int], ...]:

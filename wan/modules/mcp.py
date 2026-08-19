@@ -67,12 +67,11 @@ class MCPSelfAttention(nn.Module):
     attend to other noisy tokens within the same chunk (self-attention within the
     chunk being denoised)."
 
-    The paper's mask also grants Noisy -> Clean (each noisy token attends to all
-    causally preceding clean context tokens). We cannot: in the Self-Forcing rollout
-    the clean history lives in the MAIN model's KV cache, which these weights cannot
-    read. History still reaches the head, but only through the fused backbone
-    features -- whose tokens already attended over that KV cache. Per-token, not by
-    the head's own attention.
+    The canonical/default path still does not grant Noisy -> Clean direct K/V:
+    history reaches the head only through fused backbone features. The experimental
+    `direct_clean_context_kv` ablation can opt in to target-query-only direct
+    preceding-clean K/V for MCP depth1. That path tests the clean-context bottleneck
+    without implementing the paper's full shared clean+noisy MCP mask.
 
     RoPE uses the chunk's true absolute start frame, i.e. the paper's
     RoPE(x_0^[k][i]) = RoPE(i + k) (Eq. 6).
@@ -94,7 +93,17 @@ class MCPSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, grid_sizes, freqs, start_frame):
+    def forward(
+        self,
+        x,
+        grid_sizes,
+        freqs,
+        start_frame,
+        *,
+        clean_context=None,
+        clean_context_grid_sizes=None,
+        clean_context_start_frame=0,
+    ):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -103,6 +112,23 @@ class MCPSelfAttention(nn.Module):
 
         roped_q = causal_rope_apply(q, grid_sizes, freqs, start_frame=start_frame).type_as(v)
         roped_k = causal_rope_apply(k, grid_sizes, freqs, start_frame=start_frame).type_as(v)
+
+        if clean_context is not None and clean_context.shape[1] > 0:
+            if clean_context_grid_sizes is None:
+                raise ValueError("clean_context_grid_sizes is required with clean_context")
+            if clean_context.shape[0] != b or clean_context.shape[2] != self.dim:
+                raise ValueError("clean_context must have shape [B, L_clean, dim]")
+            clean_s = clean_context.shape[1]
+            clean_k = self.norm_k(self.k(clean_context)).view(b, clean_s, n, d)
+            clean_v = self.v(clean_context).view(b, clean_s, n, d)
+            roped_clean_k = causal_rope_apply(
+                clean_k,
+                clean_context_grid_sizes,
+                freqs,
+                start_frame=clean_context_start_frame,
+            ).type_as(v)
+            roped_k = torch.cat([roped_clean_k, roped_k], dim=1)
+            v = torch.cat([clean_v, v], dim=1)
 
         x = attention(roped_q, roped_k, v)
         return self.o(x.flatten(2))
@@ -147,7 +173,18 @@ class MCPBlock(nn.Module):
 
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, e, grid_sizes, freqs, start_frame):
+    def forward(
+        self,
+        x,
+        e,
+        grid_sizes,
+        freqs,
+        start_frame,
+        *,
+        clean_context=None,
+        clean_context_grid_sizes=None,
+        clean_context_start_frame=0,
+    ):
         r"""
         Args:
             x (Tensor): [B, L, C]
@@ -156,11 +193,18 @@ class MCPBlock(nn.Module):
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
+        attn_input = (
+            self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]
+        ).flatten(1, 2)
+        clean_attn_context = None if clean_context is None else self.norm1(clean_context)
         y = self.self_attn(
-            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
+            attn_input,
             grid_sizes,
             freqs,
             start_frame,
+            clean_context=clean_attn_context,
+            clean_context_grid_sizes=clean_context_grid_sizes,
+            clean_context_start_frame=clean_context_start_frame,
         )
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
@@ -242,7 +286,20 @@ class MCPModule(nn.Module):
         # (bias is already zeroed by the generic Linear loop above.)
         nn.init.zeros_(self.head.head.weight)
 
-    def forward(self, upstream, future_tokens, grid_sizes, start_frame, timestep, freqs):
+    def forward(
+        self,
+        upstream,
+        future_tokens,
+        grid_sizes,
+        start_frame,
+        timestep,
+        freqs,
+        *,
+        direct_clean_context_kv=False,
+        clean_context=None,
+        clean_context_grid_sizes=None,
+        clean_context_start_frame=0,
+    ):
         """
         Args:
             upstream (Tensor): [B, L, dim] fused backbone feature (module 1) or the
@@ -281,8 +338,18 @@ class MCPModule(nn.Module):
         )
         e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=timestep.shape)
 
+        block_clean_context = clean_context if direct_clean_context_kv else None
         for block in self.blocks:
-            x = block(x, e0, grid_sizes, freqs, start_frame)
+            x = block(
+                x,
+                e0,
+                grid_sizes,
+                freqs,
+                start_frame,
+                clean_context=block_clean_context,
+                clean_context_grid_sizes=clean_context_grid_sizes,
+                clean_context_start_frame=clean_context_start_frame,
+            )
         hidden = x
 
         out = self.head(x, e.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2))
@@ -396,7 +463,20 @@ class MCPStack(nn.Module):
                 dst.modulation.copy_(src.modulation)
         return self
 
-    def forward(self, features, future_embeds, future_grid_sizes, future_start_frames, timesteps, freqs):
+    def forward(
+        self,
+        features,
+        future_embeds,
+        future_grid_sizes,
+        future_start_frames,
+        timesteps,
+        freqs,
+        *,
+        direct_clean_context_kv=False,
+        clean_context_features=None,
+        clean_context_grid_sizes=None,
+        clean_context_start_frame=0,
+    ):
         """
         Args:
             features (List[Tensor]): tapped backbone hidden states, each [B, L, dim],
@@ -421,6 +501,15 @@ class MCPStack(nn.Module):
 
         # h_prev^[0] = h_fuse  (Eq. 8)
         upstream = self.fusion(torch.cat(features, dim=-1))
+        clean_context = None
+        if direct_clean_context_kv and clean_context_features is not None:
+            if len(clean_context_features) != len(self.tap_layers):
+                raise ValueError(
+                    f"MCPStack expected {len(self.tap_layers)} clean context features, "
+                    f"got {len(clean_context_features)}"
+                )
+            if clean_context_features and clean_context_features[0].shape[1] > 0:
+                clean_context = self.fusion(torch.cat(clean_context_features, dim=-1))
 
         flow_preds = []
         for k, module in enumerate(self.mcp_modules):
@@ -433,6 +522,10 @@ class MCPStack(nn.Module):
                 start_frame=future_start_frames[k],
                 timestep=timesteps[k],
                 freqs=freqs,
+                direct_clean_context_kv=bool(direct_clean_context_kv and k == 0 and clean_context is not None),
+                clean_context=clean_context if k == 0 else None,
+                clean_context_grid_sizes=clean_context_grid_sizes if k == 0 else None,
+                clean_context_start_frame=clean_context_start_frame,
             )
             flow_preds.append(flow_pred)
         return flow_preds

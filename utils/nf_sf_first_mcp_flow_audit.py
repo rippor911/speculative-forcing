@@ -358,6 +358,7 @@ def validate_first_mcp_flow_audit_manifest(manifest: Mapping[str, Any]) -> None:
 def _run_predicted_rollout(
     *,
     runtime: deployment.DeploymentRuntime,
+    main_transition_scheduler: Any | None = None,
     mcp_scheduler: Any,
     source_noise: torch.Tensor,
     teacher_target: torch.Tensor,
@@ -416,7 +417,9 @@ def _run_predicted_rollout(
                 template=main_x0,
             )
             current_state = _add_noise_chunk(
-                runtime.scheduler,
+                runtime.scheduler
+                if main_transition_scheduler is None
+                else main_transition_scheduler,
                 clean=main_x0,
                 noise=current_noise,
                 timestep=_timestep(next_main_t, main_x0),
@@ -492,6 +495,7 @@ def _run_predicted_rollout(
 def _run_oracle_flow_rollout(
     *,
     runtime: deployment.DeploymentRuntime,
+    main_transition_scheduler: Any | None = None,
     mcp_scheduler: Any,
     source_noise: torch.Tensor,
     teacher_target: torch.Tensor,
@@ -558,7 +562,9 @@ def _run_oracle_flow_rollout(
                 template=main_x0,
             )
             current_state = _add_noise_chunk(
-                runtime.scheduler,
+                runtime.scheduler
+                if main_transition_scheduler is None
+                else main_transition_scheduler,
                 clean=main_x0,
                 noise=current_noise,
                 timestep=_timestep(next_main_t, main_x0),
@@ -895,8 +901,8 @@ def _require_main_trajectory_exact(
     predicted: Sequence[Mapping[str, str]],
     oracle: Sequence[Mapping[str, str]],
 ) -> None:
-    if len(predicted) != 4 or len(oracle) != 4:
-        raise RuntimeError("Main trajectory comparison requires four steps")
+    if len(predicted) != len(oracle) or len(predicted) <= 0:
+        raise RuntimeError("Main trajectory comparison requires equal nonempty steps")
     for index, (left, right) in enumerate(zip(predicted, oracle)):
         if dict(left) != dict(right):
             raise RuntimeError(f"oracle Main trajectory diverged at step {index}")

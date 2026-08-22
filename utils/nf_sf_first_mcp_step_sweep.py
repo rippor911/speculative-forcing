@@ -25,6 +25,9 @@ LIVE_JOINT_PREDICTED = "live_joint_predicted"
 TEACHER_CURRENT_PREDICTED_MCP = "teacher_current_predicted_mcp"
 ORACLE_FLOW = "oracle_flow"
 DEFAULT_STEP_COUNTS = (4, 8, 16, 32)
+SEMANTIC_RNG_COUPLING_SCHEMA = "first_mcp_step_sweep_semantic_rng_coupling_v1"
+SEMANTIC_RAW_TICK_DENOMINATOR = max(DEFAULT_STEP_COUNTS)
+CANONICAL_4_ANCHORED_RNG_MODE = "canonical_4_anchored_semantic_rng"
 CANONICAL_RAW_4 = deployment.RAW_DEPLOYMENT_SCHEDULE
 CANONICAL_MAIN_4 = deployment.MAIN_DEPLOYMENT_SCHEDULE
 CANONICAL_MCP_4 = deployment.MCP_DEPLOYMENT_SCHEDULE
@@ -133,6 +136,327 @@ def schedule_fingerprint(schedule: deployment.DeploymentSchedule) -> str:
     )
 
 
+def build_step_sweep_rng_plan(
+    *,
+    source_noise: torch.Tensor,
+    rollout_seed: int,
+    schedule: deployment.DeploymentSchedule,
+    step_count: int,
+    chunk_frames: int = deployment.FULL_SEQUENCE_CHUNK_FRAMES,
+) -> dict[str, Any]:
+    count = _validate_step_count(step_count)
+    validate_step_sweep_schedule(schedule, expected_step_count=count)
+    if source_noise.ndim != 5:
+        raise ValueError("source_noise must have layout [B, F, C, H, W]")
+    if int(source_noise.shape[1]) % int(chunk_frames) != 0:
+        raise ValueError("source_noise frame count must be chunk-aligned")
+    device = source_noise.device
+    source_sha = tensor_sha256(source_noise.detach().cpu())
+    num_chunks = int(source_noise.shape[1]) // int(chunk_frames)
+    active_before = deployment.global_rng_state_hash(device)
+    canonical_plan = deployment.build_absolute_chunk_rng_plan(
+        source_noise=source_noise,
+        rollout_seed=int(rollout_seed),
+        num_denoising_steps=4,
+        chunk_frames=int(chunk_frames),
+    )
+    compatibility = (
+        dict(canonical_plan["trace"]["compatibility_draw"])
+        if count == 4
+        else _semantic_compatibility_draw(
+            source_noise_sha256=source_sha,
+            rollout_seed=int(rollout_seed),
+            num_chunks=num_chunks,
+            num_denoising_steps=count,
+            device=device,
+        )
+    )
+    canonical_transition_steps = {
+        _destination_raw_timestep_tick(
+            deployment.resolve_deployment_schedule(),
+            step_index=step_index,
+        ): step_index
+        for step_index in range(len(deployment.RAW_DEPLOYMENT_SCHEDULE) - 1)
+    }
+    transitions: dict[tuple[int, int], torch.Tensor] = {}
+    contexts: dict[int, torch.Tensor] = {}
+    draws: list[dict[str, Any]] = []
+    draw_order = 1
+    for chunk_index in range(num_chunks):
+        start = int(chunk_index) * int(chunk_frames)
+        template = source_noise[:, start:start + int(chunk_frames)].flatten(0, 1)
+        for step_index in range(count - 1):
+            destination_tick = _destination_raw_timestep_tick(
+                schedule,
+                step_index=step_index,
+            )
+            canonical_step_index = canonical_transition_steps.get(destination_tick)
+            if canonical_step_index is None:
+                noise, record = _semantic_noise_like(
+                    template,
+                    source_noise_sha256=source_sha,
+                    rollout_seed=int(rollout_seed),
+                    purpose="transition_re_noise",
+                    draw_order=draw_order,
+                    chunk_index=chunk_index,
+                    solver_step_index=step_index,
+                    destination_raw_timestep_tick_32=destination_tick,
+                )
+            else:
+                noise = canonical_plan["transition_noises"][
+                    (int(chunk_index), int(canonical_step_index))
+                ].detach().clone()
+                record = _anchored_rng_record(
+                    noise,
+                    purpose="transition_re_noise",
+                    draw_order=draw_order,
+                    chunk_index=chunk_index,
+                    solver_step_index=step_index,
+                    destination_raw_timestep_tick_32=destination_tick,
+                    canonical_4_solver_step_index=canonical_step_index,
+                )
+            record["absolute_chunk_index"] = int(chunk_index)
+            transitions[(int(chunk_index), int(step_index))] = noise.detach().clone()
+            draws.append(record)
+            draw_order += 1
+        noise = canonical_plan["context_noises"][int(chunk_index)].detach().clone()
+        record = _anchored_rng_record(
+            noise,
+            purpose="context_clean_recache_noise",
+            draw_order=draw_order,
+            chunk_index=chunk_index,
+            solver_step_index=None,
+            destination_raw_timestep_tick_32=None,
+            canonical_4_solver_step_index=None,
+        )
+        record["absolute_chunk_index"] = int(chunk_index)
+        contexts[int(chunk_index)] = noise.detach().clone()
+        draws.append(record)
+        draw_order += 1
+    active_after = deployment.global_rng_state_hash(device)
+    if active_after != active_before:
+        raise RuntimeError("step sweep semantic RNG plan changed active RNG state")
+    coupling = _semantic_rng_coupling_contract()
+    trace = {
+        "schema": deployment.EVAL_RNG_PLAN_SCHEMA,
+        "rollout_seed": int(rollout_seed),
+        "source_noise_sha256": source_sha,
+        "canonical_4_rng_plan_fingerprint_sha256": canonical_plan["trace"][
+            "rng_plan_fingerprint_sha256"
+        ],
+        "post_reset_global_rng_state_hash": active_before,
+        "active_rng_unchanged": True,
+        "compatibility_draw": compatibility,
+        "draws": draws,
+        "draw_count": len(draws),
+        "semantic_coupling": coupling,
+    }
+    trace["rng_plan_fingerprint_sha256"] = deployment.rng_plan_fingerprint(trace)
+    return {
+        "schema": deployment.EVAL_RNG_PLAN_SCHEMA,
+        "semantic_coupling_schema": SEMANTIC_RNG_COUPLING_SCHEMA,
+        "coupling_mode": CANONICAL_4_ANCHORED_RNG_MODE,
+        "canonical_4_rng_preserved": True,
+        "rollout_seed": int(rollout_seed),
+        "num_chunks": int(num_chunks),
+        "chunk_frames": int(chunk_frames),
+        "num_denoising_steps": int(count),
+        "source_noise_sha256": source_sha,
+        "transition_noises": transitions,
+        "context_noises": contexts,
+        "trace": trace,
+    }
+
+
+def _semantic_rng_coupling_contract() -> dict[str, Any]:
+    return {
+        "schema": SEMANTIC_RNG_COUPLING_SCHEMA,
+        "mode": CANONICAL_4_ANCHORED_RNG_MODE,
+        "scope": "First-MCP denoising-step diagnostic sweep only",
+        "canonical_deployment_rng_unchanged": True,
+        "canonical_4_rng_preserved": True,
+        "context_noise_key": [
+            "canonical_4_context_clean_recache_noise",
+            "chunk_index",
+        ],
+        "transition_noise_key": [
+            "rollout_seed",
+            "source_noise_sha256",
+            "chunk_index",
+            "destination_raw_timestep_tick_32",
+        ],
+        "raw_tick_denominator": SEMANTIC_RAW_TICK_DENOMINATOR,
+        "canonical_4_anchor_destination_raw_timestep_ticks_32": [24, 16, 8],
+        "raw_tick_unit_timestep": (
+            float(DEFAULT_NUM_TRAIN_TIMESTEPS) / float(SEMANTIC_RAW_TICK_DENOMINATOR)
+        ),
+        "transition_alignment_semantics": (
+            "Noise is anchored to the canonical 4-step RNG plan at raw 750, "
+            "500, and 250; finer-only raw destinations use semantic keyed RNG."
+        ),
+    }
+
+
+def _semantic_compatibility_draw(
+    *,
+    source_noise_sha256: str,
+    rollout_seed: int,
+    num_chunks: int,
+    num_denoising_steps: int,
+    device: torch.device | str,
+) -> dict[str, Any]:
+    key = {
+        "schema": SEMANTIC_RNG_COUPLING_SCHEMA,
+        "rollout_seed": int(rollout_seed),
+        "source_noise_sha256": str(source_noise_sha256),
+        "purpose": "teacher_exit_flag_randint_compatibility",
+    }
+    generator = _semantic_torch_generator(key, device=device)
+    state_before = _generator_state_hash(generator)
+    values = torch.randint(
+        low=0,
+        high=int(num_denoising_steps),
+        size=(int(num_chunks),),
+        device=device,
+        dtype=torch.long,
+        generator=generator,
+    )
+    state_after = _generator_state_hash(generator)
+    return {
+        "draw_order": 0,
+        "purpose": "teacher_exit_flag_randint_compatibility",
+        "operation": "semantic_keyed_torch.randint",
+        "low": 0,
+        "high": int(num_denoising_steps),
+        "size": [int(num_chunks)],
+        "dtype": str(values.dtype),
+        "device": str(values.device),
+        "state_before_hash": state_before,
+        "state_after_hash": state_after,
+        "semantic_rng_key": key,
+        "values_sha256": tensor_sha256(values.detach().cpu()),
+        "values_discarded": True,
+    }
+
+
+def _anchored_rng_record(
+    noise: torch.Tensor,
+    *,
+    purpose: str,
+    draw_order: int,
+    chunk_index: int,
+    solver_step_index: int | None,
+    destination_raw_timestep_tick_32: int | None,
+    canonical_4_solver_step_index: int | None,
+) -> dict[str, Any]:
+    return {
+        "draw_order": int(draw_order),
+        "purpose": str(purpose),
+        "chunk_index": int(chunk_index),
+        "solver_step_index": (
+            None if solver_step_index is None else int(solver_step_index)
+        ),
+        "destination_raw_timestep_tick_32": destination_raw_timestep_tick_32,
+        "canonical_4_anchor": True,
+        "canonical_4_solver_step_index": (
+            None
+            if canonical_4_solver_step_index is None
+            else int(canonical_4_solver_step_index)
+        ),
+        "noise": deployment.tensor_json_summary(noise),
+    }
+
+
+def _semantic_noise_like(
+    template: torch.Tensor,
+    *,
+    source_noise_sha256: str,
+    rollout_seed: int,
+    purpose: str,
+    draw_order: int,
+    chunk_index: int,
+    solver_step_index: int | None,
+    destination_raw_timestep_tick_32: int | None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    semantic_key: dict[str, Any] = {
+        "schema": SEMANTIC_RNG_COUPLING_SCHEMA,
+        "rollout_seed": int(rollout_seed),
+        "source_noise_sha256": str(source_noise_sha256),
+        "purpose": str(purpose),
+        "chunk_index": int(chunk_index),
+    }
+    if destination_raw_timestep_tick_32 is None:
+        semantic_key["semantic_position"] = "context_clean_recache"
+    else:
+        semantic_key["destination_raw_timestep_tick_32"] = int(
+            destination_raw_timestep_tick_32
+        )
+        semantic_key["raw_tick_denominator"] = SEMANTIC_RAW_TICK_DENOMINATOR
+    generator = _semantic_torch_generator(semantic_key, device=template.device)
+    state_before = _generator_state_hash(generator)
+    noise = torch.randn(
+        tuple(template.shape),
+        device=template.device,
+        dtype=template.dtype,
+        generator=generator,
+    )
+    state_after = _generator_state_hash(generator)
+    return noise, {
+        "draw_order": int(draw_order),
+        "purpose": str(purpose),
+        "chunk_index": int(chunk_index),
+        "solver_step_index": (
+            None if solver_step_index is None else int(solver_step_index)
+        ),
+        "destination_raw_timestep_tick_32": destination_raw_timestep_tick_32,
+        "semantic_rng_key": semantic_key,
+        "state_before_hash": state_before,
+        "state_after_hash": state_after,
+        "noise": deployment.tensor_json_summary(noise),
+    }
+
+
+def _semantic_torch_generator(
+    semantic_key: Mapping[str, Any],
+    *,
+    device: torch.device | str,
+) -> torch.Generator:
+    device = torch.device(device)
+    generator_device = device if device.type == "cuda" else torch.device("cpu")
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(_semantic_seed(semantic_key))
+    return generator
+
+
+def _semantic_seed(semantic_key: Mapping[str, Any]) -> int:
+    digest = deployment.canonical_json_sha256(semantic_key)
+    return int(digest[:16], 16)
+
+
+def _generator_state_hash(generator: torch.Generator) -> str:
+    return tensor_sha256(generator.get_state().detach().cpu())
+
+
+def _destination_raw_timestep_tick(
+    schedule: deployment.DeploymentSchedule,
+    *,
+    step_index: int,
+) -> int:
+    destination = float(schedule.raw_schedule[int(step_index) + 1])
+    scaled = destination * float(SEMANTIC_RAW_TICK_DENOMINATOR) / float(
+        DEFAULT_NUM_TRAIN_TIMESTEPS
+    )
+    tick = int(round(scaled))
+    expected = (
+        float(DEFAULT_NUM_TRAIN_TIMESTEPS)
+        * float(tick)
+        / float(SEMANTIC_RAW_TICK_DENOMINATOR)
+    )
+    if abs(destination - expected) > 1.0e-4:
+        raise RuntimeError("step sweep raw destination timestep is off 32-tick grid")
+    return tick
+
+
 def run_first_mcp_step_sweep(
     *,
     runtime_factory: Callable[[], deployment.DeploymentRuntime],
@@ -173,10 +497,11 @@ def run_first_mcp_step_sweep(
                 shift=DEFAULT_S_MCP,
                 device=source_noise.device,
             )
-            rng_plan = deployment.build_absolute_chunk_rng_plan(
+            rng_plan = build_step_sweep_rng_plan(
                 source_noise=source_noise,
                 rollout_seed=int(teacher_payload["rollout_seed"]),
-                num_denoising_steps=count,
+                schedule=schedule,
+                step_count=count,
                 chunk_frames=deployment.FULL_SEQUENCE_CHUNK_FRAMES,
             )
             live = flow_audit._run_predicted_rollout(
@@ -225,6 +550,7 @@ def run_first_mcp_step_sweep(
                 "draw_count": int(rng_plan["trace"]["draw_count"]),
                 "num_denoising_steps": int(rng_plan["num_denoising_steps"]),
                 "source_noise_sha256": str(rng_plan["source_noise_sha256"]),
+                "semantic_coupling": dict(rng_plan["trace"]["semantic_coupling"]),
             }
             runs[key] = {
                 "step_count": int(count),
@@ -285,6 +611,7 @@ def run_first_mcp_step_sweep(
         ),
         "step_counts_requested": [int(value) for value in step_counts],
         "step_counts": [int(value) for value in counts],
+        "rng_coupling_contract": _semantic_rng_coupling_contract(),
         "schedule_by_step_count": schedule_records,
         "rng_plan_by_step_count": rng_records,
         "input_tensors": flow_audit._input_tensor_provenance(
@@ -454,21 +781,73 @@ def _step0_single_variable_fairness_report(
     for key in keys:
         live = _live_step0_identity(runs[key])
         teacher_current = _teacher_current_step0_identity(runs[key])
-        if live != live_ref:
-            raise RuntimeError(f"live step0 fairness mismatch for {key}-step")
-        if teacher_current != teacher_ref:
-            raise RuntimeError(
-                f"teacher-current step0 fairness mismatch for {key}-step"
-            )
-        if live["current_input_sha256"] != teacher_current["current_input_sha256"]:
-            raise RuntimeError(f"step0 current input mismatch for {key}-step")
-        if live["future_state_sha256"] != teacher_current["future_state_sha256"]:
-            raise RuntimeError(f"step0 future state mismatch for {key}-step")
-        if live["predicted_flow_sha256"] != teacher_current["predicted_flow_sha256"]:
-            raise RuntimeError(f"step0 predicted MCP flow mismatch for {key}-step")
+        _require_step0_identity_exact(
+            "live",
+            count_key=key,
+            reference=live_ref,
+            candidate=live,
+        )
+        _require_step0_identity_exact(
+            "teacher-current",
+            count_key=key,
+            reference=teacher_ref,
+            candidate=teacher_current,
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="current_input_sha256",
+            reference=live["current_input_sha256"],
+            candidate=teacher_current["current_input_sha256"],
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="future_state_sha256",
+            reference=live["future_state_sha256"],
+            candidate=teacher_current["future_state_sha256"],
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="main_warped_timestep",
+            reference=live["main_warped_timestep"],
+            candidate=teacher_current["main_warped_timestep"],
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="mcp_warped_timestep",
+            reference=live["mcp_warped_timestep"],
+            candidate=teacher_current["mcp_warped_timestep"],
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="history_kv_fingerprint_sha256",
+            reference=live["history_kv_fingerprint_sha256"],
+            candidate=teacher_current["history_kv_fingerprint_sha256"],
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="crossattn_cache_fingerprint_sha256",
+            reference=live["crossattn_cache_fingerprint_sha256"],
+            candidate=teacher_current["crossattn_cache_fingerprint_sha256"],
+        )
+        _require_step0_field_exact(
+            "live-vs-teacher-current",
+            count_key=key,
+            field="predicted_flow_sha256",
+            reference=live["predicted_flow_sha256"],
+            candidate=teacher_current["predicted_flow_sha256"],
+        )
         per_count[key] = {
             "live_vs_teacher_current_current_input_exact": True,
             "live_vs_teacher_current_future_state_exact": True,
+            "live_vs_teacher_current_timestep_exact": True,
+            "live_vs_teacher_current_history_kv_exact": True,
+            "live_vs_teacher_current_crossattn_cache_exact": True,
             "live_vs_teacher_current_predicted_flow_exact": True,
         }
     return {
@@ -484,21 +863,71 @@ def _step0_single_variable_fairness_report(
 
 
 def _live_step0_identity(run: Mapping[str, Any]) -> dict[str, str]:
-    step0 = run["branches"][LIVE_JOINT_PREDICTED]["steps"][0]
+    branch = run["branches"][LIVE_JOINT_PREDICTED]
+    step0 = branch["steps"][0]
     return {
         "current_input_sha256": str(step0["main"]["main_input_sha256"]),
         "future_state_sha256": str(step0["future_state"]["sha256"]),
+        "main_warped_timestep": str(step0["main_warped_timestep"]),
+        "mcp_warped_timestep": str(step0["mcp_warped_timestep"]),
+        "history_kv_fingerprint_sha256": str(
+            branch["history_kv_fingerprint_sha256"]
+        ),
+        "crossattn_cache_fingerprint_sha256": str(
+            branch["crossattn_cache_fingerprint_sha256"]
+        ),
         "predicted_flow_sha256": str(step0["predicted_flow"]["sha256"]),
     }
 
 
 def _teacher_current_step0_identity(run: Mapping[str, Any]) -> dict[str, str]:
-    step0 = run["branches"][TEACHER_CURRENT_PREDICTED_MCP]["steps"][0]
+    branch = run["branches"][TEACHER_CURRENT_PREDICTED_MCP]
+    step0 = branch["steps"][0]
     return {
         "current_input_sha256": str(step0["current_state"]["sha256"]),
         "future_state_sha256": str(step0["future_state"]["sha256"]),
+        "main_warped_timestep": str(step0["main_warped_timestep"]),
+        "mcp_warped_timestep": str(step0["mcp_warped_timestep"]),
+        "history_kv_fingerprint_sha256": str(
+            branch["history_kv_fingerprint_sha256"]
+        ),
+        "crossattn_cache_fingerprint_sha256": str(
+            branch["crossattn_cache_fingerprint_sha256"]
+        ),
         "predicted_flow_sha256": str(step0["predicted_flow"]["sha256"]),
     }
+
+
+def _require_step0_identity_exact(
+    branch_label: str,
+    *,
+    count_key: str,
+    reference: Mapping[str, str],
+    candidate: Mapping[str, str],
+) -> None:
+    for field, reference_value in reference.items():
+        _require_step0_field_exact(
+            branch_label,
+            count_key=count_key,
+            field=field,
+            reference=reference_value,
+            candidate=candidate.get(field),
+        )
+
+
+def _require_step0_field_exact(
+    branch_label: str,
+    *,
+    count_key: str,
+    field: str,
+    reference: Any,
+    candidate: Any,
+) -> None:
+    if candidate != reference:
+        raise RuntimeError(
+            f"{branch_label} step0 fairness mismatch for {count_key}-step "
+            f"field {field}: reference={reference} candidate={candidate}"
+        )
 
 
 def _validate_checkpoint_summary(checkpoint: Any) -> None:
@@ -571,6 +1000,10 @@ def validate_first_mcp_step_sweep_manifest(manifest: Mapping[str, Any]) -> None:
         common_inputs.get("fixed_decode_validation_identity")
     ):
         raise RuntimeError("step sweep fixed identity mismatch")
+    if dict(manifest.get("rng_coupling_contract") or {}) != (
+        _semantic_rng_coupling_contract()
+    ):
+        raise RuntimeError("step sweep RNG coupling contract mismatch")
     input_tensors = manifest.get("input_tensors")
     if not isinstance(input_tensors, Mapping):
         raise RuntimeError("step sweep input tensor provenance missing")
@@ -593,6 +1026,10 @@ def validate_first_mcp_step_sweep_manifest(manifest: Mapping[str, Any]) -> None:
             raise RuntimeError("step sweep RNG source noise SHA mismatch")
         if not _is_sha256(rng.get("rng_plan_fingerprint_sha256")):
             raise RuntimeError("step sweep RNG fingerprint invalid")
+        if dict(rng.get("semantic_coupling") or {}) != (
+            _semantic_rng_coupling_contract()
+        ):
+            raise RuntimeError("step sweep semantic RNG coupling mismatch")
         run = runs[key]
         if not isinstance(run, Mapping):
             raise RuntimeError("step sweep run entry must be a mapping")
@@ -652,7 +1089,7 @@ def _run_teacher_current_predicted_mcp(
     schedule: deployment.DeploymentSchedule,
     rng_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    flow_audit._recache_teacher_history0(
+    history_recache = flow_audit._recache_teacher_history0(
         runtime=runtime,
         source_noise=source_noise,
         teacher_target=teacher_target,
@@ -787,6 +1224,13 @@ def _run_teacher_current_predicted_mcp(
         "trace": {
             "mode": TEACHER_CURRENT_PREDICTED_MCP,
             "steps": trace_steps,
+            "history_recache": history_recache,
+            "history_kv_fingerprint_sha256": history_recache[
+                "history_kv_fingerprint_sha256"
+            ],
+            "crossattn_cache_fingerprint_sha256": history_recache[
+                "crossattn_cache_fingerprint_sha256"
+            ],
             "mcp_depths_used": [1],
             "used_model_flow_for_transition": True,
             "used_exact_flow_for_transition": False,
@@ -937,6 +1381,10 @@ def _validate_predicted_branch(
     )
     if not _is_sha256(branch.get("final_chunk2_sha256")):
         raise RuntimeError(f"{branch_name} final chunk2 SHA invalid")
+    if not _is_sha256(branch.get("history_kv_fingerprint_sha256")):
+        raise RuntimeError(f"{branch_name} history KV fingerprint invalid")
+    if not _is_sha256(branch.get("crossattn_cache_fingerprint_sha256")):
+        raise RuntimeError(f"{branch_name} cross-attn cache fingerprint invalid")
     if branch_name == TEACHER_CURRENT_PREDICTED_MCP:
         if branch.get("current_state_depends_on_previous_main_x0") is not False:
             raise RuntimeError("teacher-current branch must not depend on previous Main x0")
@@ -971,6 +1419,10 @@ def _validate_oracle_branch(
         raise RuntimeError("oracle gate failure")
     if not _is_sha256(branch.get("final_chunk2_sha256")):
         raise RuntimeError("oracle final chunk2 SHA invalid")
+    if not _is_sha256(branch.get("history_kv_fingerprint_sha256")):
+        raise RuntimeError("oracle history KV fingerprint invalid")
+    if not _is_sha256(branch.get("crossattn_cache_fingerprint_sha256")):
+        raise RuntimeError("oracle cross-attn cache fingerprint invalid")
 
 
 def _validate_steps(
@@ -1115,6 +1567,7 @@ __all__ = [
     "SUPPORT_FEW_STEP_INFERENCE_GAP",
     "TEACHER_CURRENT_PREDICTED_MCP",
     "FirstMCPStepSweepResult",
+    "build_step_sweep_rng_plan",
     "build_step_sweep_schedule",
     "build_step_sweep_scheduler",
     "evaluate_few_step_decision",

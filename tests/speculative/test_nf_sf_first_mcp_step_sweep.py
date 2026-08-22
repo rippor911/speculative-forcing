@@ -48,8 +48,9 @@ class BaseSweepGenerator(nn.Module):
             }
         )
         for layer in kwargs["kv_cache"]:
-            layer["k"][:, current_start:token_end] = 1.0 + len(self.calls)
-            layer["v"][:, current_start:token_end] = 2.0 + len(self.calls)
+            fill = float(current.detach().float().mean().item())
+            layer["k"][:, current_start:token_end] = 1.0 + fill
+            layer["v"][:, current_start:token_end] = 2.0 + fill
             layer["global_end_index"].fill_(token_end)
             layer["local_end_index"].fill_(token_end)
         return current, mcp_requested
@@ -244,6 +245,23 @@ def make_decision_runs(
     return runs
 
 
+def build_test_rng_plan(
+    count: int,
+    *,
+    source_noise: torch.Tensor | None = None,
+    rollout_seed: int = 123,
+) -> dict:
+    source = make_source_noise() if source_noise is None else source_noise
+    schedule = sweep.build_step_sweep_schedule(step_count=count)
+    return sweep.build_step_sweep_rng_plan(
+        source_noise=source,
+        rollout_seed=rollout_seed,
+        schedule=schedule,
+        step_count=count,
+        chunk_frames=ev.FULL_SEQUENCE_CHUNK_FRAMES,
+    )
+
+
 def test_step_sweep_schedules_are_generated_by_flow_match_scheduler() -> None:
     for count in sweep.DEFAULT_STEP_COUNTS:
         schedule = sweep.build_step_sweep_schedule(step_count=count)
@@ -261,6 +279,99 @@ def test_step_sweep_schedules_are_generated_by_flow_match_scheduler() -> None:
     assert schedule4.raw_schedule == ev.RAW_DEPLOYMENT_SCHEDULE
     assert schedule4.main_warped_schedule == ev.MAIN_DEPLOYMENT_SCHEDULE
     assert schedule4.mcp_warped_schedule == ev.MCP_DEPLOYMENT_SCHEDULE
+
+
+def test_semantic_rng_couples_context_noise_across_step_counts() -> None:
+    source = make_source_noise()
+    canonical = ev.build_absolute_chunk_rng_plan(
+        source_noise=source,
+        rollout_seed=123,
+        num_denoising_steps=4,
+        chunk_frames=ev.FULL_SEQUENCE_CHUNK_FRAMES,
+    )
+    plans = {count: build_test_rng_plan(count) for count in sweep.DEFAULT_STEP_COUNTS}
+    for chunk_index in range(ev.FULL_SEQUENCE_NUM_CHUNKS):
+        reference = plans[4]["context_noises"][chunk_index]
+        assert torch.equal(reference, canonical["context_noises"][chunk_index])
+        for count in (8, 16, 32):
+            assert torch.equal(reference, plans[count]["context_noises"][chunk_index])
+
+
+def test_step_sweep_4step_rng_preserves_canonical_deployment_rng() -> None:
+    source = make_source_noise()
+    canonical = ev.build_absolute_chunk_rng_plan(
+        source_noise=source,
+        rollout_seed=123,
+        num_denoising_steps=4,
+        chunk_frames=ev.FULL_SEQUENCE_CHUNK_FRAMES,
+    )
+    actual = build_test_rng_plan(4, source_noise=source)
+    assert actual["coupling_mode"] == sweep.CANONICAL_4_ANCHORED_RNG_MODE
+    assert actual["canonical_4_rng_preserved"] is True
+    assert actual["trace"]["rng_plan_fingerprint_sha256"] == canonical["trace"][
+        "rng_plan_fingerprint_sha256"
+    ]
+    for chunk_index in range(ev.FULL_SEQUENCE_NUM_CHUNKS):
+        assert torch.equal(
+            actual["context_noises"][chunk_index],
+            canonical["context_noises"][chunk_index],
+        )
+        for step_index in range(3):
+            assert torch.equal(
+                actual["transition_noises"][(chunk_index, step_index)],
+                canonical["transition_noises"][(chunk_index, step_index)],
+            )
+
+
+def test_semantic_rng_couples_transitions_by_destination_raw_timestep() -> None:
+    plans = {count: build_test_rng_plan(count) for count in sweep.DEFAULT_STEP_COUNTS}
+    by_count: dict[int, dict[int, torch.Tensor]] = {}
+    for count, plan in plans.items():
+        by_count[count] = {}
+        for record in plan["trace"]["draws"]:
+            if (
+                record["purpose"] == "transition_re_noise"
+                and record["chunk_index"] == flow_audit.FUTURE_CHUNK_INDEX
+            ):
+                tick = int(record["destination_raw_timestep_tick_32"])
+                by_count[count][tick] = plan["transition_noises"][
+                    (flow_audit.FUTURE_CHUNK_INDEX, int(record["solver_step_index"]))
+                ]
+
+    for tick in (24, 16, 8):
+        assert torch.equal(by_count[4][tick], by_count[8][tick])
+        assert torch.equal(by_count[4][tick], by_count[16][tick])
+        assert torch.equal(by_count[4][tick], by_count[32][tick])
+    assert 28 in by_count[8]
+    assert 28 not in by_count[4]
+    assert torch.equal(
+        build_test_rng_plan(8)["transition_noises"][
+            (flow_audit.FUTURE_CHUNK_INDEX, 0)
+        ],
+        by_count[8][28],
+    )
+
+
+def test_semantic_rng_is_deterministic_and_fingerprint_tracks_inputs() -> None:
+    before = ev.global_rng_state_hash(torch.device("cpu"))
+    plan_a = build_test_rng_plan(8)
+    after = ev.global_rng_state_hash(torch.device("cpu"))
+    plan_b = build_test_rng_plan(8)
+    changed_source = make_source_noise().clone()
+    changed_source[:, 0] = changed_source[:, 0] + 0.125
+    plan_source = build_test_rng_plan(8, source_noise=changed_source)
+    plan_seed = build_test_rng_plan(8, rollout_seed=124)
+
+    assert before == after
+    assert plan_a["trace"]["rng_plan_fingerprint_sha256"] == plan_b["trace"][
+        "rng_plan_fingerprint_sha256"
+    ]
+    assert plan_a["trace"]["rng_plan_fingerprint_sha256"] != plan_source["trace"][
+        "rng_plan_fingerprint_sha256"
+    ]
+    assert plan_a["trace"]["rng_plan_fingerprint_sha256"] != plan_seed["trace"][
+        "rng_plan_fingerprint_sha256"
+    ]
 
 
 def test_diagnostic_only_no_training_guards_are_recorded_and_source_clean() -> None:
@@ -394,7 +505,8 @@ def test_new_sweep_4step_live_branch_matches_existing_flow_audit_rollout() -> No
     source = make_source_noise()
     teacher = make_teacher_target()
     conditional = {"prompt_embeds": torch.zeros((1, 2, 3))}
-    rng_plan = ev.build_absolute_chunk_rng_plan(
+    schedule = sweep.build_step_sweep_schedule(step_count=4)
+    expected_rng_plan = ev.build_absolute_chunk_rng_plan(
         source_noise=source,
         rollout_seed=123,
         num_denoising_steps=4,
@@ -409,8 +521,8 @@ def test_new_sweep_4step_live_branch_matches_existing_flow_audit_rollout() -> No
         source_noise=source,
         teacher_target=teacher,
         conditional_dict=conditional,
-        schedule=ev.resolve_deployment_schedule(),
-        rng_plan=rng_plan,
+        schedule=schedule,
+        rng_plan=expected_rng_plan,
     )
     result = run_fake_sweep(RegressionGenerator())
     actual = result.tensors["runs"]["4"][sweep.LIVE_JOINT_PREDICTED]["final_chunk2"]
@@ -465,10 +577,11 @@ def test_teacher_current_branch_uses_teacher_corrupted_current_not_main_drift() 
         shift=DEFAULT_S_MAIN,
         device=torch.device("cpu"),
     )
-    rng_plan = ev.build_absolute_chunk_rng_plan(
+    rng_plan = sweep.build_step_sweep_rng_plan(
         source_noise=source,
         rollout_seed=123,
-        num_denoising_steps=4,
+        schedule=schedule,
+        step_count=4,
         chunk_frames=ev.FULL_SEQUENCE_CHUNK_FRAMES,
     )
     teacher_chunk1 = flow_audit._chunk(teacher, flow_audit.CURRENT_CHUNK_INDEX)
@@ -574,17 +687,92 @@ def test_step0_single_variable_fairness_gate_passes_and_rejects_tamper() -> None
     assert fairness["cross_count_live_exact"] is True
     assert fairness["cross_count_teacher_current_exact"] is True
     assert fairness["within_count_live_vs_teacher_current_exact"] is True
+    live_reference = sweep._live_step0_identity(manifest["runs"]["4"])
+    teacher_reference = sweep._teacher_current_step0_identity(manifest["runs"]["4"])
+    for field in (
+        "current_input_sha256",
+        "future_state_sha256",
+        "main_warped_timestep",
+        "mcp_warped_timestep",
+        "history_kv_fingerprint_sha256",
+        "crossattn_cache_fingerprint_sha256",
+        "predicted_flow_sha256",
+    ):
+        assert live_reference[field]
+        for count in sweep.DEFAULT_STEP_COUNTS:
+            run = manifest["runs"][str(count)]
+            assert sweep._live_step0_identity(run)[field] == live_reference[field]
+            assert (
+                sweep._teacher_current_step0_identity(run)[field]
+                == teacher_reference[field]
+            )
+            assert sweep._teacher_current_step0_identity(run)[field] == live_reference[field]
 
     live_cross_count = copy.deepcopy(manifest)
     live_cross_count["runs"]["8"]["branches"][sweep.LIVE_JOINT_PREDICTED][
         "steps"
     ][0]["predicted_flow"]["sha256"] = "0" * 64
-    with pytest.raises(RuntimeError, match="step0 fairness|step0 predicted"):
+    with pytest.raises(RuntimeError, match="8-step field predicted_flow_sha256"):
         sweep.validate_first_mcp_step_sweep_manifest(live_cross_count)
 
     within_count = copy.deepcopy(manifest)
     within_count["runs"]["16"]["branches"][sweep.TEACHER_CURRENT_PREDICTED_MCP][
         "steps"
     ][0]["current_state"]["sha256"] = "0" * 64
-    with pytest.raises(RuntimeError, match="step0"):
+    with pytest.raises(RuntimeError, match="16-step field current_input_sha256"):
         sweep.validate_first_mcp_step_sweep_manifest(within_count)
+
+    history_kv = copy.deepcopy(manifest)
+    history_kv["runs"]["32"]["branches"][sweep.LIVE_JOINT_PREDICTED][
+        "history_kv_fingerprint_sha256"
+    ] = "0" * 64
+    with pytest.raises(RuntimeError, match="32-step field history_kv"):
+        sweep.validate_first_mcp_step_sweep_manifest(history_kv)
+
+
+def _run_live_step0_probe(generator: nn.Module, count: int) -> dict[str, str]:
+    source = make_source_noise()
+    teacher = make_teacher_target()
+    schedule = sweep.build_step_sweep_schedule(step_count=count)
+    rng_plan = sweep.build_step_sweep_rng_plan(
+        source_noise=source,
+        rollout_seed=123,
+        schedule=schedule,
+        step_count=count,
+        chunk_frames=ev.FULL_SEQUENCE_CHUNK_FRAMES,
+    )
+    rollout = flow_audit._run_predicted_rollout(
+        runtime=make_runtime(generator),
+        main_transition_scheduler=sweep.build_step_sweep_scheduler(
+            step_count=count,
+            shift=DEFAULT_S_MAIN,
+            device=torch.device("cpu"),
+        ),
+        mcp_scheduler=sweep.build_step_sweep_scheduler(
+            step_count=count,
+            shift=DEFAULT_S_MCP,
+            device=torch.device("cpu"),
+        ),
+        source_noise=source,
+        teacher_target=teacher,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 2, 3))},
+        schedule=schedule,
+        rng_plan=rng_plan,
+    )
+    step0 = rollout["trace"]["steps"][0]
+    return {
+        "history_kv_fingerprint_sha256": rollout["trace"][
+            "history_kv_fingerprint_sha256"
+        ],
+        "current_input_sha256": step0["main"]["main_input_sha256"],
+        "future_state_sha256": step0["future_state"]["sha256"],
+        "predicted_flow_sha256": step0["predicted_flow"]["sha256"],
+    }
+
+
+def test_shared_generator_sequential_run_does_not_change_8step_step0() -> None:
+    shared = RegressionGenerator()
+    _run_live_step0_probe(shared, 4)
+    shared_after_4 = _run_live_step0_probe(shared, 8)
+    fresh_8 = _run_live_step0_probe(RegressionGenerator(), 8)
+    assert shared_after_4 == fresh_8

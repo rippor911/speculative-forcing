@@ -366,7 +366,7 @@ def _run_predicted_rollout(
     schedule: deployment.DeploymentSchedule,
     rng_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    _recache_teacher_history0(
+    history_recache = _recache_teacher_history0(
         runtime=runtime,
         source_noise=source_noise,
         teacher_target=teacher_target,
@@ -479,6 +479,13 @@ def _run_predicted_rollout(
         "trace": {
             "mode": PREDICTED_ROLLOUT,
             "steps": trace_steps,
+            "history_recache": history_recache,
+            "history_kv_fingerprint_sha256": history_recache[
+                "history_kv_fingerprint_sha256"
+            ],
+            "crossattn_cache_fingerprint_sha256": history_recache[
+                "crossattn_cache_fingerprint_sha256"
+            ],
             "mcp_depths_used": [1],
             "used_model_flow_for_transition": True,
             "used_exact_flow_for_transition": False,
@@ -503,7 +510,7 @@ def _run_oracle_flow_rollout(
     schedule: deployment.DeploymentSchedule,
     rng_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    _recache_teacher_history0(
+    history_recache = _recache_teacher_history0(
         runtime=runtime,
         source_noise=source_noise,
         teacher_target=teacher_target,
@@ -624,6 +631,13 @@ def _run_oracle_flow_rollout(
         "trace": {
             "mode": ORACLE_FLOW_ROLLOUT,
             "steps": trace_steps,
+            "history_recache": history_recache,
+            "history_kv_fingerprint_sha256": history_recache[
+                "history_kv_fingerprint_sha256"
+            ],
+            "crossattn_cache_fingerprint_sha256": history_recache[
+                "crossattn_cache_fingerprint_sha256"
+            ],
             "mcp_depths_used": [1],
             "used_exact_flow_for_transition": True,
             "used_model_flow_for_transition": False,
@@ -656,7 +670,7 @@ def _run_teacher_state_probe(
         zip(schedule.raw_schedule, schedule.main_warped_schedule, schedule.mcp_warped_schedule)
     ):
         runtime = runtime_factory()
-        _recache_teacher_history0(
+        history_recache = _recache_teacher_history0(
             runtime=runtime,
             source_noise=source_noise,
             teacher_target=teacher_target,
@@ -725,6 +739,12 @@ def _run_teacher_state_probe(
                 "raw_timestep": float(raw_t),
                 "main_warped_timestep": float(main_t),
                 "mcp_warped_timestep": float(mcp_t),
+                "history_kv_fingerprint_sha256": history_recache[
+                    "history_kv_fingerprint_sha256"
+                ],
+                "crossattn_cache_fingerprint_sha256": history_recache[
+                    "crossattn_cache_fingerprint_sha256"
+                ],
                 "fresh_kv_teacher_history_chunks": [HISTORY_CHUNK_INDEX],
                 "current_state": _tensor_record(current_state),
                 "future_state": _tensor_record(future_state),
@@ -835,9 +855,9 @@ def _recache_teacher_history0(
     teacher_target: torch.Tensor,
     conditional_dict: Mapping[str, Any],
     rng_plan: Mapping[str, Any],
-) -> None:
+) -> dict[str, Any]:
     counts = {"clean_recache_forward_count": 0}
-    deployment._clean_recache(
+    clean_recache = deployment._clean_recache(
         runtime=runtime,
         conditional_dict=conditional_dict,
         rng_plan=rng_plan,
@@ -847,6 +867,79 @@ def _recache_teacher_history0(
         start_frame=0,
         expected_before=None,
     )
+    history_kv = kv_cache_content_fingerprint(runtime.kv_cache)
+    crossattn = crossattn_cache_content_fingerprint(runtime.crossattn_cache)
+    return {
+        "clean_recache": clean_recache,
+        "history_kv": history_kv,
+        "history_kv_fingerprint_sha256": history_kv["fingerprint_sha256"],
+        "crossattn_cache": crossattn,
+        "crossattn_cache_fingerprint_sha256": crossattn["fingerprint_sha256"],
+    }
+
+
+def kv_cache_content_fingerprint(kv_cache: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    layers: list[dict[str, Any]] = []
+    for index, layer in enumerate(kv_cache):
+        local_end = _cache_index_int(layer.get("local_end_index"))
+        entry: dict[str, Any] = {
+            "layer": int(index),
+            "global_end_index": _cache_index_int(layer.get("global_end_index")),
+            "local_end_index": local_end,
+        }
+        for name in ("k", "v"):
+            tensor = layer.get(name)
+            if torch.is_tensor(tensor):
+                active = tensor[:, :local_end].detach().cpu()
+                entry[name] = {
+                    "shape": list(active.shape),
+                    "dtype": str(active.dtype),
+                    "sha256": tensor_sha256(active),
+                }
+        layers.append(entry)
+    payload = {
+        "schema": "first_mcp_kv_cache_content_fingerprint_v1",
+        "layers": layers,
+    }
+    return {
+        **payload,
+        "fingerprint_sha256": deployment.canonical_json_sha256(payload),
+    }
+
+
+def crossattn_cache_content_fingerprint(
+    crossattn_cache: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    layers: list[dict[str, Any]] = []
+    for index, layer in enumerate(crossattn_cache):
+        entry: dict[str, Any] = {
+            "layer": int(index),
+            "is_init": bool(layer.get("is_init", False)),
+        }
+        for name in ("k", "v"):
+            tensor = layer.get(name)
+            if torch.is_tensor(tensor):
+                active = tensor.detach().cpu()
+                entry[name] = {
+                    "shape": list(active.shape),
+                    "dtype": str(active.dtype),
+                    "sha256": tensor_sha256(active),
+                }
+        layers.append(entry)
+    payload = {
+        "schema": "first_mcp_crossattn_cache_content_fingerprint_v1",
+        "layers": layers,
+    }
+    return {
+        **payload,
+        "fingerprint_sha256": deployment.canonical_json_sha256(payload),
+    }
+
+
+def _cache_index_int(value: Any) -> int:
+    if torch.is_tensor(value):
+        return int(value.detach().cpu().reshape(-1)[0].item())
+    return int(value)
 
 
 def _step0_decisive_metrics(

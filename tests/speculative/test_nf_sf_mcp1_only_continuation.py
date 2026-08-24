@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import shutil
 import types
+import uuid
 from pathlib import Path
 
 import pytest
@@ -30,6 +33,7 @@ from utils.nf_sf_mcp1_only_continuation import (
     compare_parameter_sha256_reports,
     configure_mcp1_only_trainable_parameters,
     forbidden_feature_contract,
+    load_matching_control_artifact_bundle,
     mcp1_only_first_step_contract,
     mcp1_only_step_numbers,
     parameter_sha256_report,
@@ -313,7 +317,7 @@ def test_train_step_freezes_main_patch_mcp23_and_preserves_rng_contract() -> Non
 
 def _matching_control() -> dict:
     return {
-        "schema": "nf_sf_mcp_direct_clean_kv_ablation_v1",
+        "schema": NF_SF_MCP1_ONLY_CONTINUATION_SCHEMA,
         "status": "PASS",
         "arm": "control",
         "parent_step": 6500,
@@ -351,6 +355,236 @@ def test_matching_control_provenance_validation() -> None:
     audit = validate_matching_control_provenance(bad)
     assert audit["CONTROL_REUSABLE"] is False
     assert any("first_step" in failure for failure in audit["failures"])
+
+
+def _hex(char: str, length: int) -> str:
+    return str(char) * int(length)
+
+
+def _direct_control_summary(checkpoint_sha: str = _hex("7", 64)) -> dict:
+    return {
+        "schema": "nf_sf_mcp_direct_clean_kv_ablation_v1",
+        "status": "PASS",
+        "arm": "control",
+        "parent_step": 6500,
+        "target_step": 7000,
+        "train_record_count": 500,
+        "validation": {
+            "global_step": 7000,
+            "paired_identity_noise_across_steps": True,
+        },
+        "fixed_probe": {
+            "raw_timestep": 999,
+            "depth": 1,
+        },
+        "checkpoint_sha256": checkpoint_sha,
+    }
+
+
+def _direct_control_metadata(runtime_git_sha: str = _hex("8", 40)) -> dict:
+    rng = {
+        "train_rng_state_sha256": _hex("a", 64),
+        "validation_base_rng_state_sha256": _hex("b", 64),
+        "python_random_state_sha256": _hex("c", 64),
+        "torch_cpu_global_rng_state_sha256": _hex("d", 64),
+        "torch_cuda_global_rng_state_sha256": _hex("e", 64),
+    }
+    return {
+        "schema": "nf_sf_mcp_direct_clean_kv_ablation_v1",
+        "run_plan": {
+            "arm": "control",
+            "first_step": 6501,
+            "target_step": 7000,
+            "update_count": 500,
+            "direct_clean_context_kv": False,
+        },
+        "provenance": {
+            "schema": "nf_sf_mcp_direct_clean_kv_ablation_v1",
+            "arm": "control",
+            "parent_step": 6500,
+            "target_step": 7000,
+            "update_count": 500,
+            "parent_checkpoint_sha256": NF_SF_MCP1_ONLY_PARENT_CHECKPOINT_SHA256,
+            "parent_git_sha": NF_SF_MCP1_ONLY_PARENT_GIT_SHA,
+            "runtime_git_sha": runtime_git_sha,
+            "direct_clean_context_kv": False,
+            "data_changed": False,
+            "rng_changed": False,
+            "objective_changed": False,
+            "optimizer_changed": False,
+        },
+        "restore_contract": {
+            "status": "PASS",
+            "rng_fingerprint": rng,
+        },
+    }
+
+
+def _direct_control_metrics(
+    *,
+    first_step: int = 6501,
+    count: int = 500,
+) -> list[dict]:
+    records = [
+        {
+            "schema": "nf_sf_mcp_direct_clean_kv_ablation_v1_validation_v1",
+            "global_step": 7000,
+        }
+    ]
+    for step in range(first_step, first_step + count):
+        records.append(
+            {
+                "schema": "nf_sf_mcp_direct_clean_kv_ablation_v1",
+                "arm": "control",
+                "global_step": step,
+                "sample_cursor": nf_sf_full_sequence_train_cursor(step),
+                "sample_identity": f"sample-{step}",
+                "train_rng_before_sha256": _hex("1", 64),
+                "train_rng_after_sha256": _hex("2", 64),
+            }
+        )
+    records.append({"schema": "other", "global_step": 7000})
+    return records
+
+
+def _write_direct_control_bundle(tmp_path: Path, mutator=None) -> Path:
+    checkpoint_sha = _hex("7", 64)
+    payloads = {
+        "summary": _direct_control_summary(checkpoint_sha=checkpoint_sha),
+        "run_metadata": _direct_control_metadata(),
+        "metrics": _direct_control_metrics(),
+        "checkpoint_validation": {
+            "status": "PASS",
+            "global_step": 7000,
+            "sha256": checkpoint_sha,
+        },
+    }
+    if mutator is not None:
+        mutator(payloads)
+    paths = {
+        "summary": tmp_path / "ablation_summary.json",
+        "run_metadata": tmp_path / "run_metadata.json",
+        "metrics": tmp_path / "metrics.jsonl",
+        "checkpoint_validation": tmp_path / "checkpoint_step007000.validation.json",
+    }
+    if payloads.get("summary") is not None:
+        paths["summary"].write_text(
+            json.dumps(payloads["summary"]),
+            encoding="utf-8",
+        )
+    if payloads.get("run_metadata") is not None:
+        paths["run_metadata"].write_text(
+            json.dumps(payloads["run_metadata"]),
+            encoding="utf-8",
+        )
+    if payloads.get("metrics") is not None:
+        paths["metrics"].write_text(
+            "\n".join(json.dumps(record) for record in payloads["metrics"]) + "\n",
+            encoding="utf-8",
+        )
+    if payloads.get("checkpoint_validation") is not None:
+        paths["checkpoint_validation"].write_text(
+            json.dumps(payloads["checkpoint_validation"]),
+            encoding="utf-8",
+        )
+    return paths["summary"]
+
+
+@pytest.fixture
+def control_bundle_dir():
+    parent = ROOT / "_codex_tmp_nf_sf_mcp1_control_bundle_tests"
+    path = parent / uuid.uuid4().hex
+    path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_direct_clean_control_bundle_with_companion_provenance_passes(
+    control_bundle_dir: Path,
+) -> None:
+    summary_path = _write_direct_control_bundle(control_bundle_dir)
+
+    audit = load_matching_control_artifact_bundle(summary_path)
+
+    assert audit["CONTROL_REUSABLE"] is True
+    assert audit["control_summary_path"].endswith("ablation_summary.json")
+    assert audit["run_metadata_path"].endswith("run_metadata.json")
+    assert audit["metrics_path"].endswith("metrics.jsonl")
+    assert audit["checkpoint_validation_path"].endswith(
+        "checkpoint_step007000.validation.json"
+    )
+    assert len(audit["source_sha256"]) == 4
+    assert all(len(value) == 64 for value in audit["source_sha256"].values())
+
+
+@pytest.mark.parametrize(
+    ("mutator", "match"),
+    [
+        (
+            lambda payloads: payloads.__setitem__("run_metadata", None),
+            "run_metadata",
+        ),
+        (
+            lambda payloads: payloads["run_metadata"]["provenance"].__setitem__(
+                "parent_checkpoint_sha256",
+                _hex("0", 64),
+            ),
+            "parent_checkpoint_sha256",
+        ),
+        (
+            lambda payloads: payloads["run_metadata"]["provenance"].__setitem__(
+                "parent_git_sha",
+                _hex("0", 40),
+            ),
+            "parent_git_sha",
+        ),
+        (
+            lambda payloads: payloads.__setitem__(
+                "metrics",
+                _direct_control_metrics(first_step=6502, count=500),
+            ),
+            "global_step sequence",
+        ),
+        (
+            lambda payloads: next(
+                record
+                for record in payloads["metrics"]
+                if record.get("schema") == "nf_sf_mcp_direct_clean_kv_ablation_v1"
+            ).__setitem__(
+                "sample_cursor",
+                nf_sf_full_sequence_train_cursor(6502),
+            ),
+            "first sample_cursor",
+        ),
+        (
+            lambda payloads: payloads.__setitem__(
+                "metrics",
+                _direct_control_metrics(count=499),
+            ),
+            "record count",
+        ),
+        (
+            lambda payloads: payloads["checkpoint_validation"].__setitem__(
+                "sha256",
+                _hex("9", 64),
+            ),
+            "checkpoint validation SHA",
+        ),
+    ],
+)
+def test_direct_clean_control_bundle_fail_closed_cases(
+    control_bundle_dir: Path,
+    mutator,
+    match: str,
+) -> None:
+    summary_path = _write_direct_control_bundle(control_bundle_dir, mutator=mutator)
+
+    audit = load_matching_control_artifact_bundle(summary_path)
+
+    assert audit["CONTROL_REUSABLE"] is False
+    assert any(match in failure for failure in audit["failures"])
 
 
 def test_decision_thresholds_are_preregistered() -> None:

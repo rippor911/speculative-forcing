@@ -52,6 +52,7 @@ from utils.nf_sf_mcp1_only_continuation import (
     compare_parameter_sha256_reports,
     forbidden_feature_contract,
     has_nonfinite_trainable_grad,
+    load_matching_control_artifact_bundle,
     mcp1_only_first_step_contract,
     mcp1_only_loss_metrics,
     mcp1_only_step_numbers,
@@ -59,7 +60,6 @@ from utils.nf_sf_mcp1_only_continuation import (
     run_mcp1_only_forward_loss,
     trainable_parameter_delta_report,
     trainable_parameter_snapshot,
-    validate_matching_control_provenance,
     validate_mcp1_only_manifest,
     validate_mcp1_only_optimizer_isolation,
 )
@@ -726,8 +726,7 @@ def _load_or_missing_control_audit(path: Path | None) -> dict[str, Any]:
             "failures": ["matching control summary was not provided"],
             "checked_items": [],
         }
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    return validate_matching_control_provenance(payload)
+    return load_matching_control_artifact_bundle(path)
 
 
 def _require_real_run_paths(args: argparse.Namespace) -> None:

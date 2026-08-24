@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,7 +17,7 @@ from utils.nf_sf_full_sequence_continuation import (
     ADAMW_EPS,
     CONTINUATION_OBJECTIVE_MODE,
 )
-from utils.nf_sf_m3 import tensor_sha256
+from utils.nf_sf_m3 import file_sha256, tensor_sha256
 from utils.nf_sf_mcp_direct_context_ablation import (
     NF_SF_MCP_DIRECT_CLEAN_KV_ABLATION_PARENT_STEP,
     NF_SF_MCP_DIRECT_CLEAN_KV_ABLATION_TARGET_STEP,
@@ -46,6 +47,7 @@ NF_SF_MCP1_ONLY_PARENT_CHECKPOINT_SHA256 = (
     NF_SF_MCP_DIRECT_CLEAN_KV_PARENT_CHECKPOINT_SHA256
 )
 NF_SF_MCP1_ONLY_PARENT_GIT_SHA = NF_SF_MCP_DIRECT_CLEAN_KV_PARENT_GIT_SHA
+DIRECT_CLEAN_KV_CONTROL_SCHEMA = "nf_sf_mcp_direct_clean_kv_ablation_v1"
 MCP1_ONLY_TRAINABLE_GROUPS = ("mcp_fusion", "mcp_depth1")
 MCP1_ONLY_FROZEN_GROUPS = (
     "backbone",
@@ -743,23 +745,373 @@ def validate_mcp1_only_manifest(manifest: Mapping[str, Any]) -> None:
         raise RuntimeError("MCP1-only forbidden feature enabled")
 
 
+def load_matching_control_artifact_bundle(
+    summary_path: Path | str,
+    *,
+    expected_control_runtime_git_sha: str | None = None,
+) -> dict[str, Any]:
+    summary_path = Path(summary_path)
+    paths = {
+        "control_summary_path": summary_path,
+        "run_metadata_path": summary_path.parent / "run_metadata.json",
+        "metrics_path": summary_path.parent / "metrics.jsonl",
+        "checkpoint_validation_path": (
+            summary_path.parent / "checkpoint_step007000.validation.json"
+        ),
+    }
+    failures: list[str] = []
+    source_sha256: dict[str, str | None] = {}
+    summary = _load_json_companion(
+        paths["control_summary_path"],
+        label="control summary",
+        failures=failures,
+        source_sha256=source_sha256,
+    )
+    schema = summary.get("schema") if isinstance(summary, Mapping) else None
+    if schema == DIRECT_CLEAN_KV_CONTROL_SCHEMA:
+        run_metadata = _load_json_companion(
+            paths["run_metadata_path"],
+            label="run_metadata.json",
+            failures=failures,
+            source_sha256=source_sha256,
+        )
+        metrics_records = _load_jsonl_companion(
+            paths["metrics_path"],
+            failures=failures,
+            source_sha256=source_sha256,
+        )
+        checkpoint_validation = _load_json_companion(
+            paths["checkpoint_validation_path"],
+            label="checkpoint validation",
+            failures=failures,
+            source_sha256=source_sha256,
+        )
+        audit = validate_matching_control_provenance(
+            summary if isinstance(summary, Mapping) else {},
+            run_metadata=run_metadata if isinstance(run_metadata, Mapping) else None,
+            metrics_records=metrics_records,
+            checkpoint_validation=(
+                checkpoint_validation
+                if isinstance(checkpoint_validation, Mapping)
+                else None
+            ),
+            control_summary_path=paths["control_summary_path"],
+            run_metadata_path=paths["run_metadata_path"],
+            metrics_path=paths["metrics_path"],
+            checkpoint_validation_path=paths["checkpoint_validation_path"],
+            source_sha256=source_sha256,
+            expected_control_runtime_git_sha=expected_control_runtime_git_sha,
+        )
+        if failures:
+            audit["failures"] = [*audit["failures"], *failures]
+            audit["CONTROL_REUSABLE"] = False
+        return audit
+
+    audit = validate_matching_control_provenance(
+        summary if isinstance(summary, Mapping) else {},
+        control_summary_path=paths["control_summary_path"],
+        source_sha256=source_sha256,
+        expected_control_runtime_git_sha=expected_control_runtime_git_sha,
+    )
+    if failures:
+        audit["failures"] = [*audit["failures"], *failures]
+        audit["CONTROL_REUSABLE"] = False
+    return audit
+
+
 def validate_matching_control_provenance(
     control: Mapping[str, Any],
+    *,
+    run_metadata: Mapping[str, Any] | None = None,
+    metrics_records: Sequence[Mapping[str, Any]] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
+    control_summary_path: Path | str | None = None,
+    run_metadata_path: Path | str | None = None,
+    metrics_path: Path | str | None = None,
+    checkpoint_validation_path: Path | str | None = None,
+    source_sha256: Mapping[str, str | None] | None = None,
+    expected_control_runtime_git_sha: str | None = None,
 ) -> dict[str, Any]:
     failures: list[str] = []
     schema = str(control.get("schema", ""))
-    if schema not in (
-        "nf_sf_mcp_direct_clean_kv_ablation_v1",
-        NF_SF_MCP1_ONLY_CONTINUATION_SCHEMA,
-    ):
+    if schema not in (DIRECT_CLEAN_KV_CONTROL_SCHEMA, NF_SF_MCP1_ONLY_CONTINUATION_SCHEMA):
         failures.append("schema is not a recognized step6500->7000 control")
-    if control.get("status") not in ("PASS", "DONE"):
-        failures.append("control status is not PASS/DONE")
-    if control.get("arm", "control") != "control":
-        failures.append("control arm is not control")
-    _check_equal(control, failures, "parent_step", NF_SF_MCP1_ONLY_CONTINUATION_PARENT_STEP)
-    _check_equal(control, failures, "target_step", NF_SF_MCP1_ONLY_CONTINUATION_TARGET_STEP)
-    _check_equal(control, failures, "train_record_count", NF_SF_MCP1_ONLY_CONTINUATION_UPDATE_COUNT)
+    if schema == DIRECT_CLEAN_KV_CONTROL_SCHEMA:
+        if control.get("status") != "PASS":
+            failures.append("direct-clean-KV control status is not PASS")
+        if control.get("arm") != "control":
+            failures.append("direct-clean-KV control arm is not control")
+    else:
+        if control.get("status") not in ("PASS", "DONE"):
+            failures.append("control status is not PASS/DONE")
+        if control.get("arm", "control") != "control":
+            failures.append("control arm is not control")
+    _check_equal(
+        control,
+        failures,
+        "parent_step",
+        NF_SF_MCP1_ONLY_CONTINUATION_PARENT_STEP,
+    )
+    _check_equal(
+        control,
+        failures,
+        "target_step",
+        NF_SF_MCP1_ONLY_CONTINUATION_TARGET_STEP,
+    )
+    _check_equal(
+        control,
+        failures,
+        "train_record_count",
+        NF_SF_MCP1_ONLY_CONTINUATION_UPDATE_COUNT,
+    )
+    _validate_control_summary_validation_and_probe(control, failures=failures)
+
+    if schema == DIRECT_CLEAN_KV_CONTROL_SCHEMA:
+        if run_metadata is None:
+            failures.append("direct-clean-KV control run_metadata.json missing")
+        else:
+            _validate_direct_clean_control_run_metadata(
+                run_metadata,
+                failures=failures,
+                expected_control_runtime_git_sha=expected_control_runtime_git_sha,
+            )
+        if metrics_records is None:
+            failures.append("direct-clean-KV control metrics.jsonl missing")
+        else:
+            _validate_direct_clean_control_metrics(metrics_records, failures=failures)
+        if checkpoint_validation is None:
+            failures.append("direct-clean-KV checkpoint validation missing")
+        else:
+            _validate_direct_clean_control_checkpoint_validation(
+                control,
+                checkpoint_validation,
+                failures=failures,
+            )
+    else:
+        _validate_native_control_embedded_provenance(control, failures=failures)
+
+    return {
+        "schema": f"{NF_SF_MCP1_ONLY_CONTINUATION_SCHEMA}_control_reuse_audit_v1",
+        "CONTROL_REUSABLE": len(failures) == 0,
+        "control_summary_path": _path_string(control_summary_path),
+        "run_metadata_path": _path_string(run_metadata_path),
+        "metrics_path": _path_string(metrics_path),
+        "checkpoint_validation_path": _path_string(checkpoint_validation_path),
+        "source_sha256": dict(source_sha256 or {}),
+        "failures": failures,
+        "checked_items": [
+            "summary schema/status/arm/step/train count",
+            "parent checkpoint SHA",
+            "parent global step",
+            "parent git",
+            "run plan 6500->7000",
+            "500 optimizer steps",
+            "metrics sample-stream proof",
+            "restore RNG fingerprint proof",
+            "validation identity/noise contract",
+            "fixed raw999 MCP1 probe",
+            "checkpoint validation sidecar",
+        ],
+    }
+
+
+def _validate_control_summary_validation_and_probe(
+    control: Mapping[str, Any],
+    *,
+    failures: list[str],
+) -> None:
+    validation = control.get("validation")
+    if isinstance(validation, Mapping):
+        if _int_or_none(validation.get("global_step")) != 7000:
+            failures.append("validation global_step mismatch")
+        if validation.get("paired_identity_noise_across_steps") is not True:
+            failures.append("validation paired identity noise proof missing")
+    else:
+        failures.append("validation proof missing")
+    fixed_probe = control.get("fixed_probe")
+    if isinstance(fixed_probe, Mapping):
+        if _int_or_none(fixed_probe.get("raw_timestep")) != 999:
+            failures.append("fixed raw999 probe missing")
+        if _int_or_none(fixed_probe.get("depth")) != 1:
+            failures.append("fixed MCP1 probe missing")
+    else:
+        failures.append("fixed raw999 MCP1 probe missing")
+
+
+def _validate_direct_clean_control_run_metadata(
+    run_metadata: Mapping[str, Any],
+    *,
+    failures: list[str],
+    expected_control_runtime_git_sha: str | None,
+) -> None:
+    if run_metadata.get("schema") != DIRECT_CLEAN_KV_CONTROL_SCHEMA:
+        failures.append("run_metadata schema mismatch")
+    provenance = run_metadata.get("provenance")
+    if not isinstance(provenance, Mapping):
+        failures.append("run_metadata provenance missing")
+    else:
+        _check_equal(
+            provenance,
+            failures,
+            "parent_checkpoint_sha256",
+            NF_SF_MCP1_ONLY_PARENT_CHECKPOINT_SHA256,
+        )
+        _check_equal(
+            provenance,
+            failures,
+            "parent_git_sha",
+            NF_SF_MCP1_ONLY_PARENT_GIT_SHA,
+        )
+        _check_equal(
+            provenance,
+            failures,
+            "parent_step",
+            NF_SF_MCP1_ONLY_CONTINUATION_PARENT_STEP,
+        )
+        _check_equal(
+            provenance,
+            failures,
+            "target_step",
+            NF_SF_MCP1_ONLY_CONTINUATION_TARGET_STEP,
+        )
+        _check_equal(
+            provenance,
+            failures,
+            "update_count",
+            NF_SF_MCP1_ONLY_CONTINUATION_UPDATE_COUNT,
+        )
+        _check_equal(provenance, failures, "arm", "control")
+        _check_equal(provenance, failures, "direct_clean_context_kv", False)
+        for key in ("data_changed", "rng_changed", "objective_changed", "optimizer_changed"):
+            _check_equal(provenance, failures, key, False)
+        runtime_git = str(provenance.get("runtime_git_sha", ""))
+        if not _is_git_sha(runtime_git):
+            failures.append("control runtime_git_sha missing or invalid")
+        elif expected_control_runtime_git_sha is not None:
+            expected = str(expected_control_runtime_git_sha)
+            if not _is_git_sha(expected) or runtime_git != expected:
+                failures.append("control runtime_git_sha mismatch")
+
+    restore = run_metadata.get("restore_contract")
+    if not isinstance(restore, Mapping):
+        failures.append("run_metadata restore_contract missing")
+    else:
+        if restore.get("status") != "PASS":
+            failures.append("restore_contract status mismatch")
+        rng = restore.get("rng_fingerprint")
+        if not isinstance(rng, Mapping):
+            failures.append("restore_contract rng_fingerprint missing")
+        else:
+            for key in (
+                "train_rng_state_sha256",
+                "validation_base_rng_state_sha256",
+                "python_random_state_sha256",
+                "torch_cpu_global_rng_state_sha256",
+                "torch_cuda_global_rng_state_sha256",
+            ):
+                if not _is_sha256(str(rng.get(key, ""))):
+                    failures.append(f"restore_contract missing valid {key}")
+
+    run_plan = run_metadata.get("run_plan")
+    if not isinstance(run_plan, Mapping):
+        failures.append("run_metadata run_plan missing")
+    else:
+        _check_equal(
+            run_plan,
+            failures,
+            "first_step",
+            NF_SF_MCP1_ONLY_CONTINUATION_PARENT_STEP + 1,
+        )
+        _check_equal(
+            run_plan,
+            failures,
+            "target_step",
+            NF_SF_MCP1_ONLY_CONTINUATION_TARGET_STEP,
+        )
+        _check_equal(
+            run_plan,
+            failures,
+            "update_count",
+            NF_SF_MCP1_ONLY_CONTINUATION_UPDATE_COUNT,
+        )
+        _check_equal(run_plan, failures, "arm", "control")
+        _check_equal(run_plan, failures, "direct_clean_context_kv", False)
+
+
+def _validate_direct_clean_control_metrics(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    failures: list[str],
+) -> None:
+    train_records = [
+        record
+        for record in records
+        if record.get("schema") == DIRECT_CLEAN_KV_CONTROL_SCHEMA
+        and record.get("arm") == "control"
+        and _int_or_none(record.get("global_step")) is not None
+        and isinstance(record.get("sample_cursor"), Mapping)
+        and "train_rng_before_sha256" in record
+        and "train_rng_after_sha256" in record
+    ]
+    expected_steps = list(
+        range(
+            NF_SF_MCP1_ONLY_CONTINUATION_PARENT_STEP + 1,
+            NF_SF_MCP1_ONLY_CONTINUATION_TARGET_STEP + 1,
+        )
+    )
+    actual_steps = [_int_or_none(record.get("global_step")) for record in train_records]
+    if len(train_records) != NF_SF_MCP1_ONLY_CONTINUATION_UPDATE_COUNT:
+        failures.append("metrics training record count mismatch")
+    if actual_steps != expected_steps:
+        failures.append("metrics training global_step sequence mismatch")
+    if not train_records:
+        return
+    first = train_records[0]
+    last = train_records[-1]
+    if _int_or_none(first.get("global_step")) != expected_steps[0]:
+        failures.append("metrics first training step mismatch")
+    if _int_or_none(last.get("global_step")) != expected_steps[-1]:
+        failures.append("metrics last training step mismatch")
+    if dict(first.get("sample_cursor", {})) != nf_sf_full_sequence_train_cursor(6501):
+        failures.append("metrics first sample_cursor mismatch")
+    if dict(last.get("sample_cursor", {})) != nf_sf_full_sequence_train_cursor(7000):
+        failures.append("metrics last sample_cursor mismatch")
+    for record in train_records:
+        identity = record.get("sample_identity") or record.get("identity")
+        if not isinstance(identity, str) or not identity:
+            failures.append("metrics training sample identity missing")
+            break
+        for key in ("train_rng_before_sha256", "train_rng_after_sha256"):
+            if not _is_sha256(str(record.get(key, ""))):
+                failures.append(f"metrics training {key} missing or invalid")
+                return
+
+
+def _validate_direct_clean_control_checkpoint_validation(
+    control: Mapping[str, Any],
+    checkpoint_validation: Mapping[str, Any],
+    *,
+    failures: list[str],
+) -> None:
+    if checkpoint_validation.get("status") != "PASS":
+        failures.append("checkpoint validation status mismatch")
+    if _int_or_none(checkpoint_validation.get("global_step")) != 7000:
+        failures.append("checkpoint validation global_step mismatch")
+    summary_sha = str(control.get("checkpoint_sha256", ""))
+    sidecar_sha = str(checkpoint_validation.get("sha256", ""))
+    if not _is_sha256(summary_sha):
+        failures.append("summary checkpoint_sha256 missing or invalid")
+    if not _is_sha256(sidecar_sha):
+        failures.append("checkpoint validation sha256 missing or invalid")
+    if _is_sha256(summary_sha) and _is_sha256(sidecar_sha) and summary_sha != sidecar_sha:
+        failures.append("checkpoint validation SHA mismatch")
+
+
+def _validate_native_control_embedded_provenance(
+    control: Mapping[str, Any],
+    *,
+    failures: list[str],
+) -> None:
     parent_sha = _nested_get(
         control,
         ("parent_checkpoint", "sha256"),
@@ -790,40 +1142,7 @@ def validate_matching_control_provenance(
         if first.get("first_sample_cursor") != nf_sf_full_sequence_train_cursor(6501):
             failures.append("first sample cursor mismatch")
     else:
-        final = control.get("final_train_record")
-        if not isinstance(final, Mapping) or final.get("global_step") != 7000:
-            failures.append("first-step/sample-stream proof missing")
-    validation = control.get("validation")
-    if isinstance(validation, Mapping):
-        if int(validation.get("global_step", -1)) != 7000:
-            failures.append("validation global_step mismatch")
-        if validation.get("paired_identity_noise_across_steps") is not True:
-            failures.append("validation paired identity noise proof missing")
-    else:
-        failures.append("validation proof missing")
-    fixed_probe = control.get("fixed_probe")
-    if isinstance(fixed_probe, Mapping):
-        if int(fixed_probe.get("raw_timestep", -1)) != 999:
-            failures.append("fixed raw999 probe missing")
-        if int(fixed_probe.get("depth", -1)) != 1:
-            failures.append("fixed MCP1 probe missing")
-    else:
-        failures.append("fixed raw999 MCP1 probe missing")
-    return {
-        "schema": f"{NF_SF_MCP1_ONLY_CONTINUATION_SCHEMA}_control_reuse_audit_v1",
-        "CONTROL_REUSABLE": len(failures) == 0,
-        "failures": failures,
-        "checked_items": [
-            "parent checkpoint SHA",
-            "parent global step",
-            "parent git",
-            "run plan 6500->7000",
-            "500 optimizer steps",
-            "sample stream first-step proof",
-            "validation identity/noise contract",
-            "fixed raw999 MCP1 probe",
-        ],
-    }
+        failures.append("first-step/sample-stream proof missing")
 
 
 def classify_mcp1_only_comparison(
@@ -878,6 +1197,63 @@ def classify_mcp1_only_comparison(
             "support_requires_paired_same_direction": True,
         },
     }
+
+
+def _load_json_companion(
+    path: Path,
+    *,
+    label: str,
+    failures: list[str],
+    source_sha256: dict[str, str | None],
+) -> Mapping[str, Any] | None:
+    key = str(path.resolve())
+    if not path.is_file():
+        source_sha256[key] = None
+        failures.append(f"{label} companion artifact missing")
+        return None
+    source_sha256[key] = file_sha256(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        failures.append(f"{label} JSON parse failed: {exc}")
+        return None
+    if not isinstance(payload, Mapping):
+        failures.append(f"{label} must contain a JSON object")
+        return None
+    return payload
+
+
+def _load_jsonl_companion(
+    path: Path,
+    *,
+    failures: list[str],
+    source_sha256: dict[str, str | None],
+) -> tuple[Mapping[str, Any], ...] | None:
+    key = str(path.resolve())
+    if not path.is_file():
+        source_sha256[key] = None
+        failures.append("metrics.jsonl companion artifact missing")
+        return None
+    source_sha256[key] = file_sha256(path)
+    records = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        failures.append(f"metrics.jsonl read failed: {exc}")
+        return None
+    for line_index, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception as exc:
+            failures.append(f"metrics.jsonl line {line_index} parse failed: {exc}")
+            continue
+        if not isinstance(payload, Mapping):
+            failures.append(f"metrics.jsonl line {line_index} is not an object")
+            continue
+        records.append(payload)
+    return tuple(records)
 
 
 def _clone_optimizer_state(
@@ -936,6 +1312,29 @@ def _check_equal(
         failures.append(f"{key} mismatch")
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_sha256(value: str) -> bool:
+    text = str(value)
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _is_git_sha(value: str) -> bool:
+    text = str(value)
+    return len(text) == 40 and all(char in "0123456789abcdef" for char in text)
+
+
+def _path_string(value: Path | str | None) -> str | None:
+    if value is None:
+        return None
+    return str(Path(value).resolve())
+
+
 def _nested_get(record: Mapping[str, Any], *paths: tuple[str, ...]) -> Any:
     for path in paths:
         value: Any = record
@@ -992,6 +1391,7 @@ __all__ = [
     "configure_mcp1_only_trainable_parameters",
     "forbidden_feature_contract",
     "has_nonfinite_trainable_grad",
+    "load_matching_control_artifact_bundle",
     "mcp1_only_first_step_contract",
     "mcp1_only_loss_metrics",
     "mcp1_only_step_numbers",

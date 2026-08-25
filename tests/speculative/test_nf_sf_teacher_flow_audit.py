@@ -11,6 +11,7 @@ from torch import nn
 import utils.nf_sf_full_sequence_eval as ev
 import utils.nf_sf_teacher_flow_audit as audit
 from scripts import run_nf_sf_teacher_flow_audit as runner
+from utils.nf_sf_training import FULL_SEQUENCE_TRAINER_SCHEMA
 from utils.nf_sf_tensors import DEFAULT_S_MAIN, DEFAULT_S_MCP
 
 
@@ -260,6 +261,157 @@ def make_result(
     )
 
 
+def make_validation32_plan(count: int = 256) -> dict[str, Any]:
+    identities = [f"val{index:03d}" for index in range(count)]
+    return {
+        "sample_plan_sha256": "b" * 64,
+        "validation_sample_identities": identities,
+        "fixed_decode_validation_identity": identities[0],
+    }
+
+
+def make_multi_record(
+    *,
+    identity_index: int,
+    validation_position: int,
+    raw_timestep: int,
+    mcp_flow: float = 1.0,
+    matched_flow: float = 1.1,
+    privileged_flow: float = 0.5,
+    mcp_x0: float = 1.0,
+    matched_x0: float = 1.1,
+    privileged_x0: float = 0.5,
+) -> dict[str, Any]:
+    identity = f"val{validation_position:03d}"
+    return {
+        "state_id": f"id{identity_index:02d}_pos{validation_position:03d}"
+        f"_raw{raw_timestep:03d}_noise0",
+        "sample_identity": identity,
+        "identity_index": int(identity_index),
+        "validation_position": int(validation_position),
+        "raw_timestep": int(raw_timestep),
+        "noise_index": 0,
+        "metrics": {
+            "mcp_flow_vs_exact_mse": float(mcp_flow),
+            "mcp_x0_vs_clean_future_mse": float(mcp_x0),
+            "teacher_matched_flow_vs_exact_mse": float(matched_flow),
+            "teacher_matched_x0_vs_clean_future_mse": float(matched_x0),
+            "mcp_flow_vs_teacher_matched_flow_mse": 0.01,
+            "teacher_clean_flow_vs_exact_mse": float(privileged_flow),
+            "teacher_clean_x0_vs_clean_future_mse": float(privileged_x0),
+            "mcp_flow_vs_teacher_clean_flow_mse": 0.02,
+        },
+        "teacher_matched_current": {
+            "proof": {
+                "privileged_clean_current": False,
+                "same_information_as_mcp": True,
+            }
+        },
+        "teacher_clean_current": {
+            "proof": {
+                "privileged_clean_current": True,
+                "same_information_as_mcp": False,
+            }
+        },
+        "same_state_sigma_proof": {
+            "all_future_states_exact": True,
+            "raw_timestep_directly_used_for_teacher": False,
+        },
+    }
+
+
+def make_multi_records(
+    *,
+    mcp_flow: float = 1.0,
+    matched_flow: float = 1.1,
+    privileged_flow: float = 0.5,
+    mcp_x0: float = 1.0,
+    matched_x0: float = 1.1,
+    privileged_x0: float = 0.5,
+) -> list[dict[str, Any]]:
+    records = []
+    for identity_index, validation_position in enumerate(range(0, 256, 8)):
+        for raw_timestep in audit.TEACHER_FLOW_AUDIT_RAW_TIMESTEPS:
+            records.append(
+                make_multi_record(
+                    identity_index=identity_index,
+                    validation_position=validation_position,
+                    raw_timestep=raw_timestep,
+                    mcp_flow=mcp_flow,
+                    matched_flow=matched_flow,
+                    privileged_flow=privileged_flow,
+                    mcp_x0=mcp_x0,
+                    matched_x0=matched_x0,
+                    privileged_x0=privileged_x0,
+                )
+            )
+    return records
+
+
+def make_identity_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aggregates = audit.aggregate_teacher_flow_metrics(records)["by_identity"]
+    identity_records = []
+    for key, value in aggregates.items():
+        identity_records.append(
+            {
+                "identity_index": value["identity_index"],
+                "sample_identity": value["sample_identity"],
+                "validation_position": value["validation_position"],
+                "state_count": value["state_count"],
+                "common_inputs_fingerprint_sha256": "f" * 64,
+                "metrics": value["metrics"],
+                "aggregate_key": key,
+            }
+        )
+    return identity_records
+
+
+def make_multi_manifest(records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    selection = audit.select_validation32_identities(make_validation32_plan())
+    state_records = records if records is not None else make_multi_records()
+    return audit.build_teacher_flow_multi_identity_manifest(
+        state_records=state_records,
+        identity_records=make_identity_records(state_records),
+        identity_selection=selection,
+        student_checkpoint_contract={
+            "status": "PASS",
+            "required_global_step": 6500,
+            "actual_global_step": 6500,
+            "required_schema": FULL_SEQUENCE_TRAINER_SCHEMA,
+            "actual_schema": FULL_SEQUENCE_TRAINER_SCHEMA,
+            "checkpoint_sha256": TEST_SHA,
+        },
+        checkpoint_summary={
+            "checkpoint_type": "teacher_flow_student_step6500",
+            "load_mode": audit.TEACHER_FLOW_AUDIT_STUDENT_LOAD_MODE,
+            "sha256": TEST_SHA,
+            "global_step": 6500,
+        },
+        teacher_summary={
+            "checkpoint_type": "official_self_forcing",
+            "checkpoint_sha256": "d" * 64,
+            "mcp_tensor_count": 0,
+            "eval_mode": True,
+            "requires_grad_false": True,
+        },
+        common_inputs_fingerprints_sha256={
+            str(position): "f" * 64 for position in range(0, 256, 8)
+        },
+        runtime_git_sha=RUNTIME_GIT_SHA,
+        training_checkpoint_git_sha=TRAINING_GIT_SHA,
+    )
+
+
+def _contains_tensor(value: Any) -> bool:
+    if torch.is_tensor(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
 def test_16_state_deterministic_contract() -> None:
     source = make_source_noise()
     target = make_teacher_target()
@@ -507,6 +659,178 @@ def test_select_validation_zero_identity() -> None:
         audit.select_validation_zero_identity(bad)
 
 
+def test_select_validation32_identities_exact_stride_and_fingerprints() -> None:
+    selection = audit.select_validation32_identities(make_validation32_plan())
+    assert selection["validation_identity_count"] == 256
+    assert selection["selected_identity_count"] == 32
+    assert selection["stride"] == 8
+    assert selection["selection_rule"] == (
+        "validation positions 0,8,16,...,248 from exact 256 list"
+    )
+    assert selection["positions"] == list(range(0, 256, 8))
+    assert selection["identity_strings"][:3] == ["val000", "val008", "val016"]
+    assert selection["identity_strings"][-1] == "val248"
+    assert len(selection["identity_list_sha256"]) == 64
+    assert len(selection["selection_fingerprint_sha256"]) == 64
+
+
+def test_select_validation32_fails_closed_when_count_is_not_256() -> None:
+    with pytest.raises(RuntimeError, match="exactly 256"):
+        audit.select_validation32_identities(make_validation32_plan(count=255))
+
+
+def test_multi_identity_state_builder_uses_one_noise_per_raw() -> None:
+    source = make_source_noise()
+    target = make_teacher_target()
+    states = audit.build_teacher_flow_audit_states(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=audit.build_flow_match_scheduler(
+            shift=DEFAULT_S_MAIN,
+            device="cpu",
+        ),
+        mcp_scheduler=audit.build_flow_match_scheduler(
+            shift=DEFAULT_S_MCP,
+            device="cpu",
+        ),
+        noise_realizations_per_raw=1,
+        state_id_prefix="id00_pos000",
+        sample_identity="val000",
+        validation_position=0,
+        identity_index=0,
+    )
+    assert len(states) == 4
+    assert [state.noise_index for state in states] == [0, 0, 0, 0]
+    assert [state.raw_timestep for state in states] == [999, 750, 500, 250]
+    assert states[0].state_id.startswith("id00_pos000_raw999_noise0")
+    assert states[0].provenance["sample_identity"] == "val000"
+
+
+def test_multi_manifest_records_exactly_128_states_and_selection() -> None:
+    manifest = make_multi_manifest()
+    assert manifest["mode"] == audit.TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32
+    assert manifest["state_count"] == 128
+    assert manifest["noise_realizations_per_raw"] == 1
+    assert manifest["identity_selection"]["positions"] == list(range(0, 256, 8))
+    assert manifest["identity_selection"]["identity_strings"][0] == "val000"
+    assert manifest["identity_selection"]["identity_strings"][-1] == "val248"
+
+
+def test_multi_aggregation_by_identity_and_raw() -> None:
+    manifest = make_multi_manifest()
+    aggregates = manifest["aggregates"]
+    assert len(aggregates["by_state"]) == 128
+    assert len(aggregates["by_identity"]) == 32
+    assert set(aggregates["by_raw"].keys()) == {"250", "500", "750", "999"}
+    identity0 = aggregates["by_identity"]["validation_position_000"]
+    assert identity0["state_count"] == 4
+    assert identity0["metrics"]["teacher_clean_flow_vs_exact_mse"]["mean"] == 0.5
+    assert aggregates["by_raw"]["999"]["mcp_flow_vs_exact_mse"]["mean"] == 1.0
+
+
+def test_multi_paired_stats_win_rate_and_reductions() -> None:
+    manifest = make_multi_manifest()
+    stats = manifest["paired_statistics"]
+    assert stats["privileged_identity_flow_win_count"] == 32
+    assert stats["privileged_identity_flow_win_rate"] == pytest.approx(1.0)
+    assert stats["matched_identity_flow_win_count"] == 0
+    assert stats["privileged_identity_flow_reduction_mean"] == pytest.approx(0.5)
+    assert stats["privileged_identity_flow_reduction_median"] == pytest.approx(0.5)
+    assert stats["by_raw"]["999"]["privileged_flow_win_count"] == 32
+    assert stats["by_raw"]["999"]["privileged_flow_reduction_mean"] == pytest.approx(
+        0.5
+    )
+
+
+def test_multi_primary_diagnostic_thresholds() -> None:
+    strong = make_multi_manifest(
+        make_multi_records(privileged_flow=0.70, privileged_x0=0.70)
+    )
+    assert strong["primary_diagnostic_label"] == (
+        audit.STRONG_PRIVILEGED_CURRENT_SUPPORT
+    )
+
+    weak_reduction = make_multi_manifest(
+        make_multi_records(privileged_flow=0.95, privileged_x0=0.50)
+    )
+    assert weak_reduction["primary_diagnostic_label"] == (
+        audit.NO_PRIVILEGED_CURRENT_SUPPORT
+    )
+
+    low_win_records = make_multi_records(privileged_flow=0.50, privileged_x0=0.50)
+    for record in low_win_records[:56]:
+        record["metrics"]["teacher_clean_flow_vs_exact_mse"] = 1.10
+    low_win = make_multi_manifest(low_win_records)
+    assert low_win["primary_diagnostic_label"] == (
+        audit.NO_PRIVILEGED_CURRENT_SUPPORT
+    )
+
+    mixed = make_multi_manifest(
+        make_multi_records(privileged_flow=0.80, privileged_x0=0.80)
+    )
+    assert mixed["primary_diagnostic_label"] == audit.INCONCLUSIVE
+
+
+def test_multi_matched_timestep_dependence_is_reported_not_primary_gate() -> None:
+    records = make_multi_records(matched_flow=1.1)
+    for record in records:
+        if int(record["raw_timestep"]) in (500, 250):
+            record["metrics"]["teacher_matched_flow_vs_exact_mse"] = 0.8
+    manifest = make_multi_manifest(records)
+    diagnostic = manifest["matched_teacher_timestep_diagnostic"]
+    assert diagnostic["label"] == audit.MATCHED_TEACHER_TIMESTEP_DEPENDENCE
+    assert diagnostic["not_primary_gate"] is True
+    assert diagnostic["by_raw"]["999"]["direction"] == "worse_than_mcp"
+    assert diagnostic["by_raw"]["500"]["direction"] == "better_than_mcp"
+
+
+def test_multi_runner_cli_contract_requires_step6500_and_regular_context() -> None:
+    args = runner.parse_args(
+        [
+            "--multi_identity_validation32",
+            "--full_sequence_checkpoint",
+            "checkpoint_step006500.pt",
+            "--expected_checkpoint_step",
+            "6500",
+            "--sample_plan",
+            "sample_plan.json",
+            "--teacher_manifest",
+            "teacher_manifest.json",
+            "--dataset_root",
+            "dataset",
+            "--output_dir",
+            "out",
+            "--expected_runtime_git_sha",
+            "f" * 40,
+        ]
+    )
+    runner._validate_multi_identity_cli_contract(args)
+
+    args.expected_checkpoint_step = 7000
+    with pytest.raises(RuntimeError, match="step6500"):
+        runner._validate_multi_identity_cli_contract(args)
+    args.expected_checkpoint_step = 6500
+    args.student_direct_clean_context_kv = True
+    with pytest.raises(RuntimeError, match="direct_clean_context_kv=false"):
+        runner._validate_multi_identity_cli_contract(args)
+
+
+def test_multi_streaming_manifest_keeps_only_json_safe_records() -> None:
+    manifest = make_multi_manifest()
+    assert manifest["streaming_contract"]["retains_full_state_tensors"] is False
+    assert manifest["streaming_contract"]["retains_full_flow_tensors"] is False
+    assert "tensors" not in manifest
+    assert not _contains_tensor(manifest)
+
+
+def test_default_single_identity_mode_behavior_is_unchanged() -> None:
+    result = make_result()
+    assert result.manifest["mode"] == audit.TEACHER_FLOW_AUDIT_MODE_SINGLE
+    assert result.manifest["state_count"] == 16
+    assert result.manifest["noise_realizations_per_raw"] == 4
+    assert len(result.tensors["states"]) == 16
+
+
 def test_runner_parser_fixes_validation_zero_contract_fields() -> None:
     args = runner.parse_args(
         [
@@ -529,6 +853,7 @@ def test_runner_parser_fixes_validation_zero_contract_fields() -> None:
     assert args.sample_identity is None
     assert args.num_samples == 1
     assert args.student_direct_clean_context_kv is False
+    assert args.multi_identity_validation32 is False
     assert args.expected_training_git_sha is None
     assert runner._expected_training_git_sha(args, git_sha="a" * 40) == "a" * 40
 
@@ -576,6 +901,56 @@ def test_payload_validator_accepts_step7000_diagnostic_payload() -> None:
         expected_training_git_sha=TRAINING_GIT_SHA,
         expected_official_sha256=ev.OFFICIAL_SELF_FORCING_CHECKPOINT_SHA256,
     )
+
+
+def test_multi_student_checkpoint_contract_requires_formal_step6500() -> None:
+    checkpoint = ev.DeploymentCheckpointRecord(
+        path="student.pt",
+        sha256=TEST_SHA,
+        checkpoint_type="teacher_flow_student_step6500",
+        load_mode=audit.TEACHER_FLOW_AUDIT_STUDENT_LOAD_MODE,
+        generator_state_dict={"mcp.fusion.weight": torch.ones(1)},
+        global_step=6500,
+        training_git_sha=TRAINING_GIT_SHA,
+        payload={
+            "schema": FULL_SEQUENCE_TRAINER_SCHEMA,
+            "global_step": 6500,
+        },
+    )
+    result = audit.validate_multi_identity_student_checkpoint_contract(checkpoint)
+    assert result["status"] == "PASS"
+
+    diagnostic = ev.DeploymentCheckpointRecord(
+        path="student.pt",
+        sha256=TEST_SHA,
+        checkpoint_type="teacher_flow_student_step6500",
+        load_mode=audit.TEACHER_FLOW_AUDIT_STUDENT_LOAD_MODE,
+        generator_state_dict={"mcp.fusion.weight": torch.ones(1)},
+        global_step=6500,
+        training_git_sha=TRAINING_GIT_SHA,
+        payload={
+            "schema": audit.NF_SF_MCP1_ONLY_CONTINUATION_SCHEMA,
+            "global_step": 6500,
+        },
+    )
+    with pytest.raises(RuntimeError, match="formal full-sequence"):
+        audit.validate_multi_identity_student_checkpoint_contract(diagnostic)
+
+    wrong_step = ev.DeploymentCheckpointRecord(
+        path="student.pt",
+        sha256=TEST_SHA,
+        checkpoint_type="teacher_flow_student_step7000",
+        load_mode=audit.TEACHER_FLOW_AUDIT_STUDENT_LOAD_MODE,
+        generator_state_dict={"mcp.fusion.weight": torch.ones(1)},
+        global_step=7000,
+        training_git_sha=TRAINING_GIT_SHA,
+        payload={
+            "schema": FULL_SEQUENCE_TRAINER_SCHEMA,
+            "global_step": 7000,
+        },
+    )
+    with pytest.raises(RuntimeError, match="step6500"):
+        audit.validate_multi_identity_student_checkpoint_contract(wrong_step)
 
 
 def test_slim_student_payload_drops_training_state() -> None:

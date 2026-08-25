@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -45,6 +46,12 @@ TEACHER_FLOW_AUDIT_SUPPORTED_STUDENT_SCHEMAS = (
 )
 TEACHER_FLOW_AUDIT_RAW_TIMESTEPS = (999, 750, 500, 250)
 TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW = 4
+TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW = 1
+TEACHER_FLOW_AUDIT_VALIDATION_COUNT = 256
+TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE = 8
+TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT = 32
+TEACHER_FLOW_AUDIT_MODE_SINGLE = "single_identity_validation0"
+TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32 = "multi_identity_validation32"
 TEACHER_MATCHED_CURRENT_BRANCH = "teacher_matched_current"
 TEACHER_CLEAN_CURRENT_BRANCH = "teacher_clean_current"
 STUDENT_MCP_BRANCH = "student_mcp1_full_sequence"
@@ -57,6 +64,9 @@ FUTURE_START_FRAME = FUTURE_CHUNK_INDEX * FULL_SEQUENCE_CHUNK_FRAMES
 TEACHER_MATCHED_STRONGLY_BETTER = "TEACHER_MATCHED_STRONGLY_BETTER"
 TEACHER_PRIVILEGED_ONLY_BETTER = "TEACHER_PRIVILEGED_ONLY_BETTER"
 TEACHER_NOT_BETTER = "TEACHER_NOT_BETTER"
+STRONG_PRIVILEGED_CURRENT_SUPPORT = "STRONG_PRIVILEGED_CURRENT_SUPPORT"
+NO_PRIVILEGED_CURRENT_SUPPORT = "NO_PRIVILEGED_CURRENT_SUPPORT"
+MATCHED_TEACHER_TIMESTEP_DEPENDENCE = "MATCHED_TEACHER_TIMESTEP_DEPENDENCE"
 INCONCLUSIVE = "INCONCLUSIVE"
 
 
@@ -105,6 +115,46 @@ def select_validation_zero_identity(sample_plan: Mapping[str, Any]) -> str:
     if fixed is not None and str(fixed) != identity:
         raise RuntimeError("fixed decode identity must equal validation identity 0")
     return identity
+
+
+def select_validation32_identities(sample_plan: Mapping[str, Any]) -> dict[str, Any]:
+    identities = deployment.sample_plan_validation_identities(sample_plan)
+    if len(identities) != TEACHER_FLOW_AUDIT_VALIDATION_COUNT:
+        raise RuntimeError(
+            "multi-identity Teacher-flow audit requires exactly "
+            f"{TEACHER_FLOW_AUDIT_VALIDATION_COUNT} validation identities"
+        )
+    if len(set(identities)) != len(identities):
+        raise RuntimeError("multi-identity Teacher-flow audit requires unique identities")
+    positions = list(
+        range(
+            0,
+            TEACHER_FLOW_AUDIT_VALIDATION_COUNT,
+            TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE,
+        )
+    )
+    selected = [str(identities[position]) for position in positions]
+    if len(selected) != TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT:
+        raise RuntimeError("multi-identity Teacher-flow selection count mismatch")
+    identity_list_sha256 = deployment.canonical_json_sha256(
+        {"validation_sample_identities": list(identities)}
+    )
+    selection_payload = {
+        "mode": TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32,
+        "validation_identity_count": TEACHER_FLOW_AUDIT_VALIDATION_COUNT,
+        "selected_identity_count": TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT,
+        "stride": TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE,
+        "positions": positions,
+        "identity_strings": selected,
+        "identity_list_sha256": identity_list_sha256,
+        "selection_rule": "validation positions 0,8,16,...,248 from exact 256 list",
+    }
+    return {
+        **selection_payload,
+        "selection_fingerprint_sha256": deployment.canonical_json_sha256(
+            selection_payload
+        ),
+    }
 
 
 def build_flow_match_scheduler(*, shift: float, device: torch.device | str):
@@ -242,6 +292,85 @@ def validate_teacher_flow_artifact_identity(
     }
 
 
+def validate_teacher_flow_artifact_identity_selection(
+    *,
+    sample_plan: Mapping[str, Any],
+    teacher_manifest_sha256: str,
+    checkpoint_payload: Mapping[str, Any],
+    identity_selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    sample_plan_sha = str(sample_plan.get("sample_plan_sha256", ""))
+    checkpoint_sample_plan_sha = _payload_string(
+        checkpoint_payload,
+        "sample_plan_sha256",
+    )
+    checkpoint_manifest_sha = _payload_string(
+        checkpoint_payload,
+        "manifest_sha256",
+    )
+    if sample_plan_sha != checkpoint_sample_plan_sha:
+        raise RuntimeError("current sample_plan SHA differs from student checkpoint")
+    if str(teacher_manifest_sha256) != checkpoint_manifest_sha:
+        raise RuntimeError("current teacher manifest SHA differs from student checkpoint")
+    _validate_identity_selection(identity_selection)
+    per_identity = []
+    for index, identity in enumerate(identity_selection["identity_strings"]):
+        validation_position = deployment.selected_validation_position(
+            sample_plan,
+            str(identity),
+        )
+        expected_position = int(identity_selection["positions"][index])
+        if validation_position != expected_position:
+            raise RuntimeError("selected validation identity position mismatch")
+        per_identity.append(
+            {
+                "identity_index": int(index),
+                "sample_identity": str(identity),
+                "validation_position": int(validation_position),
+            }
+        )
+    return {
+        "status": "PASS",
+        "sample_plan_sha256": sample_plan_sha,
+        "teacher_manifest_sha256": str(teacher_manifest_sha256),
+        "identity_selection": dict(identity_selection),
+        "per_identity": per_identity,
+        "checkpoint_sample_plan_sha256_source": _payload_string_source(
+            checkpoint_payload,
+            "sample_plan_sha256",
+        ),
+        "checkpoint_manifest_sha256_source": _payload_string_source(
+            checkpoint_payload,
+            "manifest_sha256",
+        ),
+    }
+
+
+def validate_multi_identity_student_checkpoint_contract(
+    checkpoint: deployment.DeploymentCheckpointRecord,
+) -> dict[str, Any]:
+    if int(checkpoint.global_step) != 6500:
+        raise RuntimeError("multi-identity Teacher-flow audit requires step6500")
+    payload = checkpoint.payload
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("multi-identity student checkpoint payload missing")
+    if payload.get("schema") != route_eq.FULL_SEQUENCE_TRAINER_SCHEMA:
+        raise RuntimeError(
+            "multi-identity Teacher-flow audit requires formal full-sequence "
+            "trainer checkpoint"
+        )
+    if deployment.count_mcp_tensors(checkpoint.generator_state_dict) <= 0:
+        raise RuntimeError("multi-identity student checkpoint missing MCP tensors")
+    return {
+        "status": "PASS",
+        "required_global_step": 6500,
+        "actual_global_step": int(checkpoint.global_step),
+        "required_schema": route_eq.FULL_SEQUENCE_TRAINER_SCHEMA,
+        "actual_schema": str(payload["schema"]),
+        "checkpoint_sha256": str(checkpoint.sha256),
+    }
+
+
 def build_teacher_flow_audit_states(
     *,
     source_noise: torch.Tensor,
@@ -251,12 +380,20 @@ def build_teacher_flow_audit_states(
     noise_seed: int = memorization.DEFAULT_NOISE_SEED,
     raw_timesteps: Sequence[int] = TEACHER_FLOW_AUDIT_RAW_TIMESTEPS,
     noise_realizations_per_raw: int = TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
+    state_id_prefix: str | None = None,
+    sample_identity: str | None = None,
+    validation_position: int | None = None,
+    identity_index: int | None = None,
 ) -> tuple[TeacherFlowAuditState, ...]:
     flow_audit._validate_source_and_teacher(source_noise, teacher_target)
     if tuple(int(value) for value in raw_timesteps) != TEACHER_FLOW_AUDIT_RAW_TIMESTEPS:
         raise ValueError("teacher-flow audit raw timestep grid is locked")
-    if int(noise_realizations_per_raw) != TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW:
-        raise ValueError("teacher-flow audit requires exactly four noises per raw")
+    noise_count = int(noise_realizations_per_raw)
+    if noise_count not in (
+        TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
+        TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW,
+    ):
+        raise ValueError("teacher-flow audit requires one or four noises per raw")
 
     clean_current = _chunk(teacher_target, CURRENT_CHUNK_INDEX)
     clean_future = _chunk(teacher_target, FUTURE_CHUNK_INDEX)
@@ -268,7 +405,7 @@ def build_teacher_flow_audit_states(
         raw = int(raw_timestep)
         main_t = memorization._warp_raw_timestep(raw, shift=DEFAULT_S_MAIN)
         future_t = memorization._warp_raw_timestep(raw, shift=DEFAULT_S_MCP)
-        for noise_index in range(int(noise_realizations_per_raw)):
+        for noise_index in range(noise_count):
             current_noise, current_noise_record = memorization._noise_for_realization(
                 template=source_current,
                 source_noise=source_noise,
@@ -337,9 +474,14 @@ def build_teacher_flow_audit_states(
                 future_state=future_state,
                 exact_mcp_target=exact_mcp_target,
             )
-            state_id = f"raw{raw:03d}_noise{int(noise_index)}"
+            base_state_id = f"raw{raw:03d}_noise{int(noise_index)}"
+            if state_id_prefix:
+                state_id = f"{state_id_prefix}_{base_state_id}"
+            else:
+                state_id = base_state_id
             provenance = {
                 "state_id": state_id,
+                "base_state_id": base_state_id,
                 "raw_timestep": raw,
                 "noise_index": int(noise_index),
                 "main_shift": DEFAULT_S_MAIN,
@@ -363,6 +505,12 @@ def build_teacher_flow_audit_states(
                 "main_timestep_sha256": tensor_sha256(main_timestep.detach().cpu()),
                 "future_timestep_sha256": tensor_sha256(future_timestep.detach().cpu()),
             }
+            if sample_identity is not None:
+                provenance["sample_identity"] = str(sample_identity)
+            if validation_position is not None:
+                provenance["validation_position"] = int(validation_position)
+            if identity_index is not None:
+                provenance["identity_index"] = int(identity_index)
             states.append(
                 TeacherFlowAuditState(
                     state_id=state_id,
@@ -382,7 +530,10 @@ def build_teacher_flow_audit_states(
                     provenance=provenance,
                 )
             )
-    _require_16_state_contract(states)
+    _require_teacher_flow_state_contract(
+        states,
+        expected_noise_realizations_per_raw=noise_count,
+    )
     return tuple(states)
 
 
@@ -394,7 +545,7 @@ def run_student_mcp_full_sequence_predictions(
     conditional_dict: Mapping[str, Any],
     direct_clean_context_kv: bool = False,
 ) -> dict[str, FlowPrediction]:
-    _require_16_state_contract(states)
+    _require_teacher_flow_state_contract(states)
     result: dict[str, FlowPrediction] = {}
     model = route_eq._model_with_block_mask(generator)
     was_training = bool(getattr(generator, "training", False))
@@ -498,7 +649,7 @@ def run_teacher_branch_predictions(
     teacher_payload: Mapping[str, Any],
     conditional_dict: Mapping[str, Any],
 ) -> dict[str, dict[str, FlowPrediction]]:
-    _require_16_state_contract(states)
+    _require_teacher_flow_state_contract(states)
     rng_plan = deployment.build_absolute_chunk_rng_plan(
         source_noise=source_noise,
         rollout_seed=int(teacher_payload["rollout_seed"]),
@@ -540,7 +691,13 @@ def build_teacher_flow_audit_result(
     training_checkpoint_git_sha: str,
 ) -> TeacherFlowAuditResult:
     _require_16_state_contract(states)
-    state_records = []
+    state_records = build_teacher_flow_state_records(
+        states=states,
+        student_predictions=student_predictions,
+        teacher_predictions=teacher_predictions,
+        sample_identity=sample_identity,
+        validation_position=_selected_validation_position_from_common(common_inputs),
+    )
     tensors: dict[str, Any] = {
         "schema": f"{TEACHER_FLOW_AUDIT_SCHEMA}_tensors_v1",
         "states": {},
@@ -557,26 +714,6 @@ def build_teacher_flow_audit_result(
             state.state_id,
             TEACHER_CLEAN_CURRENT_BRANCH,
         )
-        metrics = _state_metrics(
-            state=state,
-            student=student,
-            teacher_matched=matched,
-            teacher_clean=clean,
-        )
-        state_record = {
-            **state.provenance,
-            "student": _prediction_record(student),
-            "teacher_matched_current": _prediction_record(matched),
-            "teacher_clean_current": _prediction_record(clean),
-            "metrics": metrics,
-            "same_state_sigma_proof": _same_state_sigma_proof(
-                state=state,
-                student=student,
-                teacher_matched=matched,
-                teacher_clean=clean,
-            ),
-        }
-        state_records.append(state_record)
         tensors["states"][state.state_id] = {
             "current_state": state.current_state.detach().cpu(),
             "future_state": state.future_state.detach().cpu(),
@@ -600,6 +737,7 @@ def build_teacher_flow_audit_result(
         "writes_checkpoint": False,
         "runs_backward": False,
         "uses_optimizer": False,
+        "mode": TEACHER_FLOW_AUDIT_MODE_SINGLE,
         "sample_identity": str(sample_identity),
         "state_count": len(state_records),
         "raw_timesteps": list(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS),
@@ -623,6 +761,136 @@ def build_teacher_flow_audit_result(
     }
     validate_teacher_flow_audit_manifest(manifest)
     return TeacherFlowAuditResult(manifest=manifest, tensors=tensors)
+
+
+def build_teacher_flow_state_records(
+    *,
+    states: Sequence[TeacherFlowAuditState],
+    student_predictions: Mapping[str, FlowPrediction],
+    teacher_predictions: Mapping[str, Mapping[str, FlowPrediction]],
+    sample_identity: str,
+    validation_position: int | None = None,
+    identity_index: int | None = None,
+) -> list[dict[str, Any]]:
+    _require_teacher_flow_state_contract(states)
+    state_records = []
+    for state in states:
+        student = _prediction_for(student_predictions, state.state_id, STUDENT_MCP_BRANCH)
+        matched = _teacher_prediction_for(
+            teacher_predictions,
+            state.state_id,
+            TEACHER_MATCHED_CURRENT_BRANCH,
+        )
+        clean = _teacher_prediction_for(
+            teacher_predictions,
+            state.state_id,
+            TEACHER_CLEAN_CURRENT_BRANCH,
+        )
+        record = {
+            **state.provenance,
+            "sample_identity": str(sample_identity),
+            "student": _prediction_record(student),
+            "teacher_matched_current": _prediction_record(matched),
+            "teacher_clean_current": _prediction_record(clean),
+            "metrics": _state_metrics(
+                state=state,
+                student=student,
+                teacher_matched=matched,
+                teacher_clean=clean,
+            ),
+            "same_state_sigma_proof": _same_state_sigma_proof(
+                state=state,
+                student=student,
+                teacher_matched=matched,
+                teacher_clean=clean,
+            ),
+        }
+        if validation_position is not None:
+            record["validation_position"] = int(validation_position)
+        if identity_index is not None:
+            record["identity_index"] = int(identity_index)
+        state_records.append(record)
+    return state_records
+
+
+def build_teacher_flow_multi_identity_manifest(
+    *,
+    state_records: Sequence[Mapping[str, Any]],
+    identity_records: Sequence[Mapping[str, Any]],
+    identity_selection: Mapping[str, Any],
+    student_checkpoint_contract: Mapping[str, Any],
+    checkpoint_summary: Mapping[str, Any],
+    teacher_summary: Mapping[str, Any],
+    common_inputs_fingerprints_sha256: Mapping[str, str],
+    runtime_git_sha: str,
+    training_checkpoint_git_sha: str,
+) -> dict[str, Any]:
+    _validate_identity_selection(identity_selection)
+    _require_multi_identity_state_records(state_records)
+    _validate_multi_identity_records(identity_records, identity_selection)
+    _validate_common_fingerprints(
+        common_inputs_fingerprints_sha256,
+        identity_selection,
+    )
+    aggregates = aggregate_teacher_flow_metrics(state_records)
+    paired_statistics = paired_teacher_flow_statistics(state_records)
+    primary_label = privileged_current_generalization_label(
+        aggregates=aggregates,
+        paired_statistics=paired_statistics,
+    )
+    manifest = {
+        "schema": TEACHER_FLOW_AUDIT_SCHEMA,
+        "status": "PASS",
+        "diagnostic_only": True,
+        "non_deployable": True,
+        "canonical_training_eligible": False,
+        "canonical_deployment_eligible": False,
+        "writes_checkpoint": False,
+        "runs_backward": False,
+        "uses_optimizer": False,
+        "mode": TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32,
+        "state_count": len(state_records),
+        "raw_timesteps": list(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS),
+        "noise_realizations_per_raw": (
+            TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW
+        ),
+        "identity_selection": dict(identity_selection),
+        "identity_records": [dict(record) for record in identity_records],
+        "diagnostic_label": primary_label,
+        "primary_diagnostic_label": primary_label,
+        "primary_diagnostic_policy": _multi_identity_primary_policy(),
+        "matched_teacher_timestep_diagnostic": matched_teacher_timestep_diagnostic(
+            state_records
+        ),
+        "state_sigma_matching_contract": _state_sigma_matching_contract(
+            identity_rule="validation positions 0,8,16,...,248",
+            noise_realizations_per_raw=(
+                TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW
+            ),
+        ),
+        "teacher_routes": _teacher_route_contracts(),
+        "student_route": {
+            "route": "forward_full_sequence_next_forcing",
+            "direct_clean_context_kv": False,
+            "uses_deployment_serial_rollout": False,
+            "same_route_as_full_sequence_validation": True,
+        },
+        "conversion_contract": _conversion_contract(),
+        "forbidden_comparisons": _forbidden_comparisons(),
+        "scientific_interpretation_boundaries": _multi_identity_boundaries(),
+        "streaming_contract": _multi_identity_streaming_contract(),
+        "checkpoint": dict(checkpoint_summary),
+        "student_checkpoint_contract": dict(student_checkpoint_contract),
+        "teacher": dict(teacher_summary),
+        "common_inputs_fingerprints_sha256": dict(common_inputs_fingerprints_sha256),
+        "runtime_git_sha": str(runtime_git_sha),
+        "training_checkpoint_git_sha": str(training_checkpoint_git_sha),
+        "states": [dict(record) for record in state_records],
+        "aggregates": aggregates,
+        "paired_statistics": paired_statistics,
+    }
+    validate_teacher_flow_audit_manifest(manifest)
+    return manifest
 
 
 def run_teacher_flow_audit(
@@ -700,15 +968,178 @@ def aggregate_teacher_flow_metrics(
     state_records: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
     grouped: dict[int, list[Mapping[str, Any]]] = {}
+    grouped_by_identity: dict[str, list[Mapping[str, Any]]] = {}
     for record in state_records:
         raw = int(record["raw_timestep"])
         grouped.setdefault(raw, []).append(record)
+        identity_key = _identity_group_key(record)
+        grouped_by_identity.setdefault(identity_key, []).append(record)
     return {
+        "by_state": {
+            str(record["state_id"]): {
+                "sample_identity": str(record.get("sample_identity", "")),
+                "validation_position": _optional_int(
+                    record.get("validation_position")
+                ),
+                "raw_timestep": int(record["raw_timestep"]),
+                "noise_index": int(record["noise_index"]),
+                "metrics": _aggregate_group([record]),
+            }
+            for record in state_records
+        },
+        "by_identity": {
+            key: {
+                "sample_identity": str(records[0].get("sample_identity", key)),
+                "validation_position": _optional_int(
+                    records[0].get("validation_position")
+                ),
+                "identity_index": _optional_int(records[0].get("identity_index")),
+                "state_count": int(len(records)),
+                "metrics": _aggregate_group(records),
+            }
+            for key, records in sorted(grouped_by_identity.items())
+        },
         "by_raw": {
             str(raw): _aggregate_group(records)
             for raw, records in sorted(grouped.items())
         },
         "all_states": _aggregate_group(list(state_records)),
+    }
+
+
+def paired_teacher_flow_statistics(
+    state_records: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    _require_non_empty_records(state_records)
+    identity_groups: dict[str, list[Mapping[str, Any]]] = {}
+    raw_groups: dict[int, list[Mapping[str, Any]]] = {}
+    for record in state_records:
+        identity_groups.setdefault(_identity_group_key(record), []).append(record)
+        raw_groups.setdefault(int(record["raw_timestep"]), []).append(record)
+
+    by_identity = {}
+    for key, records in sorted(identity_groups.items()):
+        values = _paired_values(records)
+        by_identity[key] = {
+            "sample_identity": str(records[0].get("sample_identity", key)),
+            "validation_position": _optional_int(records[0].get("validation_position")),
+            "identity_index": _optional_int(records[0].get("identity_index")),
+            "state_count": int(len(records)),
+            **values,
+        }
+
+    identity_values = list(by_identity.values())
+    by_raw = {}
+    for raw, records in sorted(raw_groups.items()):
+        raw_values = [_paired_values([record]) for record in records]
+        by_raw[str(raw)] = _paired_summary(raw_values)
+
+    return {
+        "by_identity": by_identity,
+        "by_raw": by_raw,
+        "privileged_identity_flow_win_count": int(
+            sum(1 for value in identity_values if value["privileged_flow_win"])
+        ),
+        "privileged_identity_flow_win_rate": _rate(
+            sum(1 for value in identity_values if value["privileged_flow_win"]),
+            len(identity_values),
+        ),
+        "matched_identity_flow_win_count": int(
+            sum(1 for value in identity_values if value["matched_flow_win"])
+        ),
+        "matched_identity_flow_win_rate": _rate(
+            sum(1 for value in identity_values if value["matched_flow_win"]),
+            len(identity_values),
+        ),
+        "privileged_identity_flow_reduction_mean": _mean(
+            value["privileged_flow_reduction"] for value in identity_values
+        ),
+        "privileged_identity_flow_reduction_median": _median(
+            value["privileged_flow_reduction"] for value in identity_values
+        ),
+        "privileged_identity_x0_reduction_mean": _mean(
+            value["privileged_x0_reduction"] for value in identity_values
+        ),
+        "privileged_identity_x0_reduction_median": _median(
+            value["privileged_x0_reduction"] for value in identity_values
+        ),
+        "matched_identity_flow_reduction_mean": _mean(
+            value["matched_flow_reduction"] for value in identity_values
+        ),
+        "matched_identity_flow_reduction_median": _median(
+            value["matched_flow_reduction"] for value in identity_values
+        ),
+        "matched_identity_x0_reduction_mean": _mean(
+            value["matched_x0_reduction"] for value in identity_values
+        ),
+        "matched_identity_x0_reduction_median": _median(
+            value["matched_x0_reduction"] for value in identity_values
+        ),
+    }
+
+
+def privileged_current_generalization_label(
+    *,
+    aggregates: Mapping[str, Any],
+    paired_statistics: Mapping[str, Any],
+) -> str:
+    all_states = aggregates["all_states"]
+    mcp_flow = float(all_states["mcp_flow_vs_exact_mse"]["mean"])
+    privileged_flow = float(all_states["teacher_clean_flow_vs_exact_mse"]["mean"])
+    mcp_x0 = float(all_states["mcp_x0_vs_clean_future_mse"]["mean"])
+    privileged_x0 = float(all_states["teacher_clean_x0_vs_clean_future_mse"]["mean"])
+    flow_reduction = _relative_reduction(mcp_flow, privileged_flow)
+    x0_reduction = _relative_reduction(mcp_x0, privileged_x0)
+    identity_win_rate = float(
+        paired_statistics["privileged_identity_flow_win_rate"]
+    )
+    raw_not_worse = all(
+        float(raw_metrics["teacher_clean_flow_vs_exact_mse"]["mean"])
+        <= float(raw_metrics["mcp_flow_vs_exact_mse"]["mean"])
+        for raw_metrics in aggregates["by_raw"].values()
+    )
+    if (
+        flow_reduction >= 0.25
+        and identity_win_rate >= 0.75
+        and x0_reduction >= 0.25
+        and raw_not_worse
+    ):
+        return STRONG_PRIVILEGED_CURRENT_SUPPORT
+    if flow_reduction < 0.10 or identity_win_rate < 0.60:
+        return NO_PRIVILEGED_CURRENT_SUPPORT
+    return INCONCLUSIVE
+
+
+def matched_teacher_timestep_diagnostic(
+    state_records: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    grouped: dict[int, list[Mapping[str, Any]]] = {}
+    for record in state_records:
+        grouped.setdefault(int(record["raw_timestep"]), []).append(record)
+    by_raw = {}
+    for raw, records in sorted(grouped.items()):
+        values = [_paired_values([record]) for record in records]
+        summary = _paired_summary(values)
+        reduction = float(summary["matched_flow_reduction_mean"])
+        if reduction > 0.0:
+            direction = "better_than_mcp"
+        elif reduction < 0.0:
+            direction = "worse_than_mcp"
+        else:
+            direction = "equal_to_mcp"
+        by_raw[str(raw)] = {
+            "matched_flow_reduction_mean": reduction,
+            "matched_flow_reduction_median": float(
+                summary["matched_flow_reduction_median"]
+            ),
+            "matched_flow_win_count": int(summary["matched_flow_win_count"]),
+            "matched_flow_win_rate": float(summary["matched_flow_win_rate"]),
+            "direction": direction,
+        }
+    return {
+        "label": MATCHED_TEACHER_TIMESTEP_DEPENDENCE,
+        "not_primary_gate": True,
+        "by_raw": by_raw,
     }
 
 
@@ -754,22 +1185,49 @@ def validate_teacher_flow_audit_manifest(manifest: Mapping[str, Any]) -> None:
     for field in ("writes_checkpoint", "runs_backward", "uses_optimizer"):
         if manifest.get(field) is not False:
             raise RuntimeError(f"teacher-flow audit forbidden runtime flag set: {field}")
-    if int(manifest.get("state_count", -1)) != 16:
-        raise RuntimeError("teacher-flow audit must contain 16 states")
+    mode = str(manifest.get("mode", TEACHER_FLOW_AUDIT_MODE_SINGLE))
     if tuple(manifest.get("raw_timesteps", ())) != TEACHER_FLOW_AUDIT_RAW_TIMESTEPS:
         raise RuntimeError("teacher-flow audit raw grid mismatch")
-    if int(manifest.get("noise_realizations_per_raw", -1)) != 4:
-        raise RuntimeError("teacher-flow audit noise count mismatch")
     states = manifest.get("states")
     if not isinstance(states, Sequence) or isinstance(states, (str, bytes)):
         raise RuntimeError("teacher-flow audit states missing")
-    if len(states) != 16:
-        raise RuntimeError("teacher-flow audit state record count mismatch")
+    if mode == TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32:
+        if int(manifest.get("state_count", -1)) != 128:
+            raise RuntimeError("multi-identity Teacher-flow audit must contain 128 states")
+        if int(manifest.get("noise_realizations_per_raw", -1)) != 1:
+            raise RuntimeError("multi-identity Teacher-flow audit noise count mismatch")
+        if len(states) != 128:
+            raise RuntimeError("multi-identity Teacher-flow state record count mismatch")
+        _validate_identity_selection(manifest.get("identity_selection"))
+        _require_multi_identity_state_records(states)
+        _validate_multi_identity_records(
+            manifest.get("identity_records"),
+            manifest.get("identity_selection"),
+        )
+        _validate_common_fingerprints(
+            manifest.get("common_inputs_fingerprints_sha256"),
+            manifest.get("identity_selection"),
+        )
+        if manifest.get("primary_diagnostic_label") not in {
+            STRONG_PRIVILEGED_CURRENT_SUPPORT,
+            NO_PRIVILEGED_CURRENT_SUPPORT,
+            INCONCLUSIVE,
+        }:
+            raise RuntimeError("multi-identity Teacher-flow diagnostic label invalid")
+    else:
+        if int(manifest.get("state_count", -1)) != 16:
+            raise RuntimeError("teacher-flow audit must contain 16 states")
+        if int(manifest.get("noise_realizations_per_raw", -1)) != 4:
+            raise RuntimeError("teacher-flow audit noise count mismatch")
+        if len(states) != 16:
+            raise RuntimeError("teacher-flow audit state record count mismatch")
     for record in states:
         _validate_state_record(record)
     aggregates = manifest.get("aggregates")
     if not isinstance(aggregates, Mapping) or "all_states" not in aggregates:
         raise RuntimeError("teacher-flow audit aggregates missing")
+    if "by_state" not in aggregates or "by_identity" not in aggregates:
+        raise RuntimeError("teacher-flow audit aggregate hierarchy missing")
 
 
 def _validate_student_checkpoint_sidecars(
@@ -1417,6 +1875,125 @@ def _aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, dict[str
     return aggregate
 
 
+def _paired_values(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    aggregate = _aggregate_group(records)
+    mcp_flow = float(aggregate["mcp_flow_vs_exact_mse"]["mean"])
+    matched_flow = float(aggregate["teacher_matched_flow_vs_exact_mse"]["mean"])
+    privileged_flow = float(aggregate["teacher_clean_flow_vs_exact_mse"]["mean"])
+    mcp_x0 = float(aggregate["mcp_x0_vs_clean_future_mse"]["mean"])
+    matched_x0 = float(aggregate["teacher_matched_x0_vs_clean_future_mse"]["mean"])
+    privileged_x0 = float(aggregate["teacher_clean_x0_vs_clean_future_mse"]["mean"])
+    return {
+        "mcp_flow_mse": mcp_flow,
+        "matched_flow_mse": matched_flow,
+        "privileged_flow_mse": privileged_flow,
+        "mcp_x0_mse": mcp_x0,
+        "matched_x0_mse": matched_x0,
+        "privileged_x0_mse": privileged_x0,
+        "privileged_flow_reduction": _relative_reduction(
+            mcp_flow,
+            privileged_flow,
+        ),
+        "matched_flow_reduction": _relative_reduction(mcp_flow, matched_flow),
+        "privileged_x0_reduction": _relative_reduction(mcp_x0, privileged_x0),
+        "matched_x0_reduction": _relative_reduction(mcp_x0, matched_x0),
+        "privileged_flow_win": privileged_flow < mcp_flow,
+        "matched_flow_win": matched_flow < mcp_flow,
+    }
+
+
+def _paired_summary(values: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if not values:
+        raise RuntimeError("cannot summarize empty paired values")
+    privileged_wins = sum(1 for value in values if value["privileged_flow_win"])
+    matched_wins = sum(1 for value in values if value["matched_flow_win"])
+    return {
+        "state_count": int(len(values)),
+        "privileged_flow_win_count": int(privileged_wins),
+        "privileged_flow_win_rate": _rate(privileged_wins, len(values)),
+        "matched_flow_win_count": int(matched_wins),
+        "matched_flow_win_rate": _rate(matched_wins, len(values)),
+        "privileged_flow_reduction_mean": _mean(
+            value["privileged_flow_reduction"] for value in values
+        ),
+        "privileged_flow_reduction_median": _median(
+            value["privileged_flow_reduction"] for value in values
+        ),
+        "matched_flow_reduction_mean": _mean(
+            value["matched_flow_reduction"] for value in values
+        ),
+        "matched_flow_reduction_median": _median(
+            value["matched_flow_reduction"] for value in values
+        ),
+        "privileged_x0_reduction_mean": _mean(
+            value["privileged_x0_reduction"] for value in values
+        ),
+        "privileged_x0_reduction_median": _median(
+            value["privileged_x0_reduction"] for value in values
+        ),
+        "matched_x0_reduction_mean": _mean(
+            value["matched_x0_reduction"] for value in values
+        ),
+        "matched_x0_reduction_median": _median(
+            value["matched_x0_reduction"] for value in values
+        ),
+    }
+
+
+def _relative_reduction(baseline: float, candidate: float) -> float:
+    baseline_value = float(baseline)
+    if baseline_value <= 0.0:
+        return 0.0
+    return float((baseline_value - float(candidate)) / baseline_value)
+
+
+def _rate(count: int, total: int) -> float:
+    if int(total) <= 0:
+        raise RuntimeError("rate denominator must be positive")
+    return float(int(count) / int(total))
+
+
+def _mean(values: Any) -> float:
+    materialized = [float(value) for value in values]
+    if not materialized:
+        raise RuntimeError("cannot average empty values")
+    return float(sum(materialized) / len(materialized))
+
+
+def _median(values: Any) -> float:
+    materialized = [float(value) for value in values]
+    if not materialized:
+        raise RuntimeError("cannot compute median of empty values")
+    return float(median(materialized))
+
+
+def _identity_group_key(record: Mapping[str, Any]) -> str:
+    if "validation_position" in record:
+        return f"validation_position_{int(record['validation_position']):03d}"
+    return str(record.get("sample_identity", "single_identity"))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _require_non_empty_records(records: Sequence[Mapping[str, Any]]) -> None:
+    if not records:
+        raise RuntimeError("teacher-flow metric records must be non-empty")
+
+
+def _selected_validation_position_from_common(common_inputs: Mapping[str, Any]) -> int | None:
+    value = common_inputs.get("selected_validation_position")
+    if value is not None:
+        return int(value)
+    artifact = common_inputs.get("artifact_identity")
+    if isinstance(artifact, Mapping) and artifact.get("selected_validation_position") is not None:
+        return int(artifact["selected_validation_position"])
+    return None
+
+
 def _branch_strictly_dominates(
     state_records: Sequence[Mapping[str, Any]],
     *,
@@ -1466,14 +2043,35 @@ def _diagnostic_policy() -> dict[str, Any]:
     }
 
 
-def _state_sigma_matching_contract() -> dict[str, Any]:
+def _multi_identity_primary_policy() -> dict[str, Any]:
     return {
-        "identity": "validation_sample_identities[0]",
+        "primary_hypothesis": "PRIVILEGED_CURRENT_GENERALIZES",
+        STRONG_PRIVILEGED_CURRENT_SUPPORT: (
+            "all-state privileged flow reduction >=25%, privileged identity "
+            "flow win-rate >=75%, all-state privileged x0 reduction >=25%, "
+            "and no raw aggregate privileged flow MSE is worse than MCP"
+        ),
+        NO_PRIVILEGED_CURRENT_SUPPORT: (
+            "overall privileged flow reduction <10% or privileged identity "
+            "flow win-rate <60%"
+        ),
+        INCONCLUSIVE: "pre-registered strong/no-support criteria are not met",
+        "matched_teacher_is_not_primary_gate": True,
+    }
+
+
+def _state_sigma_matching_contract(
+    *,
+    identity_rule: str = "validation_sample_identities[0]",
+    noise_realizations_per_raw: int = TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
+) -> dict[str, Any]:
+    return {
+        "identity": str(identity_rule),
         "history_chunk": HISTORY_CHUNK_INDEX,
         "current_chunk": CURRENT_CHUNK_INDEX,
         "future_chunk": FUTURE_CHUNK_INDEX,
         "raw_timesteps": list(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS),
-        "noise_realizations_per_raw": TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
+        "noise_realizations_per_raw": int(noise_realizations_per_raw),
         "current_state": "Main scheduler shift=5 add_noise(clean_chunk1, current_noise)",
         "future_state": "MCP scheduler shift=10 add_noise(clean_chunk2, future_noise)",
         "teacher_timestep": "same physical future sigma times 1000",
@@ -1555,6 +2153,37 @@ def _scientific_boundaries() -> dict[str, str]:
     }
 
 
+def _multi_identity_boundaries() -> dict[str, str]:
+    return {
+        STRONG_PRIVILEGED_CURRENT_SUPPORT: (
+            "privileged near-clean current information produces a substantially "
+            "better future conditional target across validation identities and is "
+            "a promising training-time distillation signal"
+        ),
+        NO_PRIVILEGED_CURRENT_SUPPORT: (
+            "does not support privileged-current Teacher flow as the next priority"
+        ),
+        INCONCLUSIVE: (
+            "mixed evidence; do not claim conditional ambiguity or objective failure"
+        ),
+        "forbidden_claims": (
+            "do not claim conditional ambiguity is proven, exact FM is wrong, "
+            "the privileged Teacher is oracle, or Teacher flow should directly "
+            "replace FM target"
+        ),
+    }
+
+
+def _multi_identity_streaming_contract() -> dict[str, Any]:
+    return {
+        "identity_order": "one selected validation identity at a time",
+        "states_per_identity": len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS),
+        "retains_full_state_tensors": False,
+        "retains_full_flow_tensors": False,
+        "final_json_contains": "provenance, tensor SHA summaries, metrics, aggregates",
+    }
+
+
 def _validate_state_record(record: Any) -> None:
     if not isinstance(record, Mapping):
         raise RuntimeError("teacher-flow state record must be a mapping")
@@ -1609,24 +2238,178 @@ def _validate_teacher_runtime(runtime: deployment.DeploymentRuntime) -> None:
         raise RuntimeError("Teacher audit requires clean-history context_noise=0")
 
 
-def _require_16_state_contract(states: Sequence[TeacherFlowAuditState]) -> None:
-    if len(states) != (
-        len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
-        * TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW
+def _validate_identity_selection(selection: Any) -> None:
+    if not isinstance(selection, Mapping):
+        raise RuntimeError("multi-identity selection must be a mapping")
+    positions = selection.get("positions")
+    identities = selection.get("identity_strings")
+    if not isinstance(positions, Sequence) or isinstance(positions, (str, bytes)):
+        raise RuntimeError("multi-identity selection positions missing")
+    if not isinstance(identities, Sequence) or isinstance(identities, (str, bytes)):
+        raise RuntimeError("multi-identity selection identities missing")
+    expected_positions = list(
+        range(
+            0,
+            TEACHER_FLOW_AUDIT_VALIDATION_COUNT,
+            TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE,
+        )
+    )
+    if [int(value) for value in positions] != expected_positions:
+        raise RuntimeError("multi-identity selection positions mismatch")
+    if int(selection.get("stride", -1)) != TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE:
+        raise RuntimeError("multi-identity selection stride mismatch")
+    expected_rule = "validation positions 0,8,16,...,248 from exact 256 list"
+    if str(selection.get("selection_rule")) != expected_rule:
+        raise RuntimeError("multi-identity selection rule mismatch")
+    if len(identities) != TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT:
+        raise RuntimeError("multi-identity selection identity count mismatch")
+    if len(set(str(value) for value in identities)) != len(identities):
+        raise RuntimeError("multi-identity selection contains duplicate identities")
+    if int(selection.get("validation_identity_count", -1)) != (
+        TEACHER_FLOW_AUDIT_VALIDATION_COUNT
     ):
-        raise RuntimeError("teacher-flow audit expected exactly 16 states")
+        raise RuntimeError("multi-identity validation count mismatch")
+    if int(selection.get("selected_identity_count", -1)) != (
+        TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT
+    ):
+        raise RuntimeError("multi-identity selected count mismatch")
+    if selection.get("mode") != TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32:
+        raise RuntimeError("multi-identity selection mode mismatch")
+    if not _is_sha256(selection.get("identity_list_sha256")):
+        raise RuntimeError("multi-identity identity-list SHA missing")
+    if not _is_sha256(selection.get("selection_fingerprint_sha256")):
+        raise RuntimeError("multi-identity selection fingerprint missing")
+    expected_payload = {
+        "mode": selection["mode"],
+        "validation_identity_count": int(selection["validation_identity_count"]),
+        "selected_identity_count": int(selection["selected_identity_count"]),
+        "stride": int(selection.get("stride", -1)),
+        "positions": [int(value) for value in positions],
+        "identity_strings": [str(value) for value in identities],
+        "identity_list_sha256": str(selection["identity_list_sha256"]),
+        "selection_rule": expected_rule,
+    }
+    if deployment.canonical_json_sha256(expected_payload) != str(
+        selection["selection_fingerprint_sha256"]
+    ):
+        raise RuntimeError("multi-identity selection fingerprint mismatch")
+
+
+def _require_teacher_flow_state_contract(
+    states: Sequence[TeacherFlowAuditState],
+    *,
+    expected_noise_realizations_per_raw: int | None = None,
+) -> None:
+    if not states:
+        raise RuntimeError("teacher-flow audit state list is empty")
     seen = set()
     by_raw = {raw: 0 for raw in TEACHER_FLOW_AUDIT_RAW_TIMESTEPS}
     for state in states:
         if state.state_id in seen:
             raise RuntimeError("duplicate teacher-flow audit state id")
         seen.add(state.state_id)
-        by_raw[int(state.raw_timestep)] += 1
-        if int(state.raw_timestep) not in TEACHER_FLOW_AUDIT_RAW_TIMESTEPS:
+        raw = int(state.raw_timestep)
+        if raw not in TEACHER_FLOW_AUDIT_RAW_TIMESTEPS:
             raise RuntimeError("teacher-flow audit unexpected raw timestep")
-    for raw, count in by_raw.items():
-        if count != TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW:
-            raise RuntimeError(f"teacher-flow audit raw {raw} state count mismatch")
+        by_raw[raw] += 1
+    counts = set(by_raw.values())
+    if len(counts) != 1:
+        raise RuntimeError("teacher-flow audit raw state counts differ")
+    noise_count = counts.pop()
+    if expected_noise_realizations_per_raw is not None:
+        if noise_count != int(expected_noise_realizations_per_raw):
+            raise RuntimeError("teacher-flow audit noise realization count mismatch")
+    elif noise_count not in (
+        TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
+        TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW,
+    ):
+        raise RuntimeError("teacher-flow audit unsupported noise realization count")
+    expected_states = len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS) * int(noise_count)
+    if len(states) != expected_states:
+        raise RuntimeError("teacher-flow audit state count mismatch")
+
+
+def _require_multi_identity_state_records(
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    if len(records) != (
+        TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT
+        * len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
+    ):
+        raise RuntimeError("multi-identity Teacher-flow state count mismatch")
+    grouped: dict[int, list[Mapping[str, Any]]] = {}
+    for record in records:
+        if int(record.get("noise_index", -1)) != 0:
+            raise RuntimeError("multi-identity Teacher-flow requires noise_index 0")
+        position = int(record.get("validation_position", -1))
+        grouped.setdefault(position, []).append(record)
+    expected_positions = set(
+        range(
+            0,
+            TEACHER_FLOW_AUDIT_VALIDATION_COUNT,
+            TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE,
+        )
+    )
+    if set(grouped.keys()) != expected_positions:
+        raise RuntimeError("multi-identity Teacher-flow validation positions mismatch")
+    for position, position_records in grouped.items():
+        raws = sorted(int(record["raw_timestep"]) for record in position_records)
+        if raws != sorted(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS):
+            raise RuntimeError(
+                f"multi-identity Teacher-flow raw grid mismatch at {position}"
+            )
+
+
+def _validate_multi_identity_records(
+    records: Any,
+    selection: Any,
+) -> None:
+    _validate_identity_selection(selection)
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise RuntimeError("multi-identity records must be a sequence")
+    if len(records) != TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT:
+        raise RuntimeError("multi-identity records count mismatch")
+    by_position = {
+        int(record["validation_position"]): record
+        for record in records
+    }
+    for index, position in enumerate(selection["positions"]):
+        position_int = int(position)
+        record = by_position.get(position_int)
+        if record is None:
+            raise RuntimeError("multi-identity record validation position missing")
+        if str(record.get("sample_identity")) != str(
+            selection["identity_strings"][index]
+        ):
+            raise RuntimeError("multi-identity record identity mismatch")
+        if int(record.get("identity_index", -1)) != int(index):
+            raise RuntimeError("multi-identity record identity_index mismatch")
+        if int(record.get("state_count", -1)) != len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS):
+            raise RuntimeError("multi-identity record state_count mismatch")
+        if not _is_sha256(record.get("common_inputs_fingerprint_sha256")):
+            raise RuntimeError("multi-identity common input fingerprint missing")
+
+
+def _validate_common_fingerprints(
+    fingerprints: Any,
+    selection: Any,
+) -> None:
+    _validate_identity_selection(selection)
+    if not isinstance(fingerprints, Mapping):
+        raise RuntimeError("multi-identity common fingerprints must be a mapping")
+    expected_keys = {str(position) for position in selection["positions"]}
+    if set(str(key) for key in fingerprints.keys()) != expected_keys:
+        raise RuntimeError("multi-identity common fingerprint positions mismatch")
+    for value in fingerprints.values():
+        if not _is_sha256(value):
+            raise RuntimeError("multi-identity common fingerprint invalid")
+
+
+def _require_16_state_contract(states: Sequence[TeacherFlowAuditState]) -> None:
+    _require_teacher_flow_state_contract(
+        states,
+        expected_noise_realizations_per_raw=TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
+    )
 
 
 def _selected_anchor1_depth1(anchors: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -1720,9 +2503,15 @@ __all__ = [
     "FUTURE_CHUNK_INDEX",
     "HISTORY_CHUNK_INDEX",
     "INCONCLUSIVE",
+    "MATCHED_TEACHER_TIMESTEP_DEPENDENCE",
+    "NO_PRIVILEGED_CURRENT_SUPPORT",
     "STUDENT_MCP_BRANCH",
+    "STRONG_PRIVILEGED_CURRENT_SUPPORT",
     "TEACHER_CLEAN_CURRENT_BRANCH",
     "TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW",
+    "TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32",
+    "TEACHER_FLOW_AUDIT_MODE_SINGLE",
+    "TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW",
     "TEACHER_FLOW_AUDIT_RAW_TIMESTEPS",
     "TEACHER_FLOW_AUDIT_SCHEMA",
     "TEACHER_MATCHED_CURRENT_BRANCH",
@@ -1734,16 +2523,24 @@ __all__ = [
     "TeacherFlowAuditState",
     "aggregate_teacher_flow_metrics",
     "build_flow_match_scheduler",
+    "build_teacher_flow_multi_identity_manifest",
     "build_teacher_flow_audit_result",
     "build_teacher_flow_audit_states",
+    "build_teacher_flow_state_records",
     "diagnostic_label_from_metrics",
     "load_teacher_flow_student_checkpoint_record",
+    "matched_teacher_timestep_diagnostic",
     "manual_flow_to_x0",
+    "paired_teacher_flow_statistics",
+    "privileged_current_generalization_label",
     "run_student_mcp_full_sequence_predictions",
     "run_teacher_branch_predictions",
     "run_teacher_flow_audit",
+    "select_validation32_identities",
     "select_validation_zero_identity",
     "validate_frozen_teacher_model",
+    "validate_multi_identity_student_checkpoint_contract",
+    "validate_teacher_flow_artifact_identity_selection",
     "validate_teacher_flow_artifact_identity",
     "validate_teacher_flow_audit_manifest",
 ]

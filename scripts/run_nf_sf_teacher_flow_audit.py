@@ -5,7 +5,7 @@ import gc
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -37,15 +37,22 @@ from utils.nf_sf_m4 import load_m4_sample_plan
 from utils.nf_sf_m5_samples import M5TeacherSampleStore
 from utils.nf_sf_teacher_flow_audit import (
     TEACHER_FLOW_AUDIT_SCHEMA,
+    TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW,
+    aggregate_teacher_flow_metrics,
+    build_teacher_flow_multi_identity_manifest,
     build_flow_match_scheduler,
     build_teacher_flow_audit_result,
     build_teacher_flow_audit_states,
+    build_teacher_flow_state_records,
     load_teacher_flow_student_checkpoint_record,
     run_student_mcp_full_sequence_predictions,
     run_teacher_branch_predictions,
+    select_validation32_identities,
     select_validation_zero_identity,
     validate_frozen_teacher_model,
+    validate_multi_identity_student_checkpoint_contract,
     validate_teacher_flow_artifact_identity,
+    validate_teacher_flow_artifact_identity_selection,
 )
 from utils.nf_sf_tensors import DEFAULT_S_MAIN, DEFAULT_S_MCP
 
@@ -79,6 +86,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument(
+        "--multi_identity_validation32",
+        action="store_true",
+        help=(
+            "Run the strict 32-identity validation audit at positions "
+            "0,8,16,...,248 with one deterministic noise per raw timestep."
+        ),
+    )
+    parser.add_argument(
         "--student_direct_clean_context_kv",
         action="store_true",
         help=(
@@ -92,6 +107,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     torch.set_grad_enabled(False)
+    _validate_multi_identity_cli_contract(args)
     git_sha = current_git_head()
     repo_preflight = validate_cli_contract(args, git_sha=git_sha)
     device, runtime_contract = runtime_device(args.device)
@@ -103,7 +119,16 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         args.sample_plan,
         manifest_path=args.teacher_manifest,
     )
-    sample_identity = select_validation_zero_identity(sample_plan)
+    identity_selection = (
+        select_validation32_identities(sample_plan)
+        if bool(args.multi_identity_validation32)
+        else None
+    )
+    sample_identity = (
+        str(identity_selection["identity_strings"][0])
+        if identity_selection is not None
+        else select_validation_zero_identity(sample_plan)
+    )
     teacher_manifest_sha256 = file_sha256(args.teacher_manifest)
     expected_training_git_sha = _expected_training_git_sha(args, git_sha=git_sha)
     student_checkpoint = load_teacher_flow_student_checkpoint_record(
@@ -113,11 +138,25 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     )
     if student_checkpoint.payload is None:
         raise RuntimeError("student checkpoint payload missing after validation")
-    artifact_identity = validate_teacher_flow_artifact_identity(
-        sample_plan=sample_plan,
-        teacher_manifest_sha256=teacher_manifest_sha256,
-        checkpoint_payload=student_checkpoint.payload,
-        selected_identity=sample_identity,
+    multi_student_checkpoint_contract = (
+        validate_multi_identity_student_checkpoint_contract(student_checkpoint)
+        if identity_selection is not None
+        else None
+    )
+    artifact_identity = (
+        validate_teacher_flow_artifact_identity_selection(
+            sample_plan=sample_plan,
+            teacher_manifest_sha256=teacher_manifest_sha256,
+            checkpoint_payload=student_checkpoint.payload,
+            identity_selection=identity_selection,
+        )
+        if identity_selection is not None
+        else validate_teacher_flow_artifact_identity(
+            sample_plan=sample_plan,
+            teacher_manifest_sha256=teacher_manifest_sha256,
+            checkpoint_payload=student_checkpoint.payload,
+            selected_identity=sample_identity,
+        )
     )
     teacher_store = M5TeacherSampleStore(
         sample_plan=sample_plan,
@@ -126,6 +165,22 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         reference_checkpoint_path=None,
         expected_reference_sha256=OFFICIAL_SELF_FORCING_CHECKPOINT_SHA256,
     )
+    if identity_selection is not None:
+        return _run_multi_identity_validation32(
+            args=args,
+            git_sha=git_sha,
+            repo_preflight=repo_preflight,
+            runtime_contract=runtime_contract,
+            device=device,
+            dtype=dtype,
+            config=config,
+            teacher_store=teacher_store,
+            student_checkpoint=student_checkpoint,
+            identity_selection=identity_selection,
+            artifact_identity=artifact_identity,
+            student_checkpoint_contract=multi_student_checkpoint_contract,
+            expected_training_git_sha=expected_training_git_sha,
+        )
     with teacher_store.acquire(sample_identity) as teacher_sample:
         teacher_payload = dict(teacher_sample.payload)
         teacher_metadata = dict(teacher_sample.metadata)
@@ -267,6 +322,272 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     manifest["output_dir"] = str(args.output_dir.resolve())
     atomic_json_write(manifest, args.output_dir / "teacher_flow_audit.json")
     return manifest
+
+
+def _run_multi_identity_validation32(
+    *,
+    args: argparse.Namespace,
+    git_sha: str,
+    repo_preflight: Mapping[str, Any],
+    runtime_contract: Mapping[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+    config: Mapping[str, Any],
+    teacher_store: M5TeacherSampleStore,
+    student_checkpoint: Any,
+    identity_selection: Mapping[str, Any],
+    artifact_identity: Mapping[str, Any],
+    student_checkpoint_contract: Mapping[str, Any],
+    expected_training_git_sha: str,
+) -> dict[str, Any]:
+    main_scheduler = build_flow_match_scheduler(shift=DEFAULT_S_MAIN, device=device)
+    mcp_scheduler = build_flow_match_scheduler(shift=DEFAULT_S_MCP, device=device)
+
+    student_generator = build_generator(
+        config=config,
+        checkpoint=student_checkpoint,
+        mode=MODE_TRAINED_MCP1,
+        device=device,
+        dtype=dtype,
+    )
+    teacher_checkpoint = load_official_checkpoint_record(args.official_checkpoint)
+    teacher_generator = build_generator(
+        config=config,
+        checkpoint=teacher_checkpoint,
+        mode=MODE_OFFICIAL_MAIN,
+        device=device,
+        dtype=dtype,
+    )
+    teacher_summary = validate_frozen_teacher_model(
+        teacher_generator,
+        checkpoint=teacher_checkpoint,
+    )
+
+    state_records: list[Mapping[str, Any]] = []
+    identity_records: list[dict[str, Any]] = []
+    common_fingerprints: dict[str, str] = {}
+    try:
+        for identity_index, identity in enumerate(identity_selection["identity_strings"]):
+            validation_position = int(identity_selection["positions"][identity_index])
+            identity_state_records, common_fingerprint = _run_one_identity_records(
+                args=args,
+                git_sha=git_sha,
+                repo_preflight=repo_preflight,
+                runtime_contract=runtime_contract,
+                device=device,
+                dtype=dtype,
+                config=config,
+                teacher_store=teacher_store,
+                student_generator=student_generator,
+                teacher_generator=teacher_generator,
+                sample_identity=str(identity),
+                validation_position=validation_position,
+                identity_index=int(identity_index),
+                student_checkpoint=student_checkpoint,
+                artifact_identity=artifact_identity,
+                student_checkpoint_contract=student_checkpoint_contract,
+                main_scheduler=main_scheduler,
+                mcp_scheduler=mcp_scheduler,
+                expected_training_git_sha=expected_training_git_sha,
+            )
+            state_records.extend(identity_state_records)
+            common_fingerprints[str(validation_position)] = common_fingerprint
+            identity_records.append(
+                {
+                    "identity_index": int(identity_index),
+                    "sample_identity": str(identity),
+                    "validation_position": validation_position,
+                    "state_count": len(identity_state_records),
+                    "common_inputs_fingerprint_sha256": common_fingerprint,
+                    "metrics": aggregate_teacher_flow_metrics(
+                        identity_state_records
+                    )["all_states"],
+                }
+            )
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    finally:
+        student_generator.to("cpu")
+        teacher_generator.to("cpu")
+        del student_generator
+        del teacher_generator
+        gc.collect()
+
+    manifest = build_teacher_flow_multi_identity_manifest(
+        state_records=state_records,
+        identity_records=identity_records,
+        identity_selection=identity_selection,
+        student_checkpoint_contract=student_checkpoint_contract,
+        checkpoint_summary={
+            **student_checkpoint.to_json(),
+            "expected_checkpoint_step": int(args.expected_checkpoint_step),
+        },
+        teacher_summary=teacher_summary,
+        common_inputs_fingerprints_sha256=common_fingerprints,
+        runtime_git_sha=git_sha,
+        training_checkpoint_git_sha=str(student_checkpoint.training_git_sha),
+    )
+    manifest["output_dir"] = str(args.output_dir.resolve())
+    atomic_json_write(manifest, args.output_dir / "teacher_flow_audit.json")
+    return manifest
+
+
+def _run_one_identity_records(
+    *,
+    args: argparse.Namespace,
+    git_sha: str,
+    repo_preflight: Mapping[str, Any],
+    runtime_contract: Mapping[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+    config: Mapping[str, Any],
+    teacher_store: M5TeacherSampleStore,
+    student_generator: Any,
+    teacher_generator: Any,
+    sample_identity: str,
+    validation_position: int,
+    identity_index: int,
+    student_checkpoint: Any,
+    artifact_identity: Mapping[str, Any],
+    student_checkpoint_contract: Mapping[str, Any],
+    main_scheduler: Any,
+    mcp_scheduler: Any,
+    expected_training_git_sha: str,
+) -> tuple[list[dict[str, Any]], str]:
+    with teacher_store.acquire(sample_identity) as teacher_sample:
+        teacher_payload = dict(teacher_sample.payload)
+        teacher_metadata = dict(teacher_sample.metadata)
+        source_noise_cpu = teacher_sample.source_noise.detach().cpu()
+        teacher_target_cpu = teacher_sample.target_latent.detach().cpu()
+
+    _validate_sample_tensors(
+        source_noise=source_noise_cpu,
+        teacher_target=teacher_target_cpu,
+        dtype=dtype,
+    )
+    conditioning_cpu = build_conditioning(
+        prompt=str(teacher_payload["prompt"]),
+        device=device,
+        dtype=dtype,
+    )
+    source_noise = source_noise_cpu.to(device=device)
+    teacher_target = teacher_target_cpu.to(device=device, dtype=dtype)
+    teacher_payload["source_noise"] = source_noise
+    conditional_dict = move_tensors_to_device(
+        conditioning_cpu,
+        device=device,
+        floating_dtype=dtype,
+    )
+    common_inputs, _ = build_common_inputs_record(
+        sample_identity=sample_identity,
+        teacher_metadata=teacher_metadata,
+        teacher_payload=teacher_payload,
+        source_noise=source_noise,
+        conditioning=conditional_dict,
+        runtime_git_sha=git_sha,
+        training_checkpoint_git_sha=str(student_checkpoint.training_git_sha),
+        fps=int(args.fps),
+        sample_plan_sha256=str(artifact_identity["sample_plan_sha256"]),
+        teacher_manifest_sha256=str(artifact_identity["teacher_manifest_sha256"]),
+        selected_validation_position=int(validation_position),
+    )
+    common_inputs.update(
+        {
+            "audit_schema": TEACHER_FLOW_AUDIT_SCHEMA,
+            "diagnostic_only": True,
+            "non_deployable": True,
+            "runtime_contract": runtime_contract,
+            "repo_preflight": repo_preflight,
+            "artifact_identity": artifact_identity,
+            "student_checkpoint_contract": student_checkpoint_contract,
+            "config_path": str(args.config.resolve()),
+            "sample_plan_path": str(args.sample_plan.resolve()),
+            "teacher_manifest_path": str(args.teacher_manifest.resolve()),
+            "dataset_root": str(args.dataset_root.resolve()),
+            "frame_seq_length": FULL_SEQUENCE_FRAME_SEQ_LENGTH,
+            "selected_identity_policy": "validation positions 0,8,16,...,248",
+            "identity_index": int(identity_index),
+            "identity_selection_fingerprint_sha256": str(
+                artifact_identity["identity_selection"]["selection_fingerprint_sha256"]
+            ),
+            "student_direct_clean_context_kv": False,
+            "expected_student_checkpoint_git_sha": str(expected_training_git_sha),
+        }
+    )
+    common_fingerprint = assert_common_payload_fingerprint(common_inputs)
+    states = build_teacher_flow_audit_states(
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        noise_realizations_per_raw=TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW,
+        state_id_prefix=f"id{identity_index:02d}_pos{validation_position:03d}",
+        sample_identity=sample_identity,
+        validation_position=int(validation_position),
+        identity_index=int(identity_index),
+    )
+    student_predictions = run_student_mcp_full_sequence_predictions(
+        student_generator,
+        states=states,
+        teacher_target=teacher_target,
+        conditional_dict=conditional_dict,
+        direct_clean_context_kv=False,
+    )
+    teacher_predictions = run_teacher_branch_predictions(
+        runtime_factory=lambda: initialize_runtime(
+            generator=teacher_generator,
+            config=config,
+            source_noise=source_noise,
+        ),
+        states=states,
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        teacher_payload=teacher_payload,
+        conditional_dict=conditional_dict,
+    )
+    state_records = build_teacher_flow_state_records(
+        states=states,
+        student_predictions=student_predictions,
+        teacher_predictions=teacher_predictions,
+        sample_identity=sample_identity,
+        validation_position=int(validation_position),
+        identity_index=int(identity_index),
+    )
+    del states
+    del student_predictions
+    del teacher_predictions
+    del source_noise
+    del teacher_target
+    del conditional_dict
+    del teacher_payload
+    del teacher_metadata
+    return state_records, common_fingerprint
+
+
+def _validate_sample_tensors(
+    *,
+    source_noise: torch.Tensor,
+    teacher_target: torch.Tensor,
+    dtype: torch.dtype,
+) -> None:
+    if int(source_noise.shape[1]) != FULL_SEQUENCE_FRAME_COUNT:
+        raise RuntimeError("selected teacher sample must contain 21 latent frames")
+    if tuple(source_noise.shape) != tuple(teacher_target.shape):
+        raise RuntimeError("teacher target_latent must match source_noise shape")
+    if source_noise.dtype != dtype or teacher_target.dtype != dtype:
+        raise RuntimeError("requested dtype must match stored teacher tensors")
+
+
+def _validate_multi_identity_cli_contract(args: argparse.Namespace) -> None:
+    if not bool(args.multi_identity_validation32):
+        return
+    if int(args.expected_checkpoint_step) != 6500:
+        raise RuntimeError("multi-identity Teacher-flow audit requires step6500")
+    if bool(args.student_direct_clean_context_kv):
+        raise RuntimeError(
+            "multi-identity Teacher-flow audit requires direct_clean_context_kv=false"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

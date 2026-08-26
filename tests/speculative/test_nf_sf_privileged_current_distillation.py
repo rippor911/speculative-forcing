@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 
@@ -320,6 +319,81 @@ def _canonical_and_privileged_grad_reports():
     return canonical, privileged, comparison
 
 
+def _manual_group_report(grads: list[torch.Tensor | None]) -> dict:
+    records = []
+    by_name = {}
+    sq_norm = 0.0
+    missing = 0
+    for index, grad in enumerate(grads):
+        name = f"param{index}"
+        shape = [2] if grad is None else [int(grad.numel())]
+        snapshot = None if grad is None else pcd._snapshot_gradient(grad)
+        grad_sq = None if snapshot is None else pcd._sum_squares_float64(snapshot)
+        if snapshot is None:
+            missing += 1
+        else:
+            sq_norm += grad_sq
+        records.append(
+            {
+                "name": name,
+                "shape": shape,
+                "requires_grad": True,
+                "grad_present": snapshot is not None,
+                "grad_norm": None if grad_sq is None else grad_sq ** 0.5,
+                "grad_sq_norm": grad_sq,
+                "grad_finite": None if snapshot is None else True,
+            }
+        )
+        by_name[name] = {
+            "shape": shape,
+            "requires_grad": True,
+            "grad": snapshot,
+        }
+    return {
+        "grad_tensors": len(grads) - missing,
+        "missing_grad_tensors": missing,
+        "finite": True,
+        "norm": sq_norm ** 0.5,
+        "sq_norm": sq_norm,
+        "full_parameter_space_norm": sq_norm ** 0.5,
+        "full_space_norm_matches_present_norm": True,
+        "parameters": records,
+        "missing_parameters": [
+            dict(item) for item in records if not item["grad_present"]
+        ],
+        "_by_name": by_name,
+    }
+
+
+def _manual_reports(
+    canonical_grads: list[torch.Tensor | None],
+    privileged_grads: list[torch.Tensor | None],
+) -> tuple[dict, dict]:
+    canonical_group = _manual_group_report(canonical_grads)
+    privileged_group = _manual_group_report(privileged_grads)
+    canonical = {
+        "backbone": canonical_group,
+        "patch_embedding": canonical_group,
+        "mcp_fusion": canonical_group,
+        "mcp_depth1": canonical_group,
+    }
+    privileged = {
+        "backbone": privileged_group,
+        "patch_embedding": privileged_group,
+        "mcp_fusion": privileged_group,
+        "mcp_depth1": privileged_group,
+    }
+    return canonical, privileged
+
+
+def _float64_cosine(left: torch.Tensor, right: torch.Tensor) -> float:
+    left64 = left.reshape(-1).to(torch.float64)
+    right64 = right.reshape(-1).to(torch.float64)
+    dot = torch.dot(left64, right64).item()
+    denom = (torch.dot(left64, left64) * torch.dot(right64, right64)).sqrt().item()
+    return dot / denom
+
+
 def test_canonical_objective_contract_is_not_modified() -> None:
     plan = pcd.privileged_run_plan()
     provenance = pcd.provenance_contract()
@@ -479,11 +553,7 @@ def test_shared_only_cosine_matches_manual_shared_parameter_space() -> None:
         if left is not None and right is not None:
             shared_left.append(left)
             shared_right.append(right)
-    expected = F.cosine_similarity(
-        torch.cat(shared_left),
-        torch.cat(shared_right),
-        dim=0,
-    ).item()
+    expected = _float64_cosine(torch.cat(shared_left), torch.cat(shared_right))
 
     assert comparison["backbone"]["shared_nonzero_gradient_cosine"] == (
         pytest.approx(expected)
@@ -515,6 +585,120 @@ def test_zero_fill_full_space_keeps_existing_norms() -> None:
             privileged[group]["norm"]
         )
         assert item["full_space_norm_matches_present_norm"] is True
+
+
+def test_streaming_cosine_identical_opposite_and_orthogonal() -> None:
+    canonical, privileged = _manual_reports(
+        [torch.tensor([1.0, 2.0, 3.0])],
+        [torch.tensor([1.0, 2.0, 3.0])],
+    )
+    comparison = pcd.compare_gradient_reports(canonical, privileged)
+    assert comparison["backbone"]["full_parameter_space_cosine"] == pytest.approx(1.0)
+
+    canonical, privileged = _manual_reports(
+        [torch.tensor([1.0, 2.0, 3.0])],
+        [torch.tensor([-1.0, -2.0, -3.0])],
+    )
+    comparison = pcd.compare_gradient_reports(canonical, privileged)
+    assert comparison["backbone"]["full_parameter_space_cosine"] == pytest.approx(-1.0)
+
+    canonical, privileged = _manual_reports(
+        [torch.tensor([1.0, 0.0])],
+        [torch.tensor([0.0, 1.0])],
+    )
+    comparison = pcd.compare_gradient_reports(canonical, privileged)
+    assert comparison["backbone"]["full_parameter_space_cosine"] == pytest.approx(0.0)
+
+
+def test_one_side_missing_zero_fill_cosine_is_well_defined() -> None:
+    canonical, privileged = _manual_reports(
+        [torch.tensor([1.0, 0.0]), torch.tensor([0.0, 2.0])],
+        [None, torch.tensor([0.0, 2.0])],
+    )
+
+    comparison = pcd.compare_gradient_reports(canonical, privileged)
+
+    assert comparison["backbone"]["full_parameter_space_cosine"] == pytest.approx(
+        2.0 / (5.0 ** 0.5)
+    )
+    assert comparison["backbone"]["shared_nonzero_gradient_cosine"] == pytest.approx(
+        1.0
+    )
+    assert comparison["backbone"]["one_side_missing_grad_parameter_count"] == 1
+
+
+def test_bf16_large_magnitude_gradients_do_not_exceed_one() -> None:
+    left = torch.full((100_000,), 512.0, dtype=torch.bfloat16)
+    right = left.clone()
+    canonical, privileged = _manual_reports([left], [right])
+
+    comparison = pcd.compare_gradient_reports(canonical, privileged)
+    cosine = comparison["backbone"]["full_parameter_space_cosine"]
+
+    assert cosine <= 1.0
+    assert cosine == pytest.approx(1.0)
+    assert comparison["backbone"]["full_parameter_space_stats"][
+        "accumulator_dtype"
+    ] == "float64"
+
+
+def test_gradient_report_snapshot_survives_later_grad_mutation() -> None:
+    student, _, _, result = _run_forward(lambda_priv=0.0)
+    result.canonical_loss.backward()
+    report = pcd.gradient_group_report(student)
+    snapshot = report["backbone"]["_by_name"]["model.backbone_weight"]["grad"].clone()
+
+    student.model.backbone_weight.grad.zero_().add_(123.0)
+
+    assert torch.equal(
+        report["backbone"]["_by_name"]["model.backbone_weight"]["grad"],
+        snapshot,
+    )
+    assert report["backbone"]["parameters"][0]["snapshot_independent"] is True
+
+
+def test_streaming_stats_match_direct_float64_reference() -> None:
+    left = torch.tensor([1.5, -2.0, 3.25, 4.5], dtype=torch.float32)
+    right = torch.tensor([-0.5, 7.0, 2.0, 1.0], dtype=torch.float32)
+    canonical, privileged = _manual_reports([left[:2], left[2:]], [right[:2], right[2:]])
+
+    comparison = pcd.compare_gradient_reports(canonical, privileged)
+    stats = comparison["backbone"]["full_parameter_space_stats"]
+
+    assert stats["raw_dot"] == pytest.approx(torch.dot(left.double(), right.double()).item())
+    assert stats["canonical_sq_norm"] == pytest.approx(
+        torch.dot(left.double(), left.double()).item()
+    )
+    assert stats["privileged_sq_norm"] == pytest.approx(
+        torch.dot(right.double(), right.double()).item()
+    )
+    assert stats["raw_cosine"] == pytest.approx(_float64_cosine(left, right))
+
+
+def test_cosine_out_of_range_fails_closed() -> None:
+    bad_stats = {
+        "raw_dot": 1.00002,
+        "canonical_sq_norm": 1.0,
+        "privileged_sq_norm": 1.0,
+        "parameter_count": 1,
+        "element_count": 1,
+        "accumulator_dtype": "float64",
+        "gradient_value_dtype": "float32_snapshot",
+    }
+    with pytest.raises(RuntimeError, match="out of mathematical range"):
+        pcd._cosine_from_stats(bad_stats, label="bad cosine")
+
+
+def test_norm_cross_check_records_relative_error() -> None:
+    canonical, privileged, comparison = _canonical_and_privileged_grad_reports()
+
+    for group, item in comparison.items():
+        check = item["norm_cross_check"]
+        assert check["pass"] is True
+        assert check["canonical_relative_error"] < 1.0e-6
+        assert check["privileged_relative_error"] < 1.0e-6
+        assert check["canonical_stats_norm"] == pytest.approx(canonical[group]["norm"])
+        assert check["privileged_stats_norm"] == pytest.approx(privileged[group]["norm"])
 
 
 def test_optimizer_fingerprint_changes_only_after_optimizer_step() -> None:

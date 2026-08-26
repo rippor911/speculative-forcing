@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -101,7 +102,15 @@ class FakeBackbone(nn.Module):
         super().__init__()
         self.patch_embedding = nn.Conv3d(1, 1, kernel_size=1, bias=False)
         self.backbone_weight = nn.Parameter(torch.tensor(0.5))
+        self.head = FakeMainHead()
         self.num_frame_per_block = FULL_SEQUENCE_CHUNK_FRAMES
+
+
+class FakeMainHead(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.modulation = nn.Parameter(torch.ones(1, 2, 1))
+        self.head = nn.Linear(1, 1)
 
 
 class FakeMCPModule(nn.Module):
@@ -147,9 +156,16 @@ class FakeStudentGenerator(nn.Module):
         main_scale = (
             self.model.backbone_weight
             + self.model.patch_embedding.weight.reshape(()).to(noisy_image_or_video)
+            + self.model.head.modulation.sum().to(noisy_image_or_video)
+            + self.model.head.head.weight.reshape(()).to(noisy_image_or_video)
+            + self.model.head.head.bias.reshape(()).to(noisy_image_or_video)
         )
         main = noisy_image_or_video * main_scale
         by_depth: list[torch.Tensor] = []
+        shared_feature_scale = (
+            self.model.backbone_weight
+            + self.model.patch_embedding.weight.reshape(()).to(noisy_image_or_video)
+        )
         for depth in FULL_SEQUENCE_DEPTHS:
             chunks = []
             for anchor in mcp_anchor_inputs:
@@ -161,6 +177,7 @@ class FakeStudentGenerator(nn.Module):
                 scale = (
                     self.mcp.mcp_modules[depth - 1].weight.reshape(())
                     * (1.0 + self.mcp.fusion.weight.reshape(()))
+                    + 0.1 * shared_feature_scale
                 ).to(future)
                 chunks.append(torch.ones_like(future) * scale)
             by_depth.append(torch.stack(chunks, dim=1))
@@ -287,6 +304,22 @@ def _run_forward(lambda_priv: float = pcd.PRIVILEGED_CURRENT_LAMBDA):
     return student, teacher, batch, result
 
 
+def _canonical_and_privileged_grad_reports():
+    student, _, _, result = _run_forward(lambda_priv=0.0)
+    result.canonical_loss.backward()
+    canonical = pcd.gradient_group_report(student)
+
+    student, _, _, result = _run_forward(lambda_priv=0.0)
+    result.privileged_loss.backward()
+    privileged = pcd.gradient_group_report(student)
+    comparison = pcd.compare_gradient_reports(
+        canonical,
+        privileged,
+        lambda_priv=0.25,
+    )
+    return canonical, privileged, comparison
+
+
 def test_canonical_objective_contract_is_not_modified() -> None:
     plan = pcd.privileged_run_plan()
     provenance = pcd.provenance_contract()
@@ -407,25 +440,81 @@ def test_lambda_zero_reproduces_canonical_numerical_objective() -> None:
 
 
 def test_gradient_report_and_comparison_cover_required_groups() -> None:
-    student, _, _, result = _run_forward(lambda_priv=0.0)
-    result.canonical_loss.backward()
-    canonical = pcd.gradient_group_report(student)
-    aux = {
-        group: {
-            **values,
-            "_flat": values["_flat"].clone() * (2.0 if group == "mcp_depth1" else 1.0),
-            "norm": values["norm"] * (2.0 if group == "mcp_depth1" else 1.0),
-        }
-        for group, values in canonical.items()
-    }
-    comparison = pcd.compare_gradient_reports(canonical, aux, lambda_priv=0.25)
+    canonical, _, comparison = _canonical_and_privileged_grad_reports()
 
     assert set(comparison) == {"backbone", "patch_embedding", "mcp_fusion", "mcp_depth1"}
-    assert comparison["mcp_depth1"]["lambda_scaled_aux_to_canonical_norm_ratio"] == (
-        pytest.approx(0.5)
-    )
+    assert comparison["mcp_depth1"]["lambda_scaled_aux_to_canonical_norm_ratio"] is not None
     stripped = pcd.strip_gradient_flats(canonical)
     assert all("_flat" not in item for item in stripped.values())
+    assert all("_full_flat" not in item for item in stripped.values())
+    assert all("_by_name" not in item for item in stripped.values())
+
+
+def test_one_side_missing_grad_has_full_space_cosine_and_missing_names() -> None:
+    canonical, privileged, comparison = _canonical_and_privileged_grad_reports()
+    backbone = comparison["backbone"]
+    missing = backbone["one_side_missing_grad_parameters"]
+
+    assert canonical["backbone"]["missing_grad_tensors"] == 0
+    assert privileged["backbone"]["missing_grad_tensors"] == 3
+    assert [item["name"] for item in missing] == [
+        "model.head.modulation",
+        "model.head.head.weight",
+        "model.head.head.bias",
+    ]
+    assert all(item["canonical_grad_present"] is True for item in missing)
+    assert all(item["privileged_grad_present"] is False for item in missing)
+    assert backbone["legacy_present_gradient_cosine"] is None
+    assert backbone["full_parameter_space_cosine"] is not None
+
+
+def test_shared_only_cosine_matches_manual_shared_parameter_space() -> None:
+    canonical, privileged, comparison = _canonical_and_privileged_grad_reports()
+    shared_left = []
+    shared_right = []
+    for item in canonical["backbone"]["parameters"]:
+        name = item["name"]
+        left = canonical["backbone"]["_by_name"][name]["grad"]
+        right = privileged["backbone"]["_by_name"][name]["grad"]
+        if left is not None and right is not None:
+            shared_left.append(left)
+            shared_right.append(right)
+    expected = F.cosine_similarity(
+        torch.cat(shared_left),
+        torch.cat(shared_right),
+        dim=0,
+    ).item()
+
+    assert comparison["backbone"]["shared_nonzero_gradient_cosine"] == (
+        pytest.approx(expected)
+    )
+
+
+def test_full_grad_groups_new_cosines_match_legacy_cosine() -> None:
+    _, _, comparison = _canonical_and_privileged_grad_reports()
+
+    for group in ("patch_embedding", "mcp_fusion", "mcp_depth1"):
+        item = comparison[group]
+        assert item["one_side_missing_grad_parameter_count"] == 0
+        assert item["full_parameter_space_cosine"] == pytest.approx(
+            item["legacy_present_gradient_cosine"]
+        )
+        assert item["shared_nonzero_gradient_cosine"] == pytest.approx(
+            item["legacy_present_gradient_cosine"]
+        )
+
+
+def test_zero_fill_full_space_keeps_existing_norms() -> None:
+    canonical, privileged, comparison = _canonical_and_privileged_grad_reports()
+
+    for group, item in comparison.items():
+        assert item["canonical_full_parameter_space_norm"] == pytest.approx(
+            canonical[group]["norm"]
+        )
+        assert item["privileged_full_parameter_space_norm"] == pytest.approx(
+            privileged[group]["norm"]
+        )
+        assert item["full_space_norm_matches_present_norm"] is True
 
 
 def test_optimizer_fingerprint_changes_only_after_optimizer_step() -> None:

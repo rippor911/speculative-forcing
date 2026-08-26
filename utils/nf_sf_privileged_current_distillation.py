@@ -491,29 +491,83 @@ def gradient_group_report(module: torch.nn.Module) -> dict[str, dict[str, Any]]:
     report = {}
     for group_name, named_params in collect_nf_sf_parameter_groups(module).items():
         values = []
+        full_values = []
+        parameter_records = []
+        by_name = {}
         missing = 0
         finite = True
-        for _, param in named_params:
+        for name, param in named_params:
+            shape = [int(dim) for dim in param.shape]
+            record = {
+                "name": str(name),
+                "shape": shape,
+                "requires_grad": bool(param.requires_grad),
+                "grad_present": False,
+                "grad_norm": None,
+                "grad_finite": None,
+            }
+            by_name[str(name)] = {
+                "shape": shape,
+                "requires_grad": bool(param.requires_grad),
+                "grad": None,
+            }
             if not param.requires_grad:
+                parameter_records.append(record)
                 continue
+            zero = torch.zeros(int(param.numel()), dtype=torch.float32)
             if param.grad is None:
                 missing += 1
+                full_values.append(zero)
+                parameter_records.append(record)
                 continue
             grad = param.grad.detach().float().reshape(-1)
-            finite = finite and bool(torch.isfinite(grad).all().item())
-            values.append(grad.cpu())
+            grad_cpu = grad.cpu()
+            grad_finite = bool(torch.isfinite(grad).all().item())
+            finite = finite and grad_finite
+            values.append(grad_cpu)
+            full_values.append(grad_cpu)
+            record.update(
+                {
+                    "grad_present": True,
+                    "grad_norm": float(grad_cpu.norm().item()),
+                    "grad_finite": grad_finite,
+                }
+            )
+            by_name[str(name)]["grad"] = grad_cpu
+            parameter_records.append(record)
         if values:
             flat = torch.cat(values)
             norm = float(flat.norm().item())
         else:
             flat = torch.empty(0)
             norm = 0.0
+        if full_values:
+            full_flat = torch.cat(full_values)
+            full_norm = float(full_flat.norm().item())
+        else:
+            full_flat = torch.empty(0)
+            full_norm = 0.0
+        _assert_norm_equivalent(norm, full_norm, label=f"{group_name} full-space norm")
         report[group_name] = {
             "grad_tensors": int(len(values)),
             "missing_grad_tensors": int(missing),
             "finite": bool(finite),
             "norm": norm,
+            "full_parameter_space_norm": full_norm,
+            "full_space_norm_matches_present_norm": True,
+            "parameter_tensors": int(len(parameter_records)),
+            "trainable_parameter_tensors": int(
+                sum(1 for item in parameter_records if item["requires_grad"])
+            ),
+            "parameters": parameter_records,
+            "missing_parameters": [
+                dict(item)
+                for item in parameter_records
+                if item["requires_grad"] and not item["grad_present"]
+            ],
             "_flat": flat,
+            "_full_flat": full_flat,
+            "_by_name": by_name,
         }
     return report
 
@@ -527,28 +581,54 @@ def compare_gradient_reports(
     groups = ("backbone", "patch_embedding", "mcp_fusion", "mcp_depth1")
     result = {}
     for group in groups:
-        left = canonical[group]["_flat"]
-        right = privileged[group]["_flat"]
-        if left.numel() != right.numel():
-            cosine = None
-        elif left.numel() == 0 or float(left.norm().item()) == 0.0:
-            cosine = None
-        elif float(right.norm().item()) == 0.0:
-            cosine = None
-        else:
-            cosine = float(F.cosine_similarity(left, right, dim=0).item())
+        legacy_left = canonical[group]["_flat"]
+        legacy_right = privileged[group]["_flat"]
+        legacy_cosine = _cosine_or_none(legacy_left, legacy_right)
+        full_left, full_right, shared_left, shared_right, one_side_missing = (
+            _paired_gradient_vectors(canonical[group], privileged[group])
+        )
+        full_cosine = _cosine_or_none(full_left, full_right)
+        shared_cosine = _cosine_or_none(shared_left, shared_right)
         canonical_norm = float(canonical[group]["norm"])
         privileged_norm = float(privileged[group]["norm"])
+        canonical_full_norm = float(full_left.norm().item()) if full_left.numel() else 0.0
+        privileged_full_norm = (
+            float(full_right.norm().item()) if full_right.numel() else 0.0
+        )
+        _assert_norm_equivalent(
+            canonical_norm,
+            canonical_full_norm,
+            label=f"{group} canonical full-space norm",
+        )
+        _assert_norm_equivalent(
+            privileged_norm,
+            privileged_full_norm,
+            label=f"{group} privileged full-space norm",
+        )
         ratio = None
         if canonical_norm > 0.0:
             ratio = float(float(lambda_priv) * privileged_norm / canonical_norm)
         result[group] = {
             "canonical_norm": canonical_norm,
             "privileged_norm": privileged_norm,
+            "canonical_full_parameter_space_norm": canonical_full_norm,
+            "privileged_full_parameter_space_norm": privileged_full_norm,
+            "full_space_norm_matches_present_norm": True,
             "canonical_finite": bool(canonical[group]["finite"]),
             "privileged_finite": bool(privileged[group]["finite"]),
-            "cosine": cosine,
+            "cosine": full_cosine,
+            "full_parameter_space_cosine": full_cosine,
+            "shared_nonzero_gradient_cosine": shared_cosine,
+            "legacy_present_gradient_cosine": legacy_cosine,
             "lambda_scaled_aux_to_canonical_norm_ratio": ratio,
+            "one_side_missing_grad_parameters": one_side_missing,
+            "one_side_missing_grad_parameter_count": len(one_side_missing),
+            "canonical_missing_parameters": [
+                dict(item) for item in canonical[group].get("missing_parameters", ())
+            ],
+            "privileged_missing_parameters": [
+                dict(item) for item in privileged[group].get("missing_parameters", ())
+            ],
         }
     return result
 
@@ -558,10 +638,94 @@ def strip_gradient_flats(report: Mapping[str, Mapping[str, Any]]) -> dict[str, A
         group: {
             key: value
             for key, value in data.items()
-            if key != "_flat"
+            if key not in ("_flat", "_full_flat", "_by_name")
         }
         for group, data in report.items()
     }
+
+
+def _paired_gradient_vectors(
+    canonical_group: Mapping[str, Any],
+    privileged_group: Mapping[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    canonical_by_name = canonical_group["_by_name"]
+    privileged_by_name = privileged_group["_by_name"]
+    canonical_names = [str(item["name"]) for item in canonical_group["parameters"]]
+    privileged_names = [str(item["name"]) for item in privileged_group["parameters"]]
+    if canonical_names != privileged_names:
+        raise RuntimeError("gradient report parameter order mismatch")
+
+    full_left = []
+    full_right = []
+    shared_left = []
+    shared_right = []
+    one_side_missing = []
+    for name in canonical_names:
+        left = canonical_by_name[name]
+        right = privileged_by_name[name]
+        if list(left["shape"]) != list(right["shape"]):
+            raise RuntimeError(f"gradient shape mismatch for {name}")
+        if bool(left["requires_grad"]) != bool(right["requires_grad"]):
+            raise RuntimeError(f"requires_grad mismatch for {name}")
+        if not bool(left["requires_grad"]):
+            continue
+
+        left_grad = left["grad"]
+        right_grad = right["grad"]
+        left_present = left_grad is not None
+        right_present = right_grad is not None
+        if left_present:
+            full_left.append(left_grad)
+        else:
+            full_left.append(_zero_for_shape(left["shape"]))
+        if right_present:
+            full_right.append(right_grad)
+        else:
+            full_right.append(_zero_for_shape(right["shape"]))
+        if left_present and right_present:
+            shared_left.append(left_grad)
+            shared_right.append(right_grad)
+        if left_present != right_present:
+            one_side_missing.append(
+                {
+                    "name": name,
+                    "shape": list(left["shape"]),
+                    "requires_grad": bool(left["requires_grad"]),
+                    "canonical_grad_present": bool(left_present),
+                    "privileged_grad_present": bool(right_present),
+                }
+            )
+
+    return (
+        torch.cat(full_left) if full_left else torch.empty(0),
+        torch.cat(full_right) if full_right else torch.empty(0),
+        torch.cat(shared_left) if shared_left else torch.empty(0),
+        torch.cat(shared_right) if shared_right else torch.empty(0),
+        one_side_missing,
+    )
+
+
+def _zero_for_shape(shape: Sequence[int]) -> torch.Tensor:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return torch.zeros(numel, dtype=torch.float32)
+
+
+def _cosine_or_none(left: torch.Tensor, right: torch.Tensor) -> float | None:
+    if left.numel() != right.numel():
+        return None
+    if left.numel() == 0 or float(left.norm().item()) == 0.0:
+        return None
+    if float(right.norm().item()) == 0.0:
+        return None
+    return float(F.cosine_similarity(left, right, dim=0).item())
+
+
+def _assert_norm_equivalent(left: float, right: float, *, label: str) -> None:
+    tolerance = max(1.0e-6, 1.0e-5 * max(abs(float(left)), abs(float(right))))
+    if abs(float(left) - float(right)) > tolerance:
+        raise RuntimeError(f"{label} changed after zero-fill")
 
 
 def classify_privileged_current_ab(

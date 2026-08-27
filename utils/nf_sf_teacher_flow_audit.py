@@ -1223,20 +1223,14 @@ def exact_current_flow_conversion_oracle(
         state.main_warped_timestep,
         state.current_state,
     )
-    exact_current_flow = route_eq._training_target_chunk(
+    diagnostic = _exact_current_flow_oracle_diagnostic(
         main_scheduler,
-        clean=clean_current,
-        noise=state.current_noise,
+        audit_state=state,
+        clean_current=clean_current,
         timestep=current_timestep,
-        name="teacher_flow_exact_current_target",
     )
-    reconstructed = reconstruct_x0_from_flow_matching(
-        main_scheduler,
-        state=state.current_state,
-        flow=exact_current_flow,
-        timestep=current_timestep,
-        name="teacher_flow_exact_current_x0_oracle",
-    )
+    exact_current_flow = diagnostic["tensors"]["exact_current_flow"]
+    reconstructed = diagnostic["tensors"]["reconstructed"]
     max_abs = float((reconstructed.float() - clean_current.float()).abs().max().item())
     mse = route_eq._mse(reconstructed, clean_current)
     passed = bool(
@@ -1247,21 +1241,29 @@ def exact_current_flow_conversion_oracle(
             rtol=CURRENT_X0_ORACLE_RTOL,
         )
     )
-    if not passed:
-        raise RuntimeError("exact current flow-to-x0 conversion oracle failed")
-    explicit_formula = (
-        state.current_state.float() - float(state.main_sigma) * exact_current_flow.float()
-    ).to(device=state.current_state.device, dtype=state.current_state.dtype)
     formula_matches_scheduler = bool(
         torch.allclose(
-            explicit_formula.float(),
+            diagnostic["tensors"]["recon_formula_actual"].float(),
             reconstructed.float(),
             atol=CURRENT_X0_ORACLE_ATOL,
             rtol=CURRENT_X0_ORACLE_RTOL,
         )
     )
+    failure_reasons = _current_oracle_failure_reasons(
+        diagnostic=diagnostic,
+        scheduler_path_pass=passed,
+        formula_matches_scheduler=formula_matches_scheduler,
+    )
+    if failure_reasons:
+        _raise_current_oracle_failure(
+            failure_reasons[0],
+            diagnostic=_strip_oracle_diagnostic_tensors(diagnostic),
+        )
     if not formula_matches_scheduler:
-        raise RuntimeError("explicit flow-to-x0 formula differs from scheduler step")
+        _raise_current_oracle_failure(
+            "explicit_formula_differs_from_scheduler_step",
+            diagnostic=_strip_oracle_diagnostic_tensors(diagnostic),
+        )
     return {
         "status": "PASS",
         "source": "FlowMatchScheduler.step(..., to_final=True)",
@@ -1273,10 +1275,290 @@ def exact_current_flow_conversion_oracle(
         "mse": float(mse),
         "scheduler_step_to_final": True,
         "formula_matches_scheduler": True,
+        "diagnostic": _strip_oracle_diagnostic_tensors(diagnostic),
         "exact_current_flow": _tensor_record(exact_current_flow),
         "reconstructed_current_x0": _tensor_record(reconstructed),
         "clean_current": _tensor_record(clean_current),
     }
+
+
+def _exact_current_flow_oracle_diagnostic(
+    scheduler: Any,
+    *,
+    audit_state: TeacherFlowAuditState,
+    clean_current: torch.Tensor,
+    timestep: torch.Tensor,
+) -> dict[str, Any]:
+    expected_main_timestep = memorization._warp_raw_timestep(
+        audit_state.raw_timestep,
+        shift=DEFAULT_S_MAIN,
+    )
+    scheduler_shift = _scheduler_shift(scheduler)
+    scheduler_sigma = flow_audit._resolved_sigma(
+        scheduler,
+        timestep,
+        audit_state.current_state,
+    )
+    exact_flow_sched = route_eq._training_target_chunk(
+        scheduler,
+        clean=clean_current,
+        noise=audit_state.current_noise,
+        timestep=timestep,
+        name="teacher_flow_exact_current_target",
+    )
+    recon_sched = reconstruct_x0_from_flow_matching(
+        scheduler,
+        state=audit_state.current_state,
+        flow=exact_flow_sched,
+        timestep=timestep,
+        name="teacher_flow_exact_current_x0_oracle",
+    )
+    recon_formula_actual = audit_state.current_state.float() - (
+        float(scheduler_sigma) * exact_flow_sched.float()
+    )
+    regenerated_state = route_eq._add_noise_chunk(
+        scheduler,
+        clean=clean_current,
+        noise=audit_state.current_noise,
+        timestep=timestep,
+        name="teacher_flow_regenerated_current_state",
+    )
+    recon_regenerated = reconstruct_x0_from_flow_matching(
+        scheduler,
+        state=regenerated_state,
+        flow=exact_flow_sched,
+        timestep=timestep,
+        name="teacher_flow_regenerated_current_x0_oracle",
+    )
+    clean32 = clean_current.detach().float()
+    noise32 = audit_state.current_noise.detach().float()
+    timestep32 = route_eq._timestep(audit_state.main_warped_timestep, clean32)
+    state32 = route_eq._add_noise_chunk(
+        scheduler,
+        clean=clean32,
+        noise=noise32,
+        timestep=timestep32,
+        name="teacher_flow_current_state_float32_reference",
+    )
+    flow32 = route_eq._training_target_chunk(
+        scheduler,
+        clean=clean32,
+        noise=noise32,
+        timestep=timestep32,
+        name="teacher_flow_current_target_float32_reference",
+    )
+    recon32 = reconstruct_x0_from_flow_matching(
+        scheduler,
+        state=state32,
+        flow=flow32,
+        timestep=timestep32,
+        name="teacher_flow_current_x0_float32_reference",
+    )
+    recon_sched_vs_clean = _tensor_error_stats(recon_sched, clean_current)
+    recon_formula_actual_vs_clean = _tensor_error_stats(
+        recon_formula_actual,
+        clean_current,
+    )
+    recon_regenerated_vs_clean = _tensor_error_stats(
+        recon_regenerated,
+        clean_current,
+    )
+    recon32_vs_clean32 = _tensor_error_stats(recon32, clean32)
+    noisy_state_vs_regenerated = _tensor_error_stats(
+        audit_state.current_state,
+        regenerated_state,
+    )
+    noisy_state_vs_regenerated["torch_equal"] = bool(
+        torch.equal(audit_state.current_state, regenerated_state)
+    )
+    recon_sched_vs_formula_actual = _tensor_error_stats(
+        recon_sched,
+        recon_formula_actual,
+    )
+    return {
+        "schema": "teacher_flow_exact_current_oracle_diagnostic_v1",
+        "identity": audit_state.provenance.get("sample_identity"),
+        "identity_index": audit_state.provenance.get("identity_index"),
+        "validation_position": audit_state.provenance.get("validation_position"),
+        "state_id": audit_state.state_id,
+        "raw_timestep": int(audit_state.raw_timestep),
+        "noise_index": int(audit_state.noise_index),
+        "warped_current_timestep": float(audit_state.main_warped_timestep),
+        "expected_main_warped_timestep": float(expected_main_timestep),
+        "future_warped_timestep": float(audit_state.future_warped_timestep),
+        "teacher_future_timestep": float(audit_state.teacher_future_timestep),
+        "resolved_sigma": float(scheduler_sigma),
+        "state_main_sigma": float(audit_state.main_sigma),
+        "state_future_sigma": float(audit_state.future_sigma),
+        "main_scheduler_expected_contract": {
+            "shift": float(DEFAULT_S_MAIN),
+            "timestep": float(audit_state.main_warped_timestep),
+            "sigma": float(audit_state.main_sigma),
+        },
+        "scheduler_actually_passed": {
+            "class": type(scheduler).__name__,
+            "id": int(id(scheduler)),
+            "shift": scheduler_shift,
+            "timestep": float(timestep.flatten()[0].detach().cpu().item()),
+            "sigma": float(scheduler_sigma),
+        },
+        "sources": {
+            "clean_current_tensor": "teacher_target chunk1",
+            "current_noise_tensor": audit_state.provenance.get("current_noise"),
+            "current_noisy_state": (
+                "main_scheduler.add_noise(clean_current, current_noise, "
+                "main_timestep)"
+            ),
+            "exact_current_flow": (
+                "main_scheduler.training_target(clean_current, current_noise, "
+                "main_timestep)"
+            ),
+            "reconstruction": (
+                "main_scheduler.step(exact_current_flow, main_timestep, "
+                "current_noisy_state, to_final=True)"
+            ),
+        },
+        "tensor_dtypes_devices": {
+            "clean": _tensor_meta(clean_current),
+            "noise": _tensor_meta(audit_state.current_noise),
+            "state": _tensor_meta(audit_state.current_state),
+            "exact_flow": _tensor_meta(exact_flow_sched),
+            "reconstructed": _tensor_meta(recon_sched),
+            "regenerated_state": _tensor_meta(regenerated_state),
+            "float32_clean": _tensor_meta(clean32),
+            "float32_state": _tensor_meta(state32),
+            "float32_flow": _tensor_meta(flow32),
+            "float32_reconstructed": _tensor_meta(recon32),
+        },
+        "noisy_state_vs_regenerated": noisy_state_vs_regenerated,
+        "recon_sched_vs_clean": recon_sched_vs_clean,
+        "recon_formula_actual_vs_clean": recon_formula_actual_vs_clean,
+        "recon_regenerated_vs_clean": recon_regenerated_vs_clean,
+        "recon_sched_vs_formula_actual": recon_sched_vs_formula_actual,
+        "float32_reference": {
+            "state32_source": "scheduler.add_noise(clean32, noise32, timestep)",
+            "flow32_source": "scheduler.training_target(clean32, noise32, timestep)",
+            "recon32_source": "scheduler.step(flow32, timestep, state32, to_final=True)",
+            "recon32_vs_clean32": recon32_vs_clean32,
+            "passes_existing_oracle_tolerance": bool(
+                torch.allclose(
+                    recon32.float(),
+                    clean32.float(),
+                    atol=CURRENT_X0_ORACLE_ATOL,
+                    rtol=CURRENT_X0_ORACLE_RTOL,
+                )
+            ),
+        },
+        "tensors": {
+            "exact_current_flow": exact_flow_sched,
+            "reconstructed": recon_sched,
+            "recon_formula_actual": recon_formula_actual,
+        },
+    }
+
+
+def _current_oracle_failure_reasons(
+    *,
+    diagnostic: Mapping[str, Any],
+    scheduler_path_pass: bool,
+    formula_matches_scheduler: bool,
+) -> list[str]:
+    reasons: list[str] = []
+    actual_shift = diagnostic["scheduler_actually_passed"]["shift"]
+    if actual_shift is None or abs(float(actual_shift) - float(DEFAULT_S_MAIN)) > 1.0e-9:
+        reasons.append("scheduler_shift_not_main")
+    if (
+        abs(
+            float(diagnostic["warped_current_timestep"])
+            - float(diagnostic["expected_main_warped_timestep"])
+        )
+        > 1.0e-5
+    ):
+        reasons.append("current_timestep_not_main_shift5_raw_warp")
+    if (
+        abs(
+            float(diagnostic["resolved_sigma"])
+            - float(diagnostic["state_main_sigma"])
+        )
+        > 1.0e-7
+    ):
+        reasons.append("scheduler_sigma_differs_from_state_main_sigma")
+    if diagnostic["noisy_state_vs_regenerated"]["torch_equal"] is not True:
+        reasons.append("current_state_noise_timestep_round_trip_mismatch")
+    if (
+        diagnostic["float32_reference"]["passes_existing_oracle_tolerance"]
+        is not True
+    ):
+        reasons.append("float32_reference_oracle_failed")
+    if not scheduler_path_pass:
+        reasons.append("scheduler_reconstruction_exceeds_existing_tolerance")
+    if not formula_matches_scheduler:
+        reasons.append("explicit_formula_differs_from_scheduler_step")
+    return reasons
+
+
+def _strip_oracle_diagnostic_tensors(
+    diagnostic: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = {key: value for key, value in diagnostic.items() if key != "tensors"}
+    payload["failure_case"] = _classify_current_oracle_failure(payload)
+    return payload
+
+
+def _classify_current_oracle_failure(diagnostic: Mapping[str, Any]) -> str:
+    if diagnostic["noisy_state_vs_regenerated"]["torch_equal"] is not True:
+        return "state_noise_timestep_provenance_bug"
+    sched_formula_error = float(
+        diagnostic["recon_sched_vs_formula_actual"]["max_abs"]
+    )
+    if sched_formula_error > CURRENT_X0_ORACLE_ATOL:
+        return "scheduler_identity_or_timestep_lookup_bug"
+    if diagnostic["float32_reference"]["passes_existing_oracle_tolerance"] is True:
+        sched_error = float(diagnostic["recon_sched_vs_clean"]["max_abs"])
+        if sched_error > CURRENT_X0_ORACLE_ATOL:
+            return "bf16_quantized_state_contract"
+    return "scheduler_or_flow_semantic_error"
+
+
+def _raise_current_oracle_failure(
+    reason: str,
+    *,
+    diagnostic: Mapping[str, Any],
+) -> None:
+    payload = json.dumps(diagnostic, sort_keys=True)
+    raise RuntimeError(
+        "exact current flow-to-x0 conversion oracle failed: "
+        f"{reason}; diagnostic={payload}"
+    )
+
+
+def _tensor_meta(tensor: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": [int(value) for value in tensor.shape],
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+    }
+
+
+def _tensor_error_stats(left: torch.Tensor, right: torch.Tensor) -> dict[str, Any]:
+    _require_finite_tensor(left, name="error_stats_left")
+    _require_finite_tensor(right, name="error_stats_right")
+    diff = (left.detach().float() - right.detach().float()).abs()
+    _require_finite_tensor(diff, name="error_stats_abs_diff")
+    flat = diff.reshape(-1)
+    return {
+        "mse": float((diff.square()).mean().detach().cpu().item()),
+        "max_abs": float(diff.max().detach().cpu().item()),
+        "mean_abs": float(diff.mean().detach().cpu().item()),
+        "p99_abs": float(torch.quantile(flat, 0.99).detach().cpu().item()),
+    }
+
+
+def _scheduler_shift(scheduler: Any) -> float | None:
+    value = getattr(scheduler, "shift", None)
+    if value is None:
+        return None
+    return float(value)
 
 
 def aggregate_teacher_flow_metrics(

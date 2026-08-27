@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +231,44 @@ def make_teacher_target() -> torch.Tensor:
         ev.FULL_SEQUENCE_FRAME_COUNT,
         dtype=torch.float32,
     ).reshape(1, ev.FULL_SEQUENCE_FRAME_COUNT, 1, 1, 1)
+
+
+def make_bf16_oracle_failure_tensors() -> tuple[torch.Tensor, torch.Tensor]:
+    source = torch.zeros((1, ev.FULL_SEQUENCE_FRAME_COUNT, 1, 1, 1), dtype=torch.bfloat16)
+    target = torch.zeros((1, ev.FULL_SEQUENCE_FRAME_COUNT, 1, 1, 1), dtype=torch.bfloat16)
+    source[:, 3:6] = torch.tensor(100.0, dtype=torch.bfloat16)
+    return source, target
+
+
+def make_oracle_state(
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, tuple[audit.TeacherFlowAuditState, ...], Any, Any]:
+    source = make_source_noise().to(dtype=dtype)
+    target = make_teacher_target().to(dtype=dtype)
+    main_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MAIN,
+        device="cpu",
+    )
+    mcp_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MCP,
+        device="cpu",
+    )
+    states = audit.build_teacher_flow_audit_states(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        noise_realizations_per_raw=1,
+    )
+    return target, states, main_scheduler, mcp_scheduler
+
+
+def oracle_failure_diagnostic(exc: BaseException) -> dict[str, Any]:
+    marker = "diagnostic="
+    text = str(exc)
+    assert marker in text
+    return json.loads(text.split(marker, 1)[1])
 
 
 def make_common(source_noise: torch.Tensor, teacher_target: torch.Tensor) -> tuple[dict, str]:
@@ -600,22 +639,50 @@ def test_manual_x0_conversion() -> None:
     assert x0.item() == pytest.approx(1.875)
 
 
+@pytest.mark.parametrize("shift", [DEFAULT_S_MAIN, DEFAULT_S_MCP])
+def test_flow_match_add_noise_target_step_exact_float32(shift: float) -> None:
+    scheduler = audit.build_flow_match_scheduler(shift=shift, device="cpu")
+    clean = torch.tensor([0.25, 1.5, -0.75], dtype=torch.float32).reshape(
+        1,
+        3,
+        1,
+        1,
+        1,
+    )
+    noise = torch.tensor([1.0, -0.5, 2.0], dtype=torch.float32).reshape(
+        1,
+        3,
+        1,
+        1,
+        1,
+    )
+    timestep = audit.route_eq._timestep(750.0, clean)
+    state = audit.route_eq._add_noise_chunk(
+        scheduler,
+        clean=clean,
+        noise=noise,
+        timestep=timestep,
+        name="unit_state",
+    )
+    flow = audit.route_eq._training_target_chunk(
+        scheduler,
+        clean=clean,
+        noise=noise,
+        timestep=timestep,
+        name="unit_flow",
+    )
+    recon = audit.reconstruct_x0_from_flow_matching(
+        scheduler,
+        state=state,
+        flow=flow,
+        timestep=timestep,
+        name="unit_recon",
+    )
+    assert torch.allclose(recon, clean, atol=1e-6, rtol=1e-6)
+
+
 def test_exact_current_flow_to_x0_conversion_oracle() -> None:
-    source = make_source_noise()
-    target = make_teacher_target()
-    main_scheduler = audit.build_flow_match_scheduler(
-        shift=DEFAULT_S_MAIN,
-        device="cpu",
-    )
-    states = audit.build_teacher_flow_audit_states(
-        source_noise=source,
-        teacher_target=target,
-        main_scheduler=main_scheduler,
-        mcp_scheduler=audit.build_flow_match_scheduler(
-            shift=DEFAULT_S_MCP,
-            device="cpu",
-        ),
-    )
+    target, states, main_scheduler, _ = make_oracle_state()
     oracle = audit.exact_current_flow_conversion_oracle(
         main_scheduler,
         state=states[0],
@@ -625,6 +692,107 @@ def test_exact_current_flow_to_x0_conversion_oracle() -> None:
     assert oracle["derived_formula"] == "x0 = x_t - sigma * flow"
     assert oracle["formula_matches_scheduler"] is True
     assert oracle["max_abs_error"] <= audit.CURRENT_X0_ORACLE_ATOL
+    diagnostic = oracle["diagnostic"]
+    assert diagnostic["scheduler_actually_passed"]["shift"] == pytest.approx(
+        DEFAULT_S_MAIN
+    )
+    assert diagnostic["main_scheduler_expected_contract"]["shift"] == pytest.approx(
+        DEFAULT_S_MAIN
+    )
+    assert diagnostic["noisy_state_vs_regenerated"]["torch_equal"] is True
+    assert diagnostic["float32_reference"]["passes_existing_oracle_tolerance"] is True
+    assert diagnostic["float32_reference"]["recon32_vs_clean32"]["max_abs"] == (
+        pytest.approx(0.0, abs=1e-6)
+    )
+
+
+def test_exact_current_oracle_rejects_mcp_scheduler_for_main_state() -> None:
+    target, states, _, mcp_scheduler = make_oracle_state()
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            mcp_scheduler,
+            state=states[0],
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+    assert "scheduler_shift_not_main" in str(excinfo.value)
+    assert diagnostic["scheduler_actually_passed"]["shift"] == pytest.approx(
+        DEFAULT_S_MCP
+    )
+    assert diagnostic["main_scheduler_expected_contract"]["shift"] == pytest.approx(
+        DEFAULT_S_MAIN
+    )
+
+
+def test_exact_current_oracle_rejects_mismatched_timestep() -> None:
+    target, states, main_scheduler, _ = make_oracle_state()
+    bad_state = replace(
+        states[0],
+        main_warped_timestep=states[0].future_warped_timestep,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            main_scheduler,
+            state=bad_state,
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+    assert "current_timestep_not_main_shift5_raw_warp" in str(excinfo.value)
+    assert diagnostic["warped_current_timestep"] == pytest.approx(
+        states[0].future_warped_timestep
+    )
+
+
+def test_exact_current_oracle_round_trip_catches_mismatched_noise_state() -> None:
+    target, states, main_scheduler, _ = make_oracle_state()
+    bad_state = replace(states[0], current_noise=states[0].current_noise + 1.0)
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            main_scheduler,
+            state=bad_state,
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+    assert "current_state_noise_timestep_round_trip_mismatch" in str(excinfo.value)
+    assert diagnostic["failure_case"] == "state_noise_timestep_provenance_bug"
+    assert diagnostic["noisy_state_vs_regenerated"]["torch_equal"] is False
+    assert diagnostic["noisy_state_vs_regenerated"]["max_abs"] > 0.0
+
+
+def test_exact_current_oracle_bf16_failure_reports_float32_reference() -> None:
+    source, target = make_bf16_oracle_failure_tensors()
+    main_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MAIN,
+        device="cpu",
+    )
+    mcp_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MCP,
+        device="cpu",
+    )
+    states = audit.build_teacher_flow_audit_states(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        noise_realizations_per_raw=1,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            main_scheduler,
+            state=states[0],
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+    assert diagnostic["failure_case"] == "bf16_quantized_state_contract"
+    assert diagnostic["noisy_state_vs_regenerated"]["torch_equal"] is True
+    assert diagnostic["recon_sched_vs_clean"]["max_abs"] > audit.CURRENT_X0_ORACLE_ATOL
+    assert diagnostic["recon_formula_actual_vs_clean"]["max_abs"] > (
+        audit.CURRENT_X0_ORACLE_ATOL
+    )
+    assert diagnostic["float32_reference"]["passes_existing_oracle_tolerance"] is True
+    assert diagnostic["float32_reference"]["recon32_vs_clean32"]["max_abs"] == (
+        pytest.approx(0.0, abs=1e-6)
+    )
 
 
 def test_predicted_current_main_does_not_read_gt_current_or_future() -> None:

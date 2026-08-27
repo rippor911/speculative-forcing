@@ -59,18 +59,51 @@ class FakeFullSequenceOutputs:
 
 
 class FakeStudentGenerator(nn.Module):
-    def __init__(self, *, flow_scale: float = 0.25) -> None:
+    def __init__(
+        self,
+        *,
+        flow_scale: float = 0.25,
+        main_current_scale: float = 0.15,
+    ) -> None:
         super().__init__()
+        self.weight = nn.Parameter(torch.zeros(()), requires_grad=False)
         self.model = FakeModel()
         self.mcp = FakeMCP()
         self.flow_scale = float(flow_scale)
+        self.main_current_scale = float(main_current_scale)
         self.forward_calls = []
+        self.single_forward_calls = []
         self.serial_forward_calls = 0
 
     def forward(self, **kwargs):
-        _ = kwargs
-        self.serial_forward_calls += 1
-        raise RuntimeError("student audit must not use deployment forward")
+        if kwargs.get("kv_cache") is None:
+            self.serial_forward_calls += 1
+            raise RuntimeError("student audit must not use serial rollout")
+        if kwargs.get("clean_x") is not None:
+            raise RuntimeError("predicted-current Main must not receive clean_x")
+        if kwargs.get("mcp_future_noises") is not None:
+            raise RuntimeError("predicted-current Main must not receive future")
+        chunk = kwargs["noisy_image_or_video"]
+        timestep = kwargs["timestep"]
+        current_start = int(kwargs["current_start"])
+        kv_cache = kwargs["kv_cache"]
+        self.single_forward_calls.append(
+            {
+                "current_start": current_start,
+                "chunk_sha256": ev.tensor_sha256(chunk.detach().cpu()),
+                "timestep": float(timestep.flatten()[0].detach().cpu().item()),
+                "has_clean_x": "clean_x" in kwargs and kwargs["clean_x"] is not None,
+                "has_mcp_future": kwargs.get("mcp_future_noises") is not None,
+            }
+        )
+        token_count = int(chunk.shape[1]) * FRAME_SEQ_LENGTH
+        token_end = current_start + token_count
+        for layer in kv_cache:
+            layer["k"][:, current_start:token_end] = len(self.single_forward_calls)
+            layer["v"][:, current_start:token_end] = len(self.single_forward_calls) + 1
+            layer["global_end_index"].fill_(token_end)
+            layer["local_end_index"].fill_(token_end)
+        return chunk * self.main_current_scale, chunk
 
     def forward_full_sequence_next_forcing(
         self,
@@ -157,7 +190,7 @@ class FakeTeacherGenerator(nn.Module):
         return chunk * scale, chunk
 
 
-def make_runtime(generator: FakeTeacherGenerator) -> ev.DeploymentRuntime:
+def make_runtime(generator: nn.Module) -> ev.DeploymentRuntime:
     capacity = ev.FULL_SEQUENCE_FRAME_COUNT * FRAME_SEQ_LENGTH
     kv_cache = [
         {
@@ -222,6 +255,7 @@ def make_result(
     source = make_source_noise()
     target = make_teacher_target()
     common, fingerprint = make_common(source, target)
+    student_generator = student or FakeStudentGenerator()
     main_scheduler = audit.build_flow_match_scheduler(
         shift=DEFAULT_S_MAIN,
         device=torch.device("cpu"),
@@ -231,7 +265,8 @@ def make_result(
         device=torch.device("cpu"),
     )
     return audit.run_teacher_flow_audit(
-        student_generator=student or FakeStudentGenerator(),
+        student_generator=student_generator,
+        student_runtime_factory=lambda: make_runtime(student_generator),
         teacher_runtime_factory=teacher_factory
         or (lambda: make_runtime(FakeTeacherGenerator())),
         source_noise=source,
@@ -277,10 +312,13 @@ def make_multi_record(
     raw_timestep: int,
     mcp_flow: float = 1.0,
     matched_flow: float = 1.1,
+    predicted_flow: float = 0.8,
     privileged_flow: float = 0.5,
     mcp_x0: float = 1.0,
     matched_x0: float = 1.1,
+    predicted_x0: float = 0.8,
     privileged_x0: float = 0.5,
+    current_x0_hat: float = 0.2,
 ) -> dict[str, Any]:
     identity = f"val{validation_position:03d}"
     return {
@@ -294,28 +332,72 @@ def make_multi_record(
         "metrics": {
             "mcp_flow_vs_exact_mse": float(mcp_flow),
             "mcp_x0_vs_clean_future_mse": float(mcp_x0),
+            "student_predicted_current_flow_vs_exact_mse": 0.25,
+            "teacher_predicted_current_x0_hat_vs_clean_current_mse": float(
+                current_x0_hat
+            ),
             "teacher_matched_flow_vs_exact_mse": float(matched_flow),
             "teacher_matched_x0_vs_clean_future_mse": float(matched_x0),
             "mcp_flow_vs_teacher_matched_flow_mse": 0.01,
+            "teacher_predicted_flow_vs_exact_mse": float(predicted_flow),
+            "teacher_predicted_x0_vs_clean_future_mse": float(predicted_x0),
+            "mcp_flow_vs_teacher_predicted_flow_mse": 0.015,
             "teacher_clean_flow_vs_exact_mse": float(privileged_flow),
             "teacher_clean_x0_vs_clean_future_mse": float(privileged_x0),
             "mcp_flow_vs_teacher_clean_flow_mse": 0.02,
+        },
+        "student_predicted_current": {
+            "proof": {
+                "student_frozen": True,
+                "x0_hat_detached": True,
+                "main_forward_uses_clean_x": False,
+                "main_forward_uses_mcp_future": False,
+            }
         },
         "teacher_matched_current": {
             "proof": {
                 "privileged_clean_current": False,
                 "same_information_as_mcp": True,
+                "teacher_frozen": True,
+                "teacher_rng_unchanged": True,
+            }
+        },
+        "teacher_predicted_current": {
+            "proof": {
+                "privileged_clean_current": False,
+                "same_information_as_mcp": False,
+                "inference_information_available": True,
+                "predicted_current_uses_gt_current": False,
+                "predicted_current_uses_gt_future": False,
+                "current_x0_hat_detached": True,
+                "teacher_frozen": True,
+                "student_frozen": True,
+                "optimizer_step_executed": False,
+                "same_future_tensor_as_other_branches": True,
+            }
+        },
+        "teacher_privileged_current": {
+            "proof": {
+                "privileged_clean_current": True,
+                "same_information_as_mcp": False,
+                "inference_information_available": False,
+                "teacher_frozen": True,
+                "teacher_rng_unchanged": True,
             }
         },
         "teacher_clean_current": {
             "proof": {
                 "privileged_clean_current": True,
                 "same_information_as_mcp": False,
+                "inference_information_available": False,
+                "teacher_frozen": True,
+                "teacher_rng_unchanged": True,
             }
         },
         "same_state_sigma_proof": {
             "all_future_states_exact": True,
             "raw_timestep_directly_used_for_teacher": False,
+            "same_future_tensor_as_other_branches": True,
         },
     }
 
@@ -324,10 +406,13 @@ def make_multi_records(
     *,
     mcp_flow: float = 1.0,
     matched_flow: float = 1.1,
+    predicted_flow: float = 0.8,
     privileged_flow: float = 0.5,
     mcp_x0: float = 1.0,
     matched_x0: float = 1.1,
+    predicted_x0: float = 0.8,
     privileged_x0: float = 0.5,
+    current_x0_hat: float = 0.2,
 ) -> list[dict[str, Any]]:
     records = []
     for identity_index, validation_position in enumerate(range(0, 256, 8)):
@@ -339,10 +424,13 @@ def make_multi_records(
                     raw_timestep=raw_timestep,
                     mcp_flow=mcp_flow,
                     matched_flow=matched_flow,
+                    predicted_flow=predicted_flow,
                     privileged_flow=privileged_flow,
                     mcp_x0=mcp_x0,
                     matched_x0=matched_x0,
+                    predicted_x0=predicted_x0,
                     privileged_x0=privileged_x0,
+                    current_x0_hat=current_x0_hat,
                 )
             )
     return records
@@ -455,11 +543,13 @@ def test_same_future_state_exact_across_student_and_teacher_branches() -> None:
         assert proof["all_future_states_exact"] is True
         assert proof["student_future_state_exact"] is True
         assert proof["teacher_matched_future_state_exact"] is True
+        assert proof["teacher_predicted_future_state_exact"] is True
         assert proof["teacher_clean_future_state_exact"] is True
+        assert proof["same_future_tensor_as_other_branches"] is True
         assert record["teacher_matched_current"]["proof"][
             "history_chunk0_identity_exact"
         ] is True
-        assert record["teacher_clean_current"]["proof"][
+        assert record["teacher_privileged_current"]["proof"][
             "history_chunk0_identity_exact"
         ] is True
 
@@ -487,6 +577,12 @@ def test_teacher_timestep_uses_same_physical_sigma() -> None:
         assert record["teacher_matched_current"]["proof"][
             "future_timestep_matches_physical_sigma"
         ] is True
+        assert record["teacher_predicted_current"]["proof"][
+            "future_timestep_matches_physical_sigma"
+        ] is True
+        assert record["teacher_predicted_current"]["proof"][
+            "student_current_prediction"
+        ]["proof"]["main_sigma"] == pytest.approx(record["main_sigma"])
         assert record["same_state_sigma_proof"][
             "raw_timestep_directly_used_for_teacher"
         ] is False
@@ -504,6 +600,86 @@ def test_manual_x0_conversion() -> None:
     assert x0.item() == pytest.approx(1.875)
 
 
+def test_exact_current_flow_to_x0_conversion_oracle() -> None:
+    source = make_source_noise()
+    target = make_teacher_target()
+    main_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MAIN,
+        device="cpu",
+    )
+    states = audit.build_teacher_flow_audit_states(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=audit.build_flow_match_scheduler(
+            shift=DEFAULT_S_MCP,
+            device="cpu",
+        ),
+    )
+    oracle = audit.exact_current_flow_conversion_oracle(
+        main_scheduler,
+        state=states[0],
+        teacher_target=target,
+    )
+    assert oracle["status"] == "PASS"
+    assert oracle["derived_formula"] == "x0 = x_t - sigma * flow"
+    assert oracle["formula_matches_scheduler"] is True
+    assert oracle["max_abs_error"] <= audit.CURRENT_X0_ORACLE_ATOL
+
+
+def test_predicted_current_main_does_not_read_gt_current_or_future() -> None:
+    student = FakeStudentGenerator()
+    result = make_result(student=student)
+    current_calls = [
+        call
+        for call in student.single_forward_calls
+        if call["current_start"] == 3 * FRAME_SEQ_LENGTH
+    ]
+    assert len(current_calls) == result.manifest["state_count"]
+    assert all(call["has_clean_x"] is False for call in current_calls)
+    assert all(call["has_mcp_future"] is False for call in current_calls)
+    for record in result.manifest["states"]:
+        proof = record["teacher_predicted_current"]["proof"]
+        assert proof["predicted_current_uses_gt_current"] is False
+        assert proof["predicted_current_uses_gt_future"] is False
+        assert proof["student_current_prediction"]["proof"][
+            "main_forward_uses_clean_x"
+        ] is False
+        assert proof["student_current_prediction"]["proof"][
+            "main_forward_uses_mcp_future"
+        ] is False
+
+
+def test_predicted_current_x0_hat_is_detached_and_recorded() -> None:
+    result = make_result()
+    for state_id, tensors in result.tensors["states"].items():
+        assert tensors["student_predicted_current_x0_hat"].requires_grad is False
+        record = next(item for item in result.manifest["states"] if item["state_id"] == state_id)
+        proof = record["teacher_predicted_current"]["proof"]
+        assert proof["current_x0_hat_detached"] is True
+        assert proof["current_x0_hat"]["finite"] is True
+        assert len(proof["current_x0_hat"]["sha256"]) == 64
+        assert "teacher_predicted_current_x0_hat_vs_clean_current_mse" in (
+            record["metrics"]
+        )
+
+
+def test_predicted_branch_frozen_no_step_and_rng_proofs() -> None:
+    result = make_result()
+    for record in result.manifest["states"]:
+        proof = record["teacher_predicted_current"]["proof"]
+        assert proof["teacher_frozen"] is True
+        assert proof["student_frozen"] is True
+        assert proof["optimizer_step_executed"] is False
+        assert proof["teacher_rng_unchanged"] is True
+        assert proof["student_current_prediction"]["proof"][
+            "student_rng_unchanged"
+        ] is True
+        assert record["same_state_sigma_proof"]["teacher_frozen"] is True
+        assert record["same_state_sigma_proof"]["student_frozen"] is True
+        assert record["same_state_sigma_proof"]["optimizer_step_executed"] is False
+
+
 def test_oracle_target_cannot_be_marked_as_teacher() -> None:
     result = make_result()
     manifest = result.manifest
@@ -511,7 +687,10 @@ def test_oracle_target_cannot_be_marked_as_teacher() -> None:
         assert record["teacher_matched_current"]["proof"][
             "uses_ground_truth_future_x0_for_conversion"
         ] is False
-        assert record["teacher_clean_current"]["proof"][
+        assert record["teacher_predicted_current"]["proof"][
+            "uses_ground_truth_future_x0_for_conversion"
+        ] is False
+        assert record["teacher_privileged_current"]["proof"][
             "uses_ground_truth_future_x0_for_conversion"
         ] is False
     assert any("oracle" in item for item in manifest["forbidden_comparisons"])
@@ -520,12 +699,14 @@ def test_oracle_target_cannot_be_marked_as_teacher() -> None:
 def test_privileged_branch_is_explicitly_marked() -> None:
     result = make_result()
     for record in result.manifest["states"]:
-        clean_proof = record["teacher_clean_current"]["proof"]
+        clean_proof = record["teacher_privileged_current"]["proof"]
         matched_proof = record["teacher_matched_current"]["proof"]
         assert clean_proof["privileged_clean_current"] is True
         assert clean_proof["same_information_as_mcp"] is False
+        assert clean_proof["inference_information_available"] is False
         assert matched_proof["privileged_clean_current"] is False
         assert matched_proof["same_information_as_mcp"] is True
+        assert matched_proof["inference_information_available"] is True
 
 
 def test_matched_and_privileged_routes_are_not_confused() -> None:
@@ -534,7 +715,7 @@ def test_matched_and_privileged_routes_are_not_confused() -> None:
     assert contracts[audit.TEACHER_MATCHED_CURRENT_BRANCH][
         "privileged_clean_current"
     ] is False
-    assert contracts[audit.TEACHER_CLEAN_CURRENT_BRANCH][
+    assert contracts[audit.TEACHER_PRIVILEGED_CURRENT_BRANCH][
         "privileged_clean_current"
     ] is True
     assert result.manifest["conversion_contract"]["uses_wrapper_auto_x0"] is False
@@ -600,9 +781,13 @@ def test_student_uses_full_sequence_route_not_serial_rollout() -> None:
     result = make_result(student=student)
     assert len(student.forward_calls) == result.manifest["state_count"]
     assert student.serial_forward_calls == 0
+    assert len(student.single_forward_calls) == result.manifest["state_count"] * 2
     for record in result.manifest["states"]:
         assert record["student"]["proof"]["route"] == "forward_full_sequence_next_forcing"
         assert record["student"]["proof"]["uses_deployment_serial_rollout"] is False
+        assert record["student_predicted_current"]["proof"]["route"] == (
+            "student_main_single_chunk_kv_forward"
+        )
 
 
 def test_teacher_noisy_current_route_fail_closed() -> None:
@@ -725,7 +910,13 @@ def test_multi_aggregation_by_identity_and_raw() -> None:
     identity0 = aggregates["by_identity"]["validation_position_000"]
     assert identity0["state_count"] == 4
     assert identity0["metrics"]["teacher_clean_flow_vs_exact_mse"]["mean"] == 0.5
+    assert identity0["metrics"]["teacher_predicted_flow_vs_exact_mse"]["mean"] == 0.8
     assert aggregates["by_raw"]["999"]["mcp_flow_vs_exact_mse"]["mean"] == 1.0
+    bridge = manifest["predicted_current_bridge_statistics"]
+    assert bridge["all_states"]["matched_flow_mse"] == pytest.approx(1.1)
+    assert bridge["all_states"]["predicted_flow_mse"] == pytest.approx(0.8)
+    assert bridge["all_states"]["privileged_flow_mse"] == pytest.approx(0.5)
+    assert bridge["all_states"]["mcp_flow_mse"] == pytest.approx(1.0)
 
 
 def test_multi_paired_stats_win_rate_and_reductions() -> None:
@@ -736,39 +927,102 @@ def test_multi_paired_stats_win_rate_and_reductions() -> None:
     assert stats["matched_identity_flow_win_count"] == 0
     assert stats["privileged_identity_flow_reduction_mean"] == pytest.approx(0.5)
     assert stats["privileged_identity_flow_reduction_median"] == pytest.approx(0.5)
+    assert stats["predicted_better_than_matched_win_count"] == 32
+    assert stats["predicted_better_than_matched_win_rate"] == pytest.approx(1.0)
+    assert stats["predicted_vs_matched_flow_reduction_mean"] == pytest.approx(
+        (1.1 - 0.8) / 1.1
+    )
+    assert stats["gap_recovery_ratio_mean"] == pytest.approx(0.5)
     assert stats["by_raw"]["999"]["privileged_flow_win_count"] == 32
     assert stats["by_raw"]["999"]["privileged_flow_reduction_mean"] == pytest.approx(
         0.5
     )
+    assert stats["by_raw"]["999"][
+        "predicted_better_than_matched_win_count"
+    ] == 32
 
 
-def test_multi_primary_diagnostic_thresholds() -> None:
+def test_predicted_current_bridge_primary_thresholds() -> None:
+    policy = audit._predicted_current_bridge_policy()
+    assert policy["strong"]["all_state_flow_reduction_min"] == pytest.approx(0.15)
+    assert policy["strong"]["identity_win_rate_min"] == pytest.approx(0.75)
+    assert policy["strong"]["identity_win_count_min"] == 24
+    assert policy["strong"]["gap_recovery_ratio_min"] == pytest.approx(0.30)
+    assert policy["strong"]["future_x0_reduction_min"] == pytest.approx(0.10)
+    assert policy["no_support"]["all_state_flow_reduction_lt"] == pytest.approx(0.05)
+    assert policy["no_support"]["identity_win_rate_lt"] == pytest.approx(0.60)
+    assert policy["no_support"]["raw_clearly_worse_count_gte"] == 2
+    assert policy["no_support"]["clearly_worse_relative_margin"] == pytest.approx(
+        0.05
+    )
+
     strong = make_multi_manifest(
-        make_multi_records(privileged_flow=0.70, privileged_x0=0.70)
+        make_multi_records(
+            matched_flow=1.0,
+            predicted_flow=0.70,
+            privileged_flow=0.0,
+            matched_x0=1.0,
+            predicted_x0=0.80,
+        )
     )
     assert strong["primary_diagnostic_label"] == (
-        audit.STRONG_PRIVILEGED_CURRENT_SUPPORT
+        audit.STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT
     )
+    bridge = strong["predicted_current_bridge_statistics"]["all_states"]
+    assert bridge["predicted_vs_matched_flow_reduction_pct"] == pytest.approx(30.0)
+    assert bridge["gap_recovery_ratio"] == pytest.approx(0.30)
 
     weak_reduction = make_multi_manifest(
-        make_multi_records(privileged_flow=0.95, privileged_x0=0.50)
+        make_multi_records(matched_flow=1.0, predicted_flow=0.96)
     )
-    assert weak_reduction["primary_diagnostic_label"] == (
-        audit.NO_PRIVILEGED_CURRENT_SUPPORT
-    )
+    assert weak_reduction["primary_diagnostic_label"] == audit.NO_SUPPORT
 
-    low_win_records = make_multi_records(privileged_flow=0.50, privileged_x0=0.50)
+    low_win_records = make_multi_records(matched_flow=1.0, predicted_flow=0.70)
     for record in low_win_records[:56]:
-        record["metrics"]["teacher_clean_flow_vs_exact_mse"] = 1.10
+        record["metrics"]["teacher_predicted_flow_vs_exact_mse"] = 1.0
     low_win = make_multi_manifest(low_win_records)
-    assert low_win["primary_diagnostic_label"] == (
-        audit.NO_PRIVILEGED_CURRENT_SUPPORT
-    )
+    assert low_win["primary_diagnostic_label"] == audit.NO_SUPPORT
+
+    raw_worse_records = make_multi_records(matched_flow=1.0, predicted_flow=0.70)
+    for record in raw_worse_records:
+        if int(record["raw_timestep"]) in (999, 750):
+            record["metrics"]["teacher_predicted_flow_vs_exact_mse"] = 1.06
+    raw_worse = make_multi_manifest(raw_worse_records)
+    assert raw_worse["primary_diagnostic_label"] == audit.NO_SUPPORT
 
     mixed = make_multi_manifest(
-        make_multi_records(privileged_flow=0.80, privileged_x0=0.80)
+        make_multi_records(
+            matched_flow=1.0,
+            predicted_flow=0.88,
+            privileged_flow=0.70,
+            matched_x0=1.0,
+            predicted_x0=0.92,
+        )
     )
     assert mixed["primary_diagnostic_label"] == audit.INCONCLUSIVE
+
+    undefined_gap = make_multi_manifest(
+        make_multi_records(matched_flow=1.0, predicted_flow=0.90, privileged_flow=1.1)
+    )
+    assert undefined_gap["predicted_current_bridge_statistics"]["all_states"][
+        "gap_recovery_ratio"
+    ] is None
+
+
+def test_privileged_current_diagnostic_thresholds_remain_unchanged() -> None:
+    records = make_multi_records(privileged_flow=0.70, privileged_x0=0.70)
+    aggregates = audit.aggregate_teacher_flow_metrics(records)
+    paired = audit.paired_teacher_flow_statistics(records)
+    assert audit.privileged_current_generalization_label(
+        aggregates=aggregates,
+        paired_statistics=paired,
+    ) == audit.STRONG_PRIVILEGED_CURRENT_SUPPORT
+
+    weak_reduction = make_multi_records(privileged_flow=0.95, privileged_x0=0.50)
+    assert audit.privileged_current_generalization_label(
+        aggregates=audit.aggregate_teacher_flow_metrics(weak_reduction),
+        paired_statistics=audit.paired_teacher_flow_statistics(weak_reduction),
+    ) == audit.NO_PRIVILEGED_CURRENT_SUPPORT
 
 
 def test_multi_matched_timestep_dependence_is_reported_not_primary_gate() -> None:

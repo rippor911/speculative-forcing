@@ -45,10 +45,14 @@ from utils.nf_sf_teacher_flow_audit import (
     build_teacher_flow_audit_states,
     build_teacher_flow_state_records,
     load_teacher_flow_student_checkpoint_record,
+    parameter_sha256_report,
+    require_no_parameter_mutation,
+    run_student_predicted_current_predictions,
     run_student_mcp_full_sequence_predictions,
     run_teacher_branch_predictions,
     select_validation32_identities,
     select_validation_zero_identity,
+    validate_frozen_student_model,
     validate_frozen_teacher_model,
     validate_multi_identity_student_checkpoint_contract,
     validate_teacher_flow_artifact_identity,
@@ -260,6 +264,14 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
         dtype=dtype,
     )
+    student_summary = validate_frozen_student_model(
+        student_generator,
+        checkpoint=student_checkpoint,
+    )
+    student_parameters_before = parameter_sha256_report(
+        student_generator,
+        role="student_main_mcp",
+    )
     try:
         student_predictions = run_student_mcp_full_sequence_predictions(
             student_generator,
@@ -267,6 +279,28 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             teacher_target=teacher_target,
             conditional_dict=conditional_dict,
             direct_clean_context_kv=bool(args.student_direct_clean_context_kv),
+        )
+        student_current_predictions = run_student_predicted_current_predictions(
+            runtime_factory=lambda: initialize_runtime(
+                generator=student_generator,
+                config=config,
+                source_noise=source_noise,
+            ),
+            states=states,
+            source_noise=source_noise,
+            teacher_target=teacher_target,
+            teacher_payload=teacher_payload,
+            conditional_dict=conditional_dict,
+            main_scheduler=main_scheduler,
+        )
+        student_parameters_after = parameter_sha256_report(
+            student_generator,
+            role="student_main_mcp",
+        )
+        student_summary["parameter_mutation_proof"] = require_no_parameter_mutation(
+            student_parameters_before,
+            student_parameters_after,
+            role="Student",
         )
     finally:
         student_generator.to("cpu")
@@ -285,6 +319,10 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         teacher_generator,
         checkpoint=teacher_checkpoint,
     )
+    teacher_parameters_before = parameter_sha256_report(
+        teacher_generator,
+        role="teacher_official_main",
+    )
     try:
         teacher_predictions = run_teacher_branch_predictions(
             runtime_factory=lambda: initialize_runtime(
@@ -297,6 +335,16 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             teacher_target=teacher_target,
             teacher_payload=teacher_payload,
             conditional_dict=conditional_dict,
+            student_current_predictions=student_current_predictions,
+        )
+        teacher_parameters_after = parameter_sha256_report(
+            teacher_generator,
+            role="teacher_official_main",
+        )
+        teacher_summary["parameter_mutation_proof"] = require_no_parameter_mutation(
+            teacher_parameters_before,
+            teacher_parameters_after,
+            role="Teacher",
         )
     finally:
         teacher_generator.to("cpu")
@@ -306,12 +354,14 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     result = build_teacher_flow_audit_result(
         states=states,
         student_predictions=student_predictions,
+        student_current_predictions=student_current_predictions,
         teacher_predictions=teacher_predictions,
         sample_identity=sample_identity,
         checkpoint_summary={
             **student_checkpoint.to_json(),
             "expected_checkpoint_step": int(args.expected_checkpoint_step),
         },
+        student_summary=student_summary,
         teacher_summary=teacher_summary,
         common_inputs=common_inputs,
         common_inputs_fingerprint_sha256=common_fingerprint,
@@ -350,6 +400,14 @@ def _run_multi_identity_validation32(
         device=device,
         dtype=dtype,
     )
+    student_summary = validate_frozen_student_model(
+        student_generator,
+        checkpoint=student_checkpoint,
+    )
+    student_parameters_before = parameter_sha256_report(
+        student_generator,
+        role="student_main_mcp",
+    )
     teacher_checkpoint = load_official_checkpoint_record(args.official_checkpoint)
     teacher_generator = build_generator(
         config=config,
@@ -361,6 +419,10 @@ def _run_multi_identity_validation32(
     teacher_summary = validate_frozen_teacher_model(
         teacher_generator,
         checkpoint=teacher_checkpoint,
+    )
+    teacher_parameters_before = parameter_sha256_report(
+        teacher_generator,
+        role="teacher_official_main",
     )
 
     state_records: list[Mapping[str, Any]] = []
@@ -407,6 +469,24 @@ def _run_multi_identity_validation32(
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+        student_parameters_after = parameter_sha256_report(
+            student_generator,
+            role="student_main_mcp",
+        )
+        teacher_parameters_after = parameter_sha256_report(
+            teacher_generator,
+            role="teacher_official_main",
+        )
+        student_summary["parameter_mutation_proof"] = require_no_parameter_mutation(
+            student_parameters_before,
+            student_parameters_after,
+            role="Student",
+        )
+        teacher_summary["parameter_mutation_proof"] = require_no_parameter_mutation(
+            teacher_parameters_before,
+            teacher_parameters_after,
+            role="Teacher",
+        )
     finally:
         student_generator.to("cpu")
         teacher_generator.to("cpu")
@@ -423,6 +503,7 @@ def _run_multi_identity_validation32(
             **student_checkpoint.to_json(),
             "expected_checkpoint_step": int(args.expected_checkpoint_step),
         },
+        student_summary=student_summary,
         teacher_summary=teacher_summary,
         common_inputs_fingerprints_sha256=common_fingerprints,
         runtime_git_sha=git_sha,
@@ -534,6 +615,19 @@ def _run_one_identity_records(
         conditional_dict=conditional_dict,
         direct_clean_context_kv=False,
     )
+    student_current_predictions = run_student_predicted_current_predictions(
+        runtime_factory=lambda: initialize_runtime(
+            generator=student_generator,
+            config=config,
+            source_noise=source_noise,
+        ),
+        states=states,
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        teacher_payload=teacher_payload,
+        conditional_dict=conditional_dict,
+        main_scheduler=main_scheduler,
+    )
     teacher_predictions = run_teacher_branch_predictions(
         runtime_factory=lambda: initialize_runtime(
             generator=teacher_generator,
@@ -545,10 +639,12 @@ def _run_one_identity_records(
         teacher_target=teacher_target,
         teacher_payload=teacher_payload,
         conditional_dict=conditional_dict,
+        student_current_predictions=student_current_predictions,
     )
     state_records = build_teacher_flow_state_records(
         states=states,
         student_predictions=student_predictions,
+        student_current_predictions=student_current_predictions,
         teacher_predictions=teacher_predictions,
         sample_identity=sample_identity,
         validation_position=int(validation_position),
@@ -556,6 +652,7 @@ def _run_one_identity_records(
     )
     del states
     del student_predictions
+    del student_current_predictions
     del teacher_predictions
     del source_noise
     del teacher_target

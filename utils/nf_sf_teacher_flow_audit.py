@@ -53,8 +53,11 @@ TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT = 32
 TEACHER_FLOW_AUDIT_MODE_SINGLE = "single_identity_validation0"
 TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32 = "multi_identity_validation32"
 TEACHER_MATCHED_CURRENT_BRANCH = "teacher_matched_current"
+TEACHER_PREDICTED_CURRENT_BRANCH = "teacher_predicted_current"
+TEACHER_PRIVILEGED_CURRENT_BRANCH = "teacher_privileged_current"
 TEACHER_CLEAN_CURRENT_BRANCH = "teacher_clean_current"
 STUDENT_MCP_BRANCH = "student_mcp1_full_sequence"
+STUDENT_PREDICTED_CURRENT_BRANCH = "student_main_predicted_current"
 
 HISTORY_CHUNK_INDEX = 0
 CURRENT_CHUNK_INDEX = 1
@@ -66,8 +69,15 @@ TEACHER_PRIVILEGED_ONLY_BETTER = "TEACHER_PRIVILEGED_ONLY_BETTER"
 TEACHER_NOT_BETTER = "TEACHER_NOT_BETTER"
 STRONG_PRIVILEGED_CURRENT_SUPPORT = "STRONG_PRIVILEGED_CURRENT_SUPPORT"
 NO_PRIVILEGED_CURRENT_SUPPORT = "NO_PRIVILEGED_CURRENT_SUPPORT"
+STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT = (
+    "STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT"
+)
+NO_SUPPORT = "NO_SUPPORT"
 MATCHED_TEACHER_TIMESTEP_DEPENDENCE = "MATCHED_TEACHER_TIMESTEP_DEPENDENCE"
 INCONCLUSIVE = "INCONCLUSIVE"
+PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN = 0.05
+CURRENT_X0_ORACLE_ATOL = 2.0e-2
+CURRENT_X0_ORACLE_RTOL = 1.0e-2
 
 
 @dataclass(frozen=True)
@@ -245,6 +255,105 @@ def validate_frozen_teacher_model(
         "eval_mode": True,
         "requires_grad_false": True,
         "parameter_count": int(len(parameters)),
+    }
+
+
+def validate_frozen_student_model(
+    student_generator: Any,
+    *,
+    checkpoint: deployment.DeploymentCheckpointRecord,
+) -> dict[str, Any]:
+    if getattr(student_generator, "training", False):
+        raise RuntimeError("frozen Student must be in eval mode")
+    trainable = [
+        name
+        for name, param in student_generator.named_parameters()
+        if param.requires_grad
+    ]
+    if trainable:
+        raise RuntimeError("frozen Student has trainable parameters")
+    parameters = list(student_generator.parameters())
+    return {
+        "checkpoint_type": str(checkpoint.checkpoint_type),
+        "checkpoint_sha256": str(checkpoint.sha256),
+        "load_mode": str(checkpoint.load_mode),
+        "mcp_tensor_count": int(
+            deployment.count_mcp_tensors(checkpoint.generator_state_dict)
+        ),
+        "eval_mode": True,
+        "requires_grad_false": True,
+        "parameter_count": int(len(parameters)),
+    }
+
+
+def parameter_sha256_report(generator: Any, *, role: str) -> dict[str, Any]:
+    records = {}
+    for name, parameter in generator.named_parameters():
+        tensor = parameter.detach().cpu()
+        records[str(name)] = {
+            "sha256": tensor_sha256(tensor),
+            "shape": [int(dim) for dim in tensor.shape],
+            "dtype": str(tensor.dtype),
+            "requires_grad": bool(parameter.requires_grad),
+        }
+    payload = {
+        "role": str(role),
+        "parameter_count": int(len(records)),
+        "parameters": records,
+    }
+    return {
+        "role": str(role),
+        "parameter_count": int(len(records)),
+        "fingerprint_sha256": deployment.canonical_json_sha256(payload),
+        "parameters": records,
+    }
+
+
+def compare_parameter_sha256_reports(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    mismatches = []
+    before_parameters = before.get("parameters", {})
+    after_parameters = after.get("parameters", {})
+    if not isinstance(before_parameters, Mapping) or not isinstance(
+        after_parameters,
+        Mapping,
+    ):
+        raise RuntimeError("parameter SHA reports must contain parameter maps")
+    for name, record in before_parameters.items():
+        after_record = after_parameters.get(name)
+        if not isinstance(after_record, Mapping):
+            mismatches.append(str(name))
+        elif str(record.get("sha256")) != str(after_record.get("sha256")):
+            mismatches.append(str(name))
+    extra_after = sorted(set(str(name) for name in after_parameters) - set(
+        str(name) for name in before_parameters
+    ))
+    mismatches.extend(extra_after)
+    return {
+        "role": str(before.get("role", after.get("role", ""))),
+        "before_fingerprint_sha256": str(before.get("fingerprint_sha256")),
+        "after_fingerprint_sha256": str(after.get("fingerprint_sha256")),
+        "parameter_count_before": int(before.get("parameter_count", 0)),
+        "parameter_count_after": int(after.get("parameter_count", 0)),
+        "all_sha256_exact_match": len(mismatches) == 0,
+        "mismatch_parameter_names": mismatches,
+    }
+
+
+def require_no_parameter_mutation(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    comparison = compare_parameter_sha256_reports(before, after)
+    if comparison["all_sha256_exact_match"] is not True:
+        raise RuntimeError(f"{role} parameter mutation detected")
+    return {
+        **comparison,
+        "parameter_mutation_detected": False,
     }
 
 
@@ -616,6 +725,8 @@ def run_student_mcp_full_sequence_predictions(
                 "selected_mcp_future_start_frames": list(selected["future_start_frames"]),
                 "selected_mcp_call_index": int(selected["call_index"]),
                 "forward_rng": dict(rng_guard),
+                "student_frozen": _parameters_are_frozen(generator),
+                "optimizer_step_executed": False,
             }
             proof["current_state_exact"] = (
                 proof["mcp_current_input_sha256"]
@@ -627,6 +738,8 @@ def run_student_mcp_full_sequence_predictions(
             )
             if not proof["current_state_exact"] or not proof["future_state_exact"]:
                 raise RuntimeError("student same-state proof failed")
+            if proof["student_frozen"] is not True:
+                raise RuntimeError("student MCP branch parameters are not frozen")
             result[state.state_id] = FlowPrediction(
                 state_id=state.state_id,
                 branch=STUDENT_MCP_BRANCH,
@@ -640,6 +753,36 @@ def run_student_mcp_full_sequence_predictions(
     return result
 
 
+def run_student_predicted_current_predictions(
+    *,
+    runtime_factory: Any,
+    states: Sequence[TeacherFlowAuditState],
+    source_noise: torch.Tensor,
+    teacher_target: torch.Tensor,
+    teacher_payload: Mapping[str, Any],
+    conditional_dict: Mapping[str, Any],
+    main_scheduler: Any,
+) -> dict[str, FlowPrediction]:
+    _require_teacher_flow_state_contract(states)
+    rng_plan = deployment.build_absolute_chunk_rng_plan(
+        source_noise=source_noise,
+        rollout_seed=int(teacher_payload["rollout_seed"]),
+        num_denoising_steps=len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS),
+        chunk_frames=FULL_SEQUENCE_CHUNK_FRAMES,
+    )
+    result: dict[str, FlowPrediction] = {}
+    for state in states:
+        result[state.state_id] = _run_student_predicted_current_state(
+            runtime_factory=runtime_factory,
+            state=state,
+            teacher_target=teacher_target,
+            conditional_dict=conditional_dict,
+            rng_plan=rng_plan,
+            main_scheduler=main_scheduler,
+        )
+    return result
+
+
 def run_teacher_branch_predictions(
     *,
     runtime_factory: Any,
@@ -648,6 +791,7 @@ def run_teacher_branch_predictions(
     teacher_target: torch.Tensor,
     teacher_payload: Mapping[str, Any],
     conditional_dict: Mapping[str, Any],
+    student_current_predictions: Mapping[str, FlowPrediction],
 ) -> dict[str, dict[str, FlowPrediction]]:
     _require_teacher_flow_state_contract(states)
     rng_plan = deployment.build_absolute_chunk_rng_plan(
@@ -658,6 +802,11 @@ def run_teacher_branch_predictions(
     )
     predictions: dict[str, dict[str, FlowPrediction]] = {}
     for state in states:
+        predicted_current = _prediction_for(
+            student_current_predictions,
+            state.state_id,
+            STUDENT_PREDICTED_CURRENT_BRANCH,
+        )
         predictions[state.state_id] = {
             TEACHER_MATCHED_CURRENT_BRANCH: _run_teacher_matched_current_branch(
                 runtime_factory=runtime_factory,
@@ -666,7 +815,15 @@ def run_teacher_branch_predictions(
                 conditional_dict=conditional_dict,
                 rng_plan=rng_plan,
             ),
-            TEACHER_CLEAN_CURRENT_BRANCH: _run_teacher_clean_current_branch(
+            TEACHER_PREDICTED_CURRENT_BRANCH: _run_teacher_predicted_current_branch(
+                runtime_factory=runtime_factory,
+                state=state,
+                teacher_target=teacher_target,
+                conditional_dict=conditional_dict,
+                rng_plan=rng_plan,
+                predicted_current=predicted_current,
+            ),
+            TEACHER_PRIVILEGED_CURRENT_BRANCH: _run_teacher_clean_current_branch(
                 runtime_factory=runtime_factory,
                 state=state,
                 teacher_target=teacher_target,
@@ -681,9 +838,11 @@ def build_teacher_flow_audit_result(
     *,
     states: Sequence[TeacherFlowAuditState],
     student_predictions: Mapping[str, FlowPrediction],
+    student_current_predictions: Mapping[str, FlowPrediction],
     teacher_predictions: Mapping[str, Mapping[str, FlowPrediction]],
     sample_identity: str,
     checkpoint_summary: Mapping[str, Any],
+    student_summary: Mapping[str, Any] | None = None,
     teacher_summary: Mapping[str, Any],
     common_inputs: Mapping[str, Any],
     common_inputs_fingerprint_sha256: str,
@@ -694,6 +853,7 @@ def build_teacher_flow_audit_result(
     state_records = build_teacher_flow_state_records(
         states=states,
         student_predictions=student_predictions,
+        student_current_predictions=student_current_predictions,
         teacher_predictions=teacher_predictions,
         sample_identity=sample_identity,
         validation_position=_selected_validation_position_from_common(common_inputs),
@@ -704,15 +864,25 @@ def build_teacher_flow_audit_result(
     }
     for state in states:
         student = _prediction_for(student_predictions, state.state_id, STUDENT_MCP_BRANCH)
+        current = _prediction_for(
+            student_current_predictions,
+            state.state_id,
+            STUDENT_PREDICTED_CURRENT_BRANCH,
+        )
         matched = _teacher_prediction_for(
             teacher_predictions,
             state.state_id,
             TEACHER_MATCHED_CURRENT_BRANCH,
         )
+        predicted = _teacher_prediction_for(
+            teacher_predictions,
+            state.state_id,
+            TEACHER_PREDICTED_CURRENT_BRANCH,
+        )
         clean = _teacher_prediction_for(
             teacher_predictions,
             state.state_id,
-            TEACHER_CLEAN_CURRENT_BRANCH,
+            TEACHER_PRIVILEGED_CURRENT_BRANCH,
         )
         tensors["states"][state.state_id] = {
             "current_state": state.current_state.detach().cpu(),
@@ -720,12 +890,17 @@ def build_teacher_flow_audit_result(
             "exact_mcp_target": state.exact_mcp_target.detach().cpu(),
             "student_mcp_flow": student.flow.detach().cpu(),
             "student_mcp_x0": student.x0.detach().cpu(),
+            "student_predicted_current_flow": current.flow.detach().cpu(),
+            "student_predicted_current_x0_hat": current.x0.detach().cpu(),
             "teacher_matched_flow": matched.flow.detach().cpu(),
             "teacher_matched_x0": matched.x0.detach().cpu(),
-            "teacher_clean_flow": clean.flow.detach().cpu(),
-            "teacher_clean_x0": clean.x0.detach().cpu(),
+            "teacher_predicted_current_flow": predicted.flow.detach().cpu(),
+            "teacher_predicted_current_x0": predicted.x0.detach().cpu(),
+            "teacher_privileged_flow": clean.flow.detach().cpu(),
+            "teacher_privileged_x0": clean.x0.detach().cpu(),
         }
     aggregates = aggregate_teacher_flow_metrics(state_records)
+    bridge_statistics = predicted_current_bridge_statistics(aggregates=aggregates)
     label = diagnostic_label_from_metrics(state_records)
     manifest = {
         "schema": TEACHER_FLOW_AUDIT_SCHEMA,
@@ -744,13 +919,19 @@ def build_teacher_flow_audit_result(
         "noise_realizations_per_raw": TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW,
         "diagnostic_label": label,
         "diagnostic_policy": _diagnostic_policy(),
+        "predicted_current_bridge_statistics": bridge_statistics,
+        "predicted_current_bridge_policy": _predicted_current_bridge_policy(),
         "state_sigma_matching_contract": _state_sigma_matching_contract(),
         "teacher_routes": _teacher_route_contracts(),
         "student_route": _student_route_contract(student_predictions),
+        "student_predicted_current_route": _student_predicted_current_route_contract(
+            student_current_predictions
+        ),
         "conversion_contract": _conversion_contract(),
         "forbidden_comparisons": _forbidden_comparisons(),
         "scientific_interpretation_boundaries": _scientific_boundaries(),
         "checkpoint": dict(checkpoint_summary),
+        "student": dict(student_summary or {}),
         "teacher": dict(teacher_summary),
         "common_inputs": dict(common_inputs),
         "common_inputs_fingerprint_sha256": str(common_inputs_fingerprint_sha256),
@@ -767,6 +948,7 @@ def build_teacher_flow_state_records(
     *,
     states: Sequence[TeacherFlowAuditState],
     student_predictions: Mapping[str, FlowPrediction],
+    student_current_predictions: Mapping[str, FlowPrediction],
     teacher_predictions: Mapping[str, Mapping[str, FlowPrediction]],
     sample_identity: str,
     validation_position: int | None = None,
@@ -776,32 +958,51 @@ def build_teacher_flow_state_records(
     state_records = []
     for state in states:
         student = _prediction_for(student_predictions, state.state_id, STUDENT_MCP_BRANCH)
+        current = _prediction_for(
+            student_current_predictions,
+            state.state_id,
+            STUDENT_PREDICTED_CURRENT_BRANCH,
+        )
         matched = _teacher_prediction_for(
             teacher_predictions,
             state.state_id,
             TEACHER_MATCHED_CURRENT_BRANCH,
         )
+        predicted = _teacher_prediction_for(
+            teacher_predictions,
+            state.state_id,
+            TEACHER_PREDICTED_CURRENT_BRANCH,
+        )
         clean = _teacher_prediction_for(
             teacher_predictions,
             state.state_id,
-            TEACHER_CLEAN_CURRENT_BRANCH,
+            TEACHER_PRIVILEGED_CURRENT_BRANCH,
         )
+        privileged_record = _prediction_record(clean)
         record = {
             **state.provenance,
             "sample_identity": str(sample_identity),
             "student": _prediction_record(student),
+            "mcp": _prediction_record(student),
+            "student_predicted_current": _prediction_record(current),
             "teacher_matched_current": _prediction_record(matched),
-            "teacher_clean_current": _prediction_record(clean),
+            "teacher_predicted_current": _prediction_record(predicted),
+            "teacher_privileged_current": privileged_record,
+            "teacher_clean_current": privileged_record,
             "metrics": _state_metrics(
                 state=state,
                 student=student,
+                student_current=current,
                 teacher_matched=matched,
+                teacher_predicted=predicted,
                 teacher_clean=clean,
             ),
             "same_state_sigma_proof": _same_state_sigma_proof(
                 state=state,
                 student=student,
+                student_current=current,
                 teacher_matched=matched,
+                teacher_predicted=predicted,
                 teacher_clean=clean,
             ),
         }
@@ -820,6 +1021,7 @@ def build_teacher_flow_multi_identity_manifest(
     identity_selection: Mapping[str, Any],
     student_checkpoint_contract: Mapping[str, Any],
     checkpoint_summary: Mapping[str, Any],
+    student_summary: Mapping[str, Any] | None = None,
     teacher_summary: Mapping[str, Any],
     common_inputs_fingerprints_sha256: Mapping[str, str],
     runtime_git_sha: str,
@@ -834,9 +1036,13 @@ def build_teacher_flow_multi_identity_manifest(
     )
     aggregates = aggregate_teacher_flow_metrics(state_records)
     paired_statistics = paired_teacher_flow_statistics(state_records)
-    primary_label = privileged_current_generalization_label(
+    privileged_label = privileged_current_generalization_label(
         aggregates=aggregates,
         paired_statistics=paired_statistics,
+    )
+    bridge_statistics = predicted_current_bridge_statistics(aggregates=aggregates)
+    primary_label = predicted_current_bridge_label(
+        bridge_statistics=bridge_statistics,
     )
     manifest = {
         "schema": TEACHER_FLOW_AUDIT_SCHEMA,
@@ -858,7 +1064,10 @@ def build_teacher_flow_multi_identity_manifest(
         "identity_records": [dict(record) for record in identity_records],
         "diagnostic_label": primary_label,
         "primary_diagnostic_label": primary_label,
-        "primary_diagnostic_policy": _multi_identity_primary_policy(),
+        "primary_diagnostic_policy": _predicted_current_bridge_policy(),
+        "privileged_current_diagnostic_label": privileged_label,
+        "privileged_current_diagnostic_policy": _multi_identity_primary_policy(),
+        "predicted_current_bridge_statistics": bridge_statistics,
         "matched_teacher_timestep_diagnostic": matched_teacher_timestep_diagnostic(
             state_records
         ),
@@ -881,6 +1090,7 @@ def build_teacher_flow_multi_identity_manifest(
         "streaming_contract": _multi_identity_streaming_contract(),
         "checkpoint": dict(checkpoint_summary),
         "student_checkpoint_contract": dict(student_checkpoint_contract),
+        "student": dict(student_summary or {}),
         "teacher": dict(teacher_summary),
         "common_inputs_fingerprints_sha256": dict(common_inputs_fingerprints_sha256),
         "runtime_git_sha": str(runtime_git_sha),
@@ -896,6 +1106,7 @@ def build_teacher_flow_multi_identity_manifest(
 def run_teacher_flow_audit(
     *,
     student_generator: Any,
+    student_runtime_factory: Any,
     teacher_runtime_factory: Any,
     source_noise: torch.Tensor,
     teacher_target: torch.Tensor,
@@ -925,6 +1136,15 @@ def run_teacher_flow_audit(
         conditional_dict=conditional_dict,
         direct_clean_context_kv=bool(student_direct_clean_context_kv),
     )
+    student_current_predictions = run_student_predicted_current_predictions(
+        runtime_factory=student_runtime_factory,
+        states=states,
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        teacher_payload=teacher_payload,
+        conditional_dict=conditional_dict,
+        main_scheduler=main_scheduler,
+    )
     teacher_predictions = run_teacher_branch_predictions(
         runtime_factory=teacher_runtime_factory,
         states=states,
@@ -932,10 +1152,12 @@ def run_teacher_flow_audit(
         teacher_target=teacher_target,
         teacher_payload=teacher_payload,
         conditional_dict=conditional_dict,
+        student_current_predictions=student_current_predictions,
     )
     return build_teacher_flow_audit_result(
         states=states,
         student_predictions=student_predictions,
+        student_current_predictions=student_current_predictions,
         teacher_predictions=teacher_predictions,
         sample_identity=sample_identity,
         checkpoint_summary=checkpoint_summary,
@@ -962,6 +1184,98 @@ def manual_flow_to_x0(
     value = value.to(device=future_state.device, dtype=future_state.dtype)
     _require_finite_tensor(value, name=name)
     return value
+
+
+def reconstruct_x0_from_flow_matching(
+    scheduler: Any,
+    *,
+    state: torch.Tensor,
+    flow: torch.Tensor,
+    timestep: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if tuple(state.shape) != tuple(flow.shape):
+        raise RuntimeError(f"{name} flow/state shape mismatch")
+    _require_finite_tensor(state, name=f"{name}_state")
+    _require_finite_tensor(flow, name=f"{name}_flow")
+    _require_finite_tensor(timestep, name=f"{name}_timestep")
+    original_shape = state.shape
+    value = scheduler.step(
+        flow.flatten(0, 1),
+        timestep.flatten(0, 1),
+        state.flatten(0, 1),
+        to_final=True,
+    ).unflatten(0, original_shape[:2])
+    value = value.to(device=state.device, dtype=state.dtype)
+    _require_finite_tensor(value, name=name)
+    return value
+
+
+def exact_current_flow_conversion_oracle(
+    main_scheduler: Any,
+    *,
+    state: TeacherFlowAuditState,
+    teacher_target: torch.Tensor,
+) -> dict[str, Any]:
+    clean_current = _chunk(teacher_target, CURRENT_CHUNK_INDEX)
+    current_timestep = route_eq._timestep(
+        state.main_warped_timestep,
+        state.current_state,
+    )
+    exact_current_flow = route_eq._training_target_chunk(
+        main_scheduler,
+        clean=clean_current,
+        noise=state.current_noise,
+        timestep=current_timestep,
+        name="teacher_flow_exact_current_target",
+    )
+    reconstructed = reconstruct_x0_from_flow_matching(
+        main_scheduler,
+        state=state.current_state,
+        flow=exact_current_flow,
+        timestep=current_timestep,
+        name="teacher_flow_exact_current_x0_oracle",
+    )
+    max_abs = float((reconstructed.float() - clean_current.float()).abs().max().item())
+    mse = route_eq._mse(reconstructed, clean_current)
+    passed = bool(
+        torch.allclose(
+            reconstructed.float(),
+            clean_current.float(),
+            atol=CURRENT_X0_ORACLE_ATOL,
+            rtol=CURRENT_X0_ORACLE_RTOL,
+        )
+    )
+    if not passed:
+        raise RuntimeError("exact current flow-to-x0 conversion oracle failed")
+    explicit_formula = (
+        state.current_state.float() - float(state.main_sigma) * exact_current_flow.float()
+    ).to(device=state.current_state.device, dtype=state.current_state.dtype)
+    formula_matches_scheduler = bool(
+        torch.allclose(
+            explicit_formula.float(),
+            reconstructed.float(),
+            atol=CURRENT_X0_ORACLE_ATOL,
+            rtol=CURRENT_X0_ORACLE_RTOL,
+        )
+    )
+    if not formula_matches_scheduler:
+        raise RuntimeError("explicit flow-to-x0 formula differs from scheduler step")
+    return {
+        "status": "PASS",
+        "source": "FlowMatchScheduler.step(..., to_final=True)",
+        "training_target_source": "FlowMatchScheduler.training_target(clean, noise, timestep)",
+        "derived_formula": "x0 = x_t - sigma * flow",
+        "atol": float(CURRENT_X0_ORACLE_ATOL),
+        "rtol": float(CURRENT_X0_ORACLE_RTOL),
+        "max_abs_error": max_abs,
+        "mse": float(mse),
+        "scheduler_step_to_final": True,
+        "formula_matches_scheduler": True,
+        "exact_current_flow": _tensor_record(exact_current_flow),
+        "reconstructed_current_x0": _tensor_record(reconstructed),
+        "clean_current": _tensor_record(clean_current),
+    }
 
 
 def aggregate_teacher_flow_metrics(
@@ -1029,6 +1343,9 @@ def paired_teacher_flow_statistics(
         }
 
     identity_values = list(by_identity.values())
+    predicted_identity_wins = sum(
+        1 for value in identity_values if value["predicted_better_than_matched"]
+    )
     by_raw = {}
     for raw, records in sorted(raw_groups.items()):
         raw_values = [_paired_values([record]) for record in records]
@@ -1049,6 +1366,11 @@ def paired_teacher_flow_statistics(
         ),
         "matched_identity_flow_win_rate": _rate(
             sum(1 for value in identity_values if value["matched_flow_win"]),
+            len(identity_values),
+        ),
+        "predicted_better_than_matched_win_count": int(predicted_identity_wins),
+        "predicted_better_than_matched_win_rate": _rate(
+            predicted_identity_wins,
             len(identity_values),
         ),
         "privileged_identity_flow_reduction_mean": _mean(
@@ -1075,7 +1397,117 @@ def paired_teacher_flow_statistics(
         "matched_identity_x0_reduction_median": _median(
             value["matched_x0_reduction"] for value in identity_values
         ),
+        "predicted_vs_matched_identity_flow_reduction_mean": _mean(
+            value["predicted_vs_matched_flow_reduction"]
+            for value in identity_values
+        ),
+        "predicted_vs_matched_identity_flow_reduction_median": _median(
+            value["predicted_vs_matched_flow_reduction"]
+            for value in identity_values
+        ),
+        "predicted_vs_matched_flow_reduction_mean": _mean(
+            value["predicted_vs_matched_flow_reduction"]
+            for value in identity_values
+        ),
+        "predicted_vs_matched_flow_reduction_median": _median(
+            value["predicted_vs_matched_flow_reduction"]
+            for value in identity_values
+        ),
+        "predicted_vs_matched_identity_x0_reduction_mean": _mean(
+            value["predicted_vs_matched_x0_reduction"] for value in identity_values
+        ),
+        "predicted_vs_matched_identity_x0_reduction_median": _median(
+            value["predicted_vs_matched_x0_reduction"] for value in identity_values
+        ),
+        "gap_recovery_ratio_mean": _mean_defined(
+            value["gap_recovery_ratio"] for value in identity_values
+        ),
+        "gap_recovery_ratio_median": _median_defined(
+            value["gap_recovery_ratio"] for value in identity_values
+        ),
     }
+
+
+def predicted_current_bridge_statistics(
+    *,
+    aggregates: Mapping[str, Any],
+) -> dict[str, Any]:
+    all_states = _bridge_group_metrics(aggregates["all_states"])
+    by_identity = {
+        key: {
+            "sample_identity": str(value.get("sample_identity", key)),
+            "validation_position": _optional_int(value.get("validation_position")),
+            "identity_index": _optional_int(value.get("identity_index")),
+            "state_count": int(value["state_count"]),
+            **_bridge_group_metrics(value["metrics"]),
+        }
+        for key, value in sorted(aggregates["by_identity"].items())
+    }
+    by_raw = {
+        str(raw): _bridge_group_metrics(metrics)
+        for raw, metrics in sorted(aggregates["by_raw"].items())
+    }
+    identity_values = list(by_identity.values())
+    raw_values = list(by_raw.values())
+    identity_wins = sum(
+        1 for value in identity_values if value["predicted_better_than_matched"]
+    )
+    raw_clearly_worse = sum(
+        1 for value in raw_values if value["predicted_clearly_worse_than_matched"]
+    )
+    raw_not_worse = sum(
+        1 for value in raw_values if value["predicted_flow_mse"] <= value["matched_flow_mse"]
+    )
+    return {
+        "policy": _predicted_current_bridge_policy(),
+        "all_states": all_states,
+        "by_identity": by_identity,
+        "by_raw": by_raw,
+        "identity_predicted_better_than_matched_win_count": int(identity_wins),
+        "identity_predicted_better_than_matched_win_rate": _rate(
+            identity_wins,
+            len(identity_values),
+        ),
+        "raw_predicted_not_worse_count": int(raw_not_worse),
+        "raw_predicted_clearly_worse_than_matched_count": int(raw_clearly_worse),
+    }
+
+
+def predicted_current_bridge_label(
+    *,
+    bridge_statistics: Mapping[str, Any],
+) -> str:
+    all_states = bridge_statistics["all_states"]
+    policy = bridge_statistics["policy"]
+    flow_improvement = float(
+        all_states["predicted_vs_matched_flow_reduction"]
+    )
+    x0_improvement = float(all_states["predicted_vs_matched_x0_reduction"])
+    gap_recovery = all_states.get("gap_recovery_ratio")
+    identity_win_rate = float(
+        bridge_statistics["identity_predicted_better_than_matched_win_rate"]
+    )
+    raw_not_worse_count = int(bridge_statistics["raw_predicted_not_worse_count"])
+    raw_clearly_worse_count = int(
+        bridge_statistics["raw_predicted_clearly_worse_than_matched_count"]
+    )
+    if (
+        flow_improvement >= float(policy["strong"]["all_state_flow_reduction_min"])
+        and identity_win_rate >= float(policy["strong"]["identity_win_rate_min"])
+        and raw_not_worse_count == len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
+        and gap_recovery is not None
+        and float(gap_recovery) >= float(policy["strong"]["gap_recovery_ratio_min"])
+        and x0_improvement >= float(policy["strong"]["future_x0_reduction_min"])
+    ):
+        return STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT
+    if (
+        flow_improvement < float(policy["no_support"]["all_state_flow_reduction_lt"])
+        or identity_win_rate < float(policy["no_support"]["identity_win_rate_lt"])
+        or raw_clearly_worse_count
+        >= int(policy["no_support"]["raw_clearly_worse_count_gte"])
+    ):
+        return NO_SUPPORT
+    return INCONCLUSIVE
 
 
 def privileged_current_generalization_label(
@@ -1209,11 +1641,17 @@ def validate_teacher_flow_audit_manifest(manifest: Mapping[str, Any]) -> None:
             manifest.get("identity_selection"),
         )
         if manifest.get("primary_diagnostic_label") not in {
+            STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT,
+            NO_SUPPORT,
+            INCONCLUSIVE,
+        }:
+            raise RuntimeError("multi-identity Teacher-flow diagnostic label invalid")
+        if manifest.get("privileged_current_diagnostic_label") not in {
             STRONG_PRIVILEGED_CURRENT_SUPPORT,
             NO_PRIVILEGED_CURRENT_SUPPORT,
             INCONCLUSIVE,
         }:
-            raise RuntimeError("multi-identity Teacher-flow diagnostic label invalid")
+            raise RuntimeError("multi-identity privileged diagnostic label invalid")
     else:
         if int(manifest.get("state_count", -1)) != 16:
             raise RuntimeError("teacher-flow audit must contain 16 states")
@@ -1228,6 +1666,9 @@ def validate_teacher_flow_audit_manifest(manifest: Mapping[str, Any]) -> None:
         raise RuntimeError("teacher-flow audit aggregates missing")
     if "by_state" not in aggregates or "by_identity" not in aggregates:
         raise RuntimeError("teacher-flow audit aggregate hierarchy missing")
+    bridge = manifest.get("predicted_current_bridge_statistics")
+    if not isinstance(bridge, Mapping) or "all_states" not in bridge:
+        raise RuntimeError("predicted-current bridge statistics missing")
 
 
 def _validate_student_checkpoint_sidecars(
@@ -1530,6 +1971,15 @@ def _run_teacher_matched_current_branch(
         privileged_clean_current=False,
         same_information_as_mcp=True,
     )
+    proof.update(
+        {
+            "inference_information_available": True,
+            "deployment_proof": False,
+            "teacher_frozen": _parameters_are_frozen(runtime.generator),
+        }
+    )
+    if proof["teacher_frozen"] is not True:
+        raise RuntimeError("matched-current Teacher is not frozen")
     return FlowPrediction(
         state_id=state.state_id,
         branch=TEACHER_MATCHED_CURRENT_BRANCH,
@@ -1537,6 +1987,114 @@ def _run_teacher_matched_current_branch(
         x0=x0.detach().clone(),
         proof=proof,
     )
+
+
+def _run_student_predicted_current_state(
+    *,
+    runtime_factory: Any,
+    state: TeacherFlowAuditState,
+    teacher_target: torch.Tensor,
+    conditional_dict: Mapping[str, Any],
+    rng_plan: Mapping[str, Any],
+    main_scheduler: Any,
+) -> FlowPrediction:
+    runtime = runtime_factory()
+    was_training = bool(getattr(runtime.generator, "training", False))
+    if hasattr(runtime.generator, "eval"):
+        runtime.generator.eval()
+    try:
+        _validate_student_current_runtime(runtime)
+        history = _recache_clean_chunk(
+            runtime=runtime,
+            teacher_target=teacher_target,
+            conditional_dict=conditional_dict,
+            rng_plan=rng_plan,
+            chunk_index=HISTORY_CHUNK_INDEX,
+        )
+        current_timestep = route_eq._timestep(
+            state.main_warped_timestep,
+            state.current_state,
+        )
+        flow, current_guard = _teacher_forward_chunk(
+            runtime=runtime,
+            conditional_dict=conditional_dict,
+            chunk=state.current_state,
+            timestep=current_timestep,
+            start_frame=CURRENT_CHUNK_INDEX * FULL_SEQUENCE_CHUNK_FRAMES,
+            label="student_predicted_current_main_forward",
+        )
+        x0_hat = reconstruct_x0_from_flow_matching(
+            main_scheduler,
+            state=state.current_state,
+            flow=flow,
+            timestep=current_timestep,
+            name="student_predicted_current_x0_hat",
+        ).detach()
+        if x0_hat.requires_grad:
+            raise RuntimeError("predicted-current x0_hat must be detached")
+        oracle = exact_current_flow_conversion_oracle(
+            main_scheduler,
+            state=state,
+            teacher_target=teacher_target,
+        )
+        clean_current = _chunk(teacher_target, CURRENT_CHUNK_INDEX)
+        history_rng_unchanged = bool(history["forward_rng"]["unchanged"])
+        current_rng_unchanged = bool(current_guard["unchanged"])
+        proof = {
+            "branch": STUDENT_PREDICTED_CURRENT_BRANCH,
+            "route": "student_main_single_chunk_kv_forward",
+            "history_policy": "same clean chunk0 recache as Teacher audit",
+            "history_chunk0_clean_sha256": tensor_sha256(
+                _chunk(teacher_target, HISTORY_CHUNK_INDEX).detach().cpu()
+            ),
+            "history_context_latent_sha256": history["context_latent"]["sha256"],
+            "history_context_noise": int(history["context_noise"]),
+            "current_noisy_tensor_sha256": tensor_sha256(
+                state.current_state.detach().cpu()
+            ),
+            "mcp_current_state_sha256": tensor_sha256(state.current_state.detach().cpu()),
+            "main_timestep_sha256": tensor_sha256(current_timestep.detach().cpu()),
+            "main_sigma": float(state.main_sigma),
+            "main_forward_uses_clean_x": False,
+            "main_forward_uses_mcp_future": False,
+            "predicted_current_uses_gt_current": False,
+            "predicted_current_uses_gt_future": False,
+            "uses_teacher_prediction": False,
+            "uses_privileged_current": False,
+            "uses_wrapper_auto_x0": False,
+            "x0_hat_source": (
+                "scheduler.step(main_flow, main_timestep, current_state, "
+                "to_final=True)"
+            ),
+            "x0_hat_detached": True,
+            "student_frozen": _parameters_are_frozen(runtime.generator),
+            "optimizer_step_executed": False,
+            "history_forward_rng": dict(history["forward_rng"]),
+            "current_forward_rng": dict(current_guard),
+            "student_rng_unchanged": bool(
+                history_rng_unchanged and current_rng_unchanged
+            ),
+            "current_x0_hat": _tensor_record(x0_hat),
+            "current_x0_hat_mse_to_gt_current": route_eq._mse(
+                x0_hat,
+                clean_current,
+            ),
+            "exact_flow_conversion_oracle": oracle,
+        }
+        if proof["student_frozen"] is not True:
+            raise RuntimeError("predicted-current Student is not frozen")
+        if proof["student_rng_unchanged"] is not True:
+            raise RuntimeError("predicted-current Student RNG changed")
+        return FlowPrediction(
+            state_id=state.state_id,
+            branch=STUDENT_PREDICTED_CURRENT_BRANCH,
+            flow=flow.detach().clone(),
+            x0=x0_hat.detach().clone(),
+            proof=proof,
+        )
+    finally:
+        if hasattr(runtime.generator, "train"):
+            runtime.generator.train(was_training)
 
 
 def _run_teacher_clean_current_branch(
@@ -1594,9 +2152,119 @@ def _run_teacher_clean_current_branch(
         same_information_as_mcp=False,
     )
     proof["clean_current_recache"] = clean_current
+    proof.update(
+        {
+            "branch": TEACHER_PRIVILEGED_CURRENT_BRANCH,
+            "inference_information_available": False,
+            "deployment_proof": False,
+            "teacher_frozen": _parameters_are_frozen(runtime.generator),
+        }
+    )
+    if proof["teacher_frozen"] is not True:
+        raise RuntimeError("privileged-current Teacher is not frozen")
     return FlowPrediction(
         state_id=state.state_id,
-        branch=TEACHER_CLEAN_CURRENT_BRANCH,
+        branch=TEACHER_PRIVILEGED_CURRENT_BRANCH,
+        flow=flow.detach().clone(),
+        x0=x0.detach().clone(),
+        proof=proof,
+    )
+
+
+def _run_teacher_predicted_current_branch(
+    *,
+    runtime_factory: Any,
+    state: TeacherFlowAuditState,
+    teacher_target: torch.Tensor,
+    conditional_dict: Mapping[str, Any],
+    rng_plan: Mapping[str, Any],
+    predicted_current: FlowPrediction,
+) -> FlowPrediction:
+    runtime = runtime_factory()
+    _validate_teacher_runtime(runtime)
+    history = _recache_clean_chunk(
+        runtime=runtime,
+        teacher_target=teacher_target,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        chunk_index=HISTORY_CHUNK_INDEX,
+    )
+    current_x0_hat = predicted_current.x0.detach()
+    if current_x0_hat.requires_grad:
+        raise RuntimeError("predicted-current Teacher recache got attached x0_hat")
+    current_recache = _recache_supplied_chunk(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        chunk=current_x0_hat,
+        chunk_index=CURRENT_CHUNK_INDEX,
+        label="predicted_current_recache",
+    )
+    future_timestep = route_eq._timestep(
+        state.teacher_future_timestep,
+        state.future_state,
+    )
+    flow, future_guard = _teacher_forward_chunk(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        chunk=state.future_state,
+        timestep=future_timestep,
+        start_frame=FUTURE_START_FRAME,
+        label="teacher_predicted_current_future_forward",
+    )
+    x0 = manual_flow_to_x0(
+        future_state=state.future_state,
+        flow=flow,
+        sigma=state.future_sigma,
+        name="teacher_predicted_current_x0",
+    )
+    proof = _teacher_branch_proof(
+        branch=TEACHER_PREDICTED_CURRENT_BRANCH,
+        state=state,
+        history=history,
+        current_state=current_x0_hat,
+        current_timestep=None,
+        future_timestep=future_timestep,
+        current_guard=current_recache["forward_rng"],
+        future_guard=future_guard,
+        privileged_clean_current=False,
+        same_information_as_mcp=False,
+    )
+    clean_current = _chunk(teacher_target, CURRENT_CHUNK_INDEX)
+    proof.update(
+        {
+            "inference_information_available": True,
+            "deployment_proof": False,
+            "current_recache": current_recache,
+            "current_x0_hat": _tensor_record(current_x0_hat),
+            "current_x0_hat_mse_to_gt_current": route_eq._mse(
+                current_x0_hat,
+                clean_current,
+            ),
+            "current_x0_hat_detached": True,
+            "student_current_prediction": _prediction_record(predicted_current),
+            "predicted_current_uses_gt_current": False,
+            "predicted_current_uses_gt_future": False,
+            "same_future_tensor_as_other_branches": True,
+            "teacher_frozen": _parameters_are_frozen(runtime.generator),
+            "student_frozen": bool(
+                predicted_current.proof.get("student_frozen") is True
+            ),
+            "optimizer_step_executed": False,
+            "teacher_rng_unchanged": bool(
+                proof["teacher_rng_unchanged"]
+                and current_recache["forward_rng"]["unchanged"]
+                and future_guard["unchanged"]
+            ),
+        }
+    )
+    if proof["teacher_frozen"] is not True or proof["student_frozen"] is not True:
+        raise RuntimeError("predicted-current branch frozen proof failed")
+    if proof["teacher_rng_unchanged"] is not True:
+        raise RuntimeError("predicted-current Teacher RNG changed")
+    return FlowPrediction(
+        state_id=state.state_id,
+        branch=TEACHER_PREDICTED_CURRENT_BRANCH,
         flow=flow.detach().clone(),
         x0=x0.detach().clone(),
         proof=proof,
@@ -1645,6 +2313,35 @@ def _recache_clean_chunk(
     )
 
 
+def _recache_supplied_chunk(
+    *,
+    runtime: deployment.DeploymentRuntime,
+    conditional_dict: Mapping[str, Any],
+    rng_plan: Mapping[str, Any],
+    chunk: torch.Tensor,
+    chunk_index: int,
+    label: str,
+) -> dict[str, Any]:
+    if chunk.requires_grad:
+        raise RuntimeError(f"{label} recache chunk must be detached")
+    counts = {"clean_recache_forward_count": 0}
+    record = deployment._clean_recache(
+        runtime=runtime,
+        conditional_dict=conditional_dict,
+        rng_plan=rng_plan,
+        counts=counts,
+        clean_chunk=chunk,
+        chunk_index=int(chunk_index),
+        start_frame=int(chunk_index) * FULL_SEQUENCE_CHUNK_FRAMES,
+        expected_before=None,
+    )
+    return {
+        **record,
+        "label": str(label),
+        "recache_chunk": _tensor_record(chunk),
+    }
+
+
 def _teacher_forward_chunk(
     *,
     runtime: deployment.DeploymentRuntime,
@@ -1667,13 +2364,18 @@ def _teacher_forward_chunk(
     outputs, rng_guard = deployment._call_with_rng_guard(
         device=chunk.device,
         label=label,
-        fn=call_teacher,
+        fn=lambda: _no_grad_call(call_teacher),
     )
     flow, _ = deployment._unpack_main_outputs(outputs)
     if tuple(flow.shape) != tuple(chunk.shape):
         raise RuntimeError(f"{label} flow shape mismatch")
     _require_finite_tensor(flow, name=label)
     return flow, dict(rng_guard)
+
+
+def _no_grad_call(fn):
+    with torch.no_grad():
+        return fn()
 
 
 def _teacher_branch_proof(
@@ -1690,6 +2392,9 @@ def _teacher_branch_proof(
     same_information_as_mcp: bool,
 ) -> dict[str, Any]:
     current_record = _tensor_record(current_state)
+    history_rng_unchanged = bool(history["forward_rng"]["unchanged"])
+    current_rng_unchanged = bool(current_guard["unchanged"])
+    future_rng_unchanged = bool(future_guard["unchanged"])
     proof = {
         "branch": branch,
         "teacher_checkpoint_role": "official_main_only_self_forcing",
@@ -1714,8 +2419,13 @@ def _teacher_branch_proof(
         "same_information_as_mcp": bool(same_information_as_mcp),
         "uses_ground_truth_future_x0_for_conversion": False,
         "uses_wrapper_auto_x0": False,
+        "history_forward_rng": dict(history["forward_rng"]),
         "current_forward_rng": dict(current_guard),
         "future_forward_rng": dict(future_guard),
+        "teacher_rng_unchanged": bool(
+            history_rng_unchanged and current_rng_unchanged and future_rng_unchanged
+        ),
+        "optimizer_step_executed": False,
     }
     proof["history_chunk0_identity_exact"] = (
         proof["history_chunk0_clean_sha256"]
@@ -1743,6 +2453,8 @@ def _teacher_branch_proof(
         proof["matched_current_state_exact"] = False
     if not proof["future_timestep_matches_physical_sigma"]:
         raise RuntimeError("Teacher future timestep does not match physical sigma")
+    if proof["teacher_rng_unchanged"] is not True:
+        raise RuntimeError("Teacher branch RNG changed")
     return proof
 
 
@@ -1750,13 +2462,24 @@ def _state_metrics(
     *,
     state: TeacherFlowAuditState,
     student: FlowPrediction,
+    student_current: FlowPrediction,
     teacher_matched: FlowPrediction,
+    teacher_predicted: FlowPrediction,
     teacher_clean: FlowPrediction,
 ) -> dict[str, float]:
     clean_future = _chunk(state.noisy_batch.clean_target, FUTURE_CHUNK_INDEX)
+    clean_current = _chunk(state.noisy_batch.clean_target, CURRENT_CHUNK_INDEX)
     return {
         "mcp_flow_vs_exact_mse": route_eq._mse(student.flow, state.exact_mcp_target),
         "mcp_x0_vs_clean_future_mse": route_eq._mse(student.x0, clean_future),
+        "student_predicted_current_flow_vs_exact_mse": route_eq._mse(
+            student_current.flow,
+            _chunk(state.noisy_batch.target_flow_main, CURRENT_CHUNK_INDEX),
+        ),
+        "teacher_predicted_current_x0_hat_vs_clean_current_mse": route_eq._mse(
+            student_current.x0,
+            clean_current,
+        ),
         "teacher_matched_flow_vs_exact_mse": route_eq._mse(
             teacher_matched.flow,
             state.exact_mcp_target,
@@ -1764,6 +2487,18 @@ def _state_metrics(
         "teacher_matched_x0_vs_clean_future_mse": route_eq._mse(
             teacher_matched.x0,
             clean_future,
+        ),
+        "teacher_predicted_flow_vs_exact_mse": route_eq._mse(
+            teacher_predicted.flow,
+            state.exact_mcp_target,
+        ),
+        "teacher_predicted_x0_vs_clean_future_mse": route_eq._mse(
+            teacher_predicted.x0,
+            clean_future,
+        ),
+        "mcp_flow_vs_teacher_predicted_flow_mse": route_eq._mse(
+            student.flow,
+            teacher_predicted.flow,
         ),
         "mcp_flow_vs_teacher_matched_flow_mse": route_eq._mse(
             student.flow,
@@ -1788,7 +2523,9 @@ def _same_state_sigma_proof(
     *,
     state: TeacherFlowAuditState,
     student: FlowPrediction,
+    student_current: FlowPrediction,
     teacher_matched: FlowPrediction,
+    teacher_predicted: FlowPrediction,
     teacher_clean: FlowPrediction,
 ) -> dict[str, Any]:
     future_sha = tensor_sha256(state.future_state.detach().cpu())
@@ -1802,24 +2539,67 @@ def _same_state_sigma_proof(
         == future_sha,
         "teacher_clean_future_state_exact": teacher_clean.proof["future_state_sha256"]
         == future_sha,
+        "teacher_predicted_future_state_exact": teacher_predicted.proof[
+            "future_state_sha256"
+        ]
+        == future_sha,
         "teacher_matched_current_state_exact": teacher_matched.proof[
             "current_state_sha256"
+        ]
+        == current_sha,
+        "student_predicted_current_input_exact": student_current.proof[
+            "current_noisy_tensor_sha256"
         ]
         == current_sha,
         "main_sigma": float(state.main_sigma),
         "future_sigma": float(state.future_sigma),
         "teacher_future_timestep": float(state.teacher_future_timestep),
         "raw_timestep_directly_used_for_teacher": False,
+        "predicted_current_uses_gt_current": bool(
+            teacher_predicted.proof["predicted_current_uses_gt_current"]
+        ),
+        "predicted_current_uses_gt_future": bool(
+            teacher_predicted.proof["predicted_current_uses_gt_future"]
+        ),
+        "same_future_tensor_as_other_branches": bool(
+            teacher_predicted.proof["same_future_tensor_as_other_branches"]
+        ),
+        "teacher_frozen": bool(
+            teacher_matched.proof.get("teacher_frozen") is True
+            and teacher_predicted.proof.get("teacher_frozen") is True
+            and teacher_clean.proof.get("teacher_frozen") is True
+        ),
+        "student_frozen": bool(
+            student.proof.get("student_frozen", True) is True
+            and student_current.proof.get("student_frozen") is True
+        ),
+        "optimizer_step_executed": False,
+        "teacher_rng_unchanged": bool(
+            teacher_matched.proof.get("teacher_rng_unchanged") is True
+            and teacher_predicted.proof.get("teacher_rng_unchanged") is True
+            and teacher_clean.proof.get("teacher_rng_unchanged") is True
+        ),
     }
     proof["all_future_states_exact"] = (
         proof["student_future_state_exact"]
         and proof["teacher_matched_future_state_exact"]
+        and proof["teacher_predicted_future_state_exact"]
         and proof["teacher_clean_future_state_exact"]
     )
     if not proof["all_future_states_exact"]:
         raise RuntimeError("future state exact proof failed")
     if not proof["teacher_matched_current_state_exact"]:
         raise RuntimeError("matched current state exact proof failed")
+    if not proof["student_predicted_current_input_exact"]:
+        raise RuntimeError("predicted-current Main input mismatch")
+    if proof["predicted_current_uses_gt_current"] is not False:
+        raise RuntimeError("predicted-current branch used GT current")
+    if proof["predicted_current_uses_gt_future"] is not False:
+        raise RuntimeError("predicted-current branch used GT future")
+    if proof["teacher_frozen"] is not True or proof["student_frozen"] is not True:
+        raise RuntimeError("predicted-current frozen proof failed")
+    if proof["teacher_rng_unchanged"] is not True:
+        raise RuntimeError("Teacher RNG unchanged proof failed")
     return proof
 
 
@@ -1875,30 +2655,101 @@ def _aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, dict[str
     return aggregate
 
 
+def _metric_mean(aggregate: Mapping[str, Any], key: str) -> float:
+    metric = aggregate.get(key)
+    if not isinstance(metric, Mapping):
+        raise RuntimeError(f"bridge aggregate metric missing: {key}")
+    return float(metric["mean"])
+
+
+def _bridge_group_metrics(aggregate: Mapping[str, Any]) -> dict[str, Any]:
+    matched_flow = _metric_mean(aggregate, "teacher_matched_flow_vs_exact_mse")
+    predicted_flow = _metric_mean(aggregate, "teacher_predicted_flow_vs_exact_mse")
+    privileged_flow = _metric_mean(aggregate, "teacher_clean_flow_vs_exact_mse")
+    mcp_flow = _metric_mean(aggregate, "mcp_flow_vs_exact_mse")
+    matched_x0 = _metric_mean(aggregate, "teacher_matched_x0_vs_clean_future_mse")
+    predicted_x0 = _metric_mean(aggregate, "teacher_predicted_x0_vs_clean_future_mse")
+    privileged_x0 = _metric_mean(aggregate, "teacher_clean_x0_vs_clean_future_mse")
+    mcp_x0 = _metric_mean(aggregate, "mcp_x0_vs_clean_future_mse")
+    flow_reduction = _relative_reduction(matched_flow, predicted_flow)
+    x0_reduction = _relative_reduction(matched_x0, predicted_x0)
+    gap_recovery = _gap_recovery_ratio(
+        matched_flow=matched_flow,
+        predicted_flow=predicted_flow,
+        privileged_flow=privileged_flow,
+    )
+    return {
+        "matched_flow_mse": matched_flow,
+        "predicted_flow_mse": predicted_flow,
+        "privileged_flow_mse": privileged_flow,
+        "mcp_flow_mse": mcp_flow,
+        "matched_x0_mse": matched_x0,
+        "predicted_x0_mse": predicted_x0,
+        "privileged_x0_mse": privileged_x0,
+        "mcp_x0_mse": mcp_x0,
+        "current_x0_hat_mse_to_gt_current": _metric_mean(
+            aggregate,
+            "teacher_predicted_current_x0_hat_vs_clean_current_mse",
+        ),
+        "predicted_vs_matched_flow_reduction": flow_reduction,
+        "predicted_vs_matched_flow_reduction_pct": flow_reduction * 100.0,
+        "predicted_vs_matched_x0_reduction": x0_reduction,
+        "predicted_vs_matched_x0_reduction_pct": x0_reduction * 100.0,
+        "gap_recovery_ratio": gap_recovery,
+        "predicted_better_than_matched": predicted_flow < matched_flow,
+        "predicted_clearly_worse_than_matched": (
+            _relative_increase(matched_flow, predicted_flow)
+            >= PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN
+        ),
+    }
+
+
 def _paired_values(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     aggregate = _aggregate_group(records)
     mcp_flow = float(aggregate["mcp_flow_vs_exact_mse"]["mean"])
     matched_flow = float(aggregate["teacher_matched_flow_vs_exact_mse"]["mean"])
+    predicted_flow = float(aggregate["teacher_predicted_flow_vs_exact_mse"]["mean"])
     privileged_flow = float(aggregate["teacher_clean_flow_vs_exact_mse"]["mean"])
     mcp_x0 = float(aggregate["mcp_x0_vs_clean_future_mse"]["mean"])
     matched_x0 = float(aggregate["teacher_matched_x0_vs_clean_future_mse"]["mean"])
+    predicted_x0 = float(aggregate["teacher_predicted_x0_vs_clean_future_mse"]["mean"])
     privileged_x0 = float(aggregate["teacher_clean_x0_vs_clean_future_mse"]["mean"])
     return {
         "mcp_flow_mse": mcp_flow,
         "matched_flow_mse": matched_flow,
+        "predicted_flow_mse": predicted_flow,
         "privileged_flow_mse": privileged_flow,
         "mcp_x0_mse": mcp_x0,
         "matched_x0_mse": matched_x0,
+        "predicted_x0_mse": predicted_x0,
         "privileged_x0_mse": privileged_x0,
         "privileged_flow_reduction": _relative_reduction(
             mcp_flow,
             privileged_flow,
         ),
         "matched_flow_reduction": _relative_reduction(mcp_flow, matched_flow),
+        "predicted_vs_matched_flow_reduction": _relative_reduction(
+            matched_flow,
+            predicted_flow,
+        ),
         "privileged_x0_reduction": _relative_reduction(mcp_x0, privileged_x0),
         "matched_x0_reduction": _relative_reduction(mcp_x0, matched_x0),
+        "predicted_vs_matched_x0_reduction": _relative_reduction(
+            matched_x0,
+            predicted_x0,
+        ),
+        "gap_recovery_ratio": _gap_recovery_ratio(
+            matched_flow=matched_flow,
+            predicted_flow=predicted_flow,
+            privileged_flow=privileged_flow,
+        ),
         "privileged_flow_win": privileged_flow < mcp_flow,
         "matched_flow_win": matched_flow < mcp_flow,
+        "predicted_better_than_matched": predicted_flow < matched_flow,
+        "predicted_clearly_worse_than_matched": (
+            _relative_increase(matched_flow, predicted_flow)
+            >= PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN
+        ),
     }
 
 
@@ -1907,12 +2758,26 @@ def _paired_summary(values: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         raise RuntimeError("cannot summarize empty paired values")
     privileged_wins = sum(1 for value in values if value["privileged_flow_win"])
     matched_wins = sum(1 for value in values if value["matched_flow_win"])
+    predicted_wins = sum(
+        1 for value in values if value["predicted_better_than_matched"]
+    )
+    predicted_clearly_worse = sum(
+        1 for value in values if value["predicted_clearly_worse_than_matched"]
+    )
     return {
         "state_count": int(len(values)),
         "privileged_flow_win_count": int(privileged_wins),
         "privileged_flow_win_rate": _rate(privileged_wins, len(values)),
         "matched_flow_win_count": int(matched_wins),
         "matched_flow_win_rate": _rate(matched_wins, len(values)),
+        "predicted_better_than_matched_win_count": int(predicted_wins),
+        "predicted_better_than_matched_win_rate": _rate(
+            predicted_wins,
+            len(values),
+        ),
+        "predicted_clearly_worse_than_matched_count": int(
+            predicted_clearly_worse
+        ),
         "privileged_flow_reduction_mean": _mean(
             value["privileged_flow_reduction"] for value in values
         ),
@@ -1924,6 +2789,12 @@ def _paired_summary(values: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "matched_flow_reduction_median": _median(
             value["matched_flow_reduction"] for value in values
+        ),
+        "predicted_vs_matched_flow_reduction_mean": _mean(
+            value["predicted_vs_matched_flow_reduction"] for value in values
+        ),
+        "predicted_vs_matched_flow_reduction_median": _median(
+            value["predicted_vs_matched_flow_reduction"] for value in values
         ),
         "privileged_x0_reduction_mean": _mean(
             value["privileged_x0_reduction"] for value in values
@@ -1937,6 +2808,18 @@ def _paired_summary(values: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "matched_x0_reduction_median": _median(
             value["matched_x0_reduction"] for value in values
         ),
+        "predicted_vs_matched_x0_reduction_mean": _mean(
+            value["predicted_vs_matched_x0_reduction"] for value in values
+        ),
+        "predicted_vs_matched_x0_reduction_median": _median(
+            value["predicted_vs_matched_x0_reduction"] for value in values
+        ),
+        "gap_recovery_ratio_mean": _mean_defined(
+            value["gap_recovery_ratio"] for value in values
+        ),
+        "gap_recovery_ratio_median": _median_defined(
+            value["gap_recovery_ratio"] for value in values
+        ),
     }
 
 
@@ -1945,6 +2828,26 @@ def _relative_reduction(baseline: float, candidate: float) -> float:
     if baseline_value <= 0.0:
         return 0.0
     return float((baseline_value - float(candidate)) / baseline_value)
+
+
+def _relative_increase(baseline: float, candidate: float) -> float:
+    baseline_value = float(baseline)
+    candidate_value = float(candidate)
+    if baseline_value <= 0.0:
+        return float("inf") if candidate_value > baseline_value else 0.0
+    return float((candidate_value - baseline_value) / baseline_value)
+
+
+def _gap_recovery_ratio(
+    *,
+    matched_flow: float,
+    predicted_flow: float,
+    privileged_flow: float,
+) -> float | None:
+    denominator = float(matched_flow) - float(privileged_flow)
+    if denominator <= 0.0:
+        return None
+    return float((float(matched_flow) - float(predicted_flow)) / denominator)
 
 
 def _rate(count: int, total: int) -> float:
@@ -1964,6 +2867,20 @@ def _median(values: Any) -> float:
     materialized = [float(value) for value in values]
     if not materialized:
         raise RuntimeError("cannot compute median of empty values")
+    return float(median(materialized))
+
+
+def _mean_defined(values: Any) -> float | None:
+    materialized = [float(value) for value in values if value is not None]
+    if not materialized:
+        return None
+    return float(sum(materialized) / len(materialized))
+
+
+def _median_defined(values: Any) -> float | None:
+    materialized = [float(value) for value in values if value is not None]
+    if not materialized:
+        return None
     return float(median(materialized))
 
 
@@ -2060,6 +2977,30 @@ def _multi_identity_primary_policy() -> dict[str, Any]:
     }
 
 
+def _predicted_current_bridge_policy() -> dict[str, Any]:
+    return {
+        "primary_hypothesis": "PREDICTED_CURRENT_BRIDGES_PRIVILEGED_CURRENT_GAP",
+        "scope": "diagnostic current bridge only; not a deployment proof",
+        "strong": {
+            "label": STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT,
+            "all_state_flow_reduction_min": 0.15,
+            "identity_win_rate_min": 0.75,
+            "identity_win_count_min": 24,
+            "raw_aggregates_predicted_not_worse_than_matched": True,
+            "gap_recovery_ratio_min": 0.30,
+            "future_x0_reduction_min": 0.10,
+        },
+        "no_support": {
+            "label": NO_SUPPORT,
+            "all_state_flow_reduction_lt": 0.05,
+            "identity_win_rate_lt": 0.60,
+            "raw_clearly_worse_count_gte": 2,
+            "clearly_worse_relative_margin": PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN,
+        },
+        INCONCLUSIVE: "pre-registered strong/no-support criteria are not met",
+    }
+
+
 def _state_sigma_matching_contract(
     *,
     identity_rule: str = "validation_sample_identities[0]",
@@ -2088,14 +3029,26 @@ def _teacher_route_contracts() -> dict[str, Any]:
             "future": "same noisy future_state as MCP target",
             "privileged_clean_current": False,
             "same_information_as_mcp": True,
+            "inference_information_available": True,
         },
-        TEACHER_CLEAN_CURRENT_BRANCH: {
+        TEACHER_PREDICTED_CURRENT_BRANCH: {
+            "fresh_teacher_kv": True,
+            "history": "clean chunk0 recache",
+            "current": "student Main predicted current x0_hat recache",
+            "future": "same noisy future_state as MCP target",
+            "privileged_clean_current": False,
+            "same_information_as_mcp": False,
+            "inference_information_available": True,
+            "deployment_proof": False,
+        },
+        TEACHER_PRIVILEGED_CURRENT_BRANCH: {
             "fresh_teacher_kv": True,
             "history": "clean chunk0 recache",
             "current": "clean chunk1 recache",
             "future": "same noisy future_state as MCP target",
             "privileged_clean_current": True,
             "same_information_as_mcp": False,
+            "inference_information_available": False,
         },
     }
 
@@ -2117,10 +3070,51 @@ def _student_route_contract(
     }
 
 
+def _student_predicted_current_route_contract(
+    student_predictions: Mapping[str, FlowPrediction]
+) -> dict[str, Any]:
+    if not student_predictions:
+        raise RuntimeError("student predicted-current predictions missing")
+    for prediction in student_predictions.values():
+        if prediction.branch != STUDENT_PREDICTED_CURRENT_BRANCH:
+            raise RuntimeError("student predicted-current branch mismatch")
+        proof = prediction.proof
+        if proof.get("main_forward_uses_clean_x") is not False:
+            raise RuntimeError("student predicted-current used clean_x")
+        if proof.get("main_forward_uses_mcp_future") is not False:
+            raise RuntimeError("student predicted-current used MCP future")
+        if proof.get("x0_hat_detached") is not True:
+            raise RuntimeError("student predicted-current x0_hat not detached")
+    return {
+        "route": "student_main_single_chunk_kv_forward",
+        "history": "same clean chunk0 recache as Teacher audit",
+        "current": "same noisy current_state as MCP and matched-current",
+        "uses_clean_x": False,
+        "uses_mcp_future": False,
+        "uses_teacher_prediction": False,
+        "uses_privileged_current": False,
+        "uses_gt_current_to_construct_x0_hat": False,
+        "uses_gt_future_to_construct_x0_hat": False,
+        "x0_hat_detached": True,
+        "inference_information_available": True,
+    }
+
+
 def _conversion_contract() -> dict[str, Any]:
     return {
         "teacher_x0": "future_state - sigma_future * teacher_flow",
         "mcp_x0": "future_state - sigma_future * mcp_flow",
+        "predicted_current_x0_hat": (
+            "FlowMatchScheduler.step(main_flow, main_timestep, current_state, "
+            "to_final=True)"
+        ),
+        "current_flow_matching_derivation": (
+            "add_noise gives x_t=(1-sigma)*x0+sigma*noise; training_target "
+            "is noise-x0; final scheduler step gives x0=x_t-sigma*flow"
+        ),
+        "current_conversion_oracle_required": True,
+        "current_conversion_oracle_atol": CURRENT_X0_ORACLE_ATOL,
+        "current_conversion_oracle_rtol": CURRENT_X0_ORACLE_RTOL,
         "uses_wrapper_auto_x0": False,
         "uses_clean_future_to_derive_teacher_flow": False,
     }
@@ -2155,6 +3149,12 @@ def _scientific_boundaries() -> dict[str, str]:
 
 def _multi_identity_boundaries() -> dict[str, str]:
     return {
+        STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT: (
+            "student Main predicted current information closes a preregistered "
+            "fraction of the matched-to-privileged Teacher-flow gap in this "
+            "diagnostic context setup"
+        ),
+        NO_SUPPORT: "does not support the predicted-current bridge as the next priority",
         STRONG_PRIVILEGED_CURRENT_SUPPORT: (
             "privileged near-clean current information produces a substantially "
             "better future conditional target across validation identities and is "
@@ -2168,8 +3168,8 @@ def _multi_identity_boundaries() -> dict[str, str]:
         ),
         "forbidden_claims": (
             "do not claim conditional ambiguity is proven, exact FM is wrong, "
-            "the privileged Teacher is oracle, or Teacher flow should directly "
-            "replace FM target"
+            "the privileged Teacher is oracle, predicted-current is a deployment "
+            "proof, or Teacher flow should directly replace FM target"
         ),
     }
 
@@ -2193,8 +3193,13 @@ def _validate_state_record(record: Any) -> None:
     required_metrics = {
         "mcp_flow_vs_exact_mse",
         "mcp_x0_vs_clean_future_mse",
+        "student_predicted_current_flow_vs_exact_mse",
+        "teacher_predicted_current_x0_hat_vs_clean_current_mse",
         "teacher_matched_flow_vs_exact_mse",
         "teacher_matched_x0_vs_clean_future_mse",
+        "teacher_predicted_flow_vs_exact_mse",
+        "teacher_predicted_x0_vs_clean_future_mse",
+        "mcp_flow_vs_teacher_predicted_flow_mse",
         "mcp_flow_vs_teacher_matched_flow_mse",
         "teacher_clean_flow_vs_exact_mse",
         "teacher_clean_x0_vs_clean_future_mse",
@@ -2208,26 +3213,51 @@ def _validate_state_record(record: Any) -> None:
         if not torch.isfinite(torch.tensor(value)):
             raise RuntimeError(f"teacher-flow metric is nonfinite: {key}")
     matched = record.get("teacher_matched_current")
-    clean = record.get("teacher_clean_current")
-    if not isinstance(matched, Mapping) or not isinstance(clean, Mapping):
+    predicted = record.get("teacher_predicted_current")
+    privileged = record.get("teacher_privileged_current")
+    if not isinstance(matched, Mapping) or not isinstance(predicted, Mapping):
+        raise RuntimeError("teacher-flow branch records missing")
+    if not isinstance(privileged, Mapping):
         raise RuntimeError("teacher-flow branch records missing")
     matched_proof = matched.get("proof")
-    clean_proof = clean.get("proof")
-    if not isinstance(matched_proof, Mapping) or not isinstance(clean_proof, Mapping):
+    predicted_proof = predicted.get("proof")
+    privileged_proof = privileged.get("proof")
+    if not isinstance(matched_proof, Mapping) or not isinstance(
+        predicted_proof,
+        Mapping,
+    ) or not isinstance(privileged_proof, Mapping):
         raise RuntimeError("teacher-flow branch proof missing")
     if matched_proof.get("privileged_clean_current") is not False:
         raise RuntimeError("matched Teacher branch is marked privileged")
     if matched_proof.get("same_information_as_mcp") is not True:
         raise RuntimeError("matched Teacher branch information flag mismatch")
-    if clean_proof.get("privileged_clean_current") is not True:
+    if predicted_proof.get("inference_information_available") is not True:
+        raise RuntimeError("predicted-current availability flag mismatch")
+    if predicted_proof.get("predicted_current_uses_gt_current") is not False:
+        raise RuntimeError("predicted-current used GT current")
+    if predicted_proof.get("predicted_current_uses_gt_future") is not False:
+        raise RuntimeError("predicted-current used GT future")
+    if predicted_proof.get("current_x0_hat_detached") is not True:
+        raise RuntimeError("predicted-current x0_hat detach proof missing")
+    if predicted_proof.get("teacher_frozen") is not True:
+        raise RuntimeError("predicted-current Teacher frozen proof missing")
+    if predicted_proof.get("student_frozen") is not True:
+        raise RuntimeError("predicted-current Student frozen proof missing")
+    if predicted_proof.get("optimizer_step_executed") is not False:
+        raise RuntimeError("predicted-current optimizer step proof mismatch")
+    if privileged_proof.get("privileged_clean_current") is not True:
         raise RuntimeError("clean-current Teacher branch privilege flag missing")
-    if clean_proof.get("same_information_as_mcp") is not False:
+    if privileged_proof.get("same_information_as_mcp") is not False:
         raise RuntimeError("clean-current Teacher branch information flag mismatch")
+    if privileged_proof.get("inference_information_available") is not False:
+        raise RuntimeError("privileged-current availability flag mismatch")
     proof = record.get("same_state_sigma_proof")
     if not isinstance(proof, Mapping) or proof.get("all_future_states_exact") is not True:
         raise RuntimeError("teacher-flow same future state proof missing")
     if proof.get("raw_timestep_directly_used_for_teacher") is not False:
         raise RuntimeError("teacher-flow Teacher used raw timestep directly")
+    if proof.get("same_future_tensor_as_other_branches") is not True:
+        raise RuntimeError("predicted-current future tensor proof missing")
 
 
 def _validate_teacher_runtime(runtime: deployment.DeploymentRuntime) -> None:
@@ -2236,6 +3266,20 @@ def _validate_teacher_runtime(runtime: deployment.DeploymentRuntime) -> None:
         raise RuntimeError("Teacher runtime must be Main-only")
     if int(runtime.context_noise) != 0:
         raise RuntimeError("Teacher audit requires clean-history context_noise=0")
+
+
+def _validate_student_current_runtime(runtime: deployment.DeploymentRuntime) -> None:
+    deployment._validate_runtime(runtime)
+    if int(runtime.context_noise) != 0:
+        raise RuntimeError("predicted-current Student requires context_noise=0")
+    if getattr(runtime.generator, "training", False):
+        raise RuntimeError("predicted-current Student must be eval")
+    if not _parameters_are_frozen(runtime.generator):
+        raise RuntimeError("predicted-current Student parameters must be frozen")
+
+
+def _parameters_are_frozen(generator: Any) -> bool:
+    return all(not parameter.requires_grad for parameter in generator.parameters())
 
 
 def _validate_identity_selection(selection: Any) -> None:
@@ -2504,8 +3548,12 @@ __all__ = [
     "HISTORY_CHUNK_INDEX",
     "INCONCLUSIVE",
     "MATCHED_TEACHER_TIMESTEP_DEPENDENCE",
+    "NO_SUPPORT",
     "NO_PRIVILEGED_CURRENT_SUPPORT",
+    "PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN",
     "STUDENT_MCP_BRANCH",
+    "STUDENT_PREDICTED_CURRENT_BRANCH",
+    "STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT",
     "STRONG_PRIVILEGED_CURRENT_SUPPORT",
     "TEACHER_CLEAN_CURRENT_BRANCH",
     "TEACHER_FLOW_AUDIT_NOISE_REALIZATIONS_PER_RAW",
@@ -2517,7 +3565,9 @@ __all__ = [
     "TEACHER_MATCHED_CURRENT_BRANCH",
     "TEACHER_MATCHED_STRONGLY_BETTER",
     "TEACHER_NOT_BETTER",
+    "TEACHER_PREDICTED_CURRENT_BRANCH",
     "TEACHER_PRIVILEGED_ONLY_BETTER",
+    "TEACHER_PRIVILEGED_CURRENT_BRANCH",
     "FlowPrediction",
     "TeacherFlowAuditResult",
     "TeacherFlowAuditState",
@@ -2528,16 +3578,24 @@ __all__ = [
     "build_teacher_flow_audit_states",
     "build_teacher_flow_state_records",
     "diagnostic_label_from_metrics",
+    "exact_current_flow_conversion_oracle",
     "load_teacher_flow_student_checkpoint_record",
     "matched_teacher_timestep_diagnostic",
     "manual_flow_to_x0",
+    "parameter_sha256_report",
     "paired_teacher_flow_statistics",
+    "predicted_current_bridge_label",
+    "predicted_current_bridge_statistics",
     "privileged_current_generalization_label",
+    "reconstruct_x0_from_flow_matching",
+    "require_no_parameter_mutation",
     "run_student_mcp_full_sequence_predictions",
+    "run_student_predicted_current_predictions",
     "run_teacher_branch_predictions",
     "run_teacher_flow_audit",
     "select_validation32_identities",
     "select_validation_zero_identity",
+    "validate_frozen_student_model",
     "validate_frozen_teacher_model",
     "validate_multi_identity_student_checkpoint_contract",
     "validate_teacher_flow_artifact_identity_selection",

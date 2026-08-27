@@ -76,6 +76,7 @@ NO_SUPPORT = "NO_SUPPORT"
 MATCHED_TEACHER_TIMESTEP_DEPENDENCE = "MATCHED_TEACHER_TIMESTEP_DEPENDENCE"
 INCONCLUSIVE = "INCONCLUSIVE"
 PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN = 0.05
+PREDICTED_CURRENT_THRESHOLD_ATOL = 1.0e-12
 CURRENT_X0_ORACLE_ATOL = 2.0e-2
 CURRENT_X0_ORACLE_RTOL = 1.0e-2
 
@@ -1456,7 +1457,9 @@ def predicted_current_bridge_statistics(
         1 for value in raw_values if value["predicted_clearly_worse_than_matched"]
     )
     raw_not_worse = sum(
-        1 for value in raw_values if value["predicted_flow_mse"] <= value["matched_flow_mse"]
+        1
+        for value in raw_values
+        if _passes_max(value["predicted_flow_mse"], value["matched_flow_mse"])
     )
     return {
         "policy": _predicted_current_bridge_policy(),
@@ -1487,22 +1490,44 @@ def predicted_current_bridge_label(
     identity_win_rate = float(
         bridge_statistics["identity_predicted_better_than_matched_win_rate"]
     )
+    identity_win_count = int(
+        bridge_statistics["identity_predicted_better_than_matched_win_count"]
+    )
     raw_not_worse_count = int(bridge_statistics["raw_predicted_not_worse_count"])
     raw_clearly_worse_count = int(
         bridge_statistics["raw_predicted_clearly_worse_than_matched_count"]
     )
     if (
-        flow_improvement >= float(policy["strong"]["all_state_flow_reduction_min"])
-        and identity_win_rate >= float(policy["strong"]["identity_win_rate_min"])
+        _passes_min(
+            flow_improvement,
+            float(policy["strong"]["all_state_flow_reduction_min"]),
+        )
+        and _passes_min(
+            identity_win_rate,
+            float(policy["strong"]["identity_win_rate_min"]),
+        )
+        and identity_win_count >= int(policy["strong"]["identity_win_count_min"])
         and raw_not_worse_count == len(TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
         and gap_recovery is not None
-        and float(gap_recovery) >= float(policy["strong"]["gap_recovery_ratio_min"])
-        and x0_improvement >= float(policy["strong"]["future_x0_reduction_min"])
+        and _passes_min(
+            float(gap_recovery),
+            float(policy["strong"]["gap_recovery_ratio_min"]),
+        )
+        and _passes_min(
+            x0_improvement,
+            float(policy["strong"]["future_x0_reduction_min"]),
+        )
     ):
         return STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT
     if (
-        flow_improvement < float(policy["no_support"]["all_state_flow_reduction_lt"])
-        or identity_win_rate < float(policy["no_support"]["identity_win_rate_lt"])
+        _below_min(
+            flow_improvement,
+            float(policy["no_support"]["all_state_flow_reduction_lt"]),
+        )
+        or _below_min(
+            identity_win_rate,
+            float(policy["no_support"]["identity_win_rate_lt"]),
+        )
         or raw_clearly_worse_count
         >= int(policy["no_support"]["raw_clearly_worse_count_gte"])
     ):
@@ -2698,8 +2723,10 @@ def _bridge_group_metrics(aggregate: Mapping[str, Any]) -> dict[str, Any]:
         "gap_recovery_ratio": gap_recovery,
         "predicted_better_than_matched": predicted_flow < matched_flow,
         "predicted_clearly_worse_than_matched": (
-            _relative_increase(matched_flow, predicted_flow)
-            >= PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN
+            _passes_min(
+                _relative_increase(matched_flow, predicted_flow),
+                PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN,
+            )
         ),
     }
 
@@ -2747,8 +2774,10 @@ def _paired_values(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "matched_flow_win": matched_flow < mcp_flow,
         "predicted_better_than_matched": predicted_flow < matched_flow,
         "predicted_clearly_worse_than_matched": (
-            _relative_increase(matched_flow, predicted_flow)
-            >= PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN
+            _passes_min(
+                _relative_increase(matched_flow, predicted_flow),
+                PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN,
+            )
         ),
     }
 
@@ -2828,6 +2857,33 @@ def _relative_reduction(baseline: float, candidate: float) -> float:
     if baseline_value <= 0.0:
         return 0.0
     return float((baseline_value - float(candidate)) / baseline_value)
+
+
+def _passes_min(
+    value: float,
+    threshold: float,
+    *,
+    atol: float = PREDICTED_CURRENT_THRESHOLD_ATOL,
+) -> bool:
+    return float(value) + float(atol) >= float(threshold)
+
+
+def _passes_max(
+    value: float,
+    threshold: float,
+    *,
+    atol: float = PREDICTED_CURRENT_THRESHOLD_ATOL,
+) -> bool:
+    return float(value) <= float(threshold) + float(atol)
+
+
+def _below_min(
+    value: float,
+    threshold: float,
+    *,
+    atol: float = PREDICTED_CURRENT_THRESHOLD_ATOL,
+) -> bool:
+    return float(value) < float(threshold) - float(atol)
 
 
 def _relative_increase(baseline: float, candidate: float) -> float:
@@ -2981,6 +3037,7 @@ def _predicted_current_bridge_policy() -> dict[str, Any]:
     return {
         "primary_hypothesis": "PREDICTED_CURRENT_BRIDGES_PRIVILEGED_CURRENT_GAP",
         "scope": "diagnostic current bridge only; not a deployment proof",
+        "threshold_comparison_atol": PREDICTED_CURRENT_THRESHOLD_ATOL,
         "strong": {
             "label": STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT,
             "all_state_flow_reduction_min": 0.15,
@@ -3551,6 +3608,7 @@ __all__ = [
     "NO_SUPPORT",
     "NO_PRIVILEGED_CURRENT_SUPPORT",
     "PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN",
+    "PREDICTED_CURRENT_THRESHOLD_ATOL",
     "STUDENT_MCP_BRANCH",
     "STUDENT_PREDICTED_CURRENT_BRANCH",
     "STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT",

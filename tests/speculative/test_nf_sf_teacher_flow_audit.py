@@ -942,8 +942,24 @@ def test_multi_paired_stats_win_rate_and_reductions() -> None:
     ] == 32
 
 
+def test_multi_fixture_builds_full_validation32_raw_plan() -> None:
+    records = make_multi_records(matched_flow=1.0, predicted_flow=0.70)
+    assert len(records) == 128
+    assert len({record["sample_identity"] for record in records}) == 32
+    assert {
+        raw: sum(1 for record in records if int(record["raw_timestep"]) == raw)
+        for raw in audit.TEACHER_FLOW_AUDIT_RAW_TIMESTEPS
+    } == {999: 32, 750: 32, 500: 32, 250: 32}
+    assert all(
+        record["metrics"]["teacher_predicted_flow_vs_exact_mse"]
+        < record["metrics"]["teacher_matched_flow_vs_exact_mse"]
+        for record in records
+    )
+
+
 def test_predicted_current_bridge_primary_thresholds() -> None:
     policy = audit._predicted_current_bridge_policy()
+    assert policy["threshold_comparison_atol"] == pytest.approx(1.0e-12)
     assert policy["strong"]["all_state_flow_reduction_min"] == pytest.approx(0.15)
     assert policy["strong"]["identity_win_rate_min"] == pytest.approx(0.75)
     assert policy["strong"]["identity_win_count_min"] == 24
@@ -1007,6 +1023,83 @@ def test_predicted_current_bridge_primary_thresholds() -> None:
     assert undefined_gap["predicted_current_bridge_statistics"]["all_states"][
         "gap_recovery_ratio"
     ] is None
+
+
+def test_predicted_current_bridge_exact_numeric_thresholds_are_strong() -> None:
+    manifest = make_multi_manifest(
+        make_multi_records(
+            matched_flow=1.0,
+            predicted_flow=0.85,
+            privileged_flow=0.5,
+            matched_x0=1.0,
+            predicted_x0=0.90,
+        )
+    )
+    assert manifest["primary_diagnostic_label"] == (
+        audit.STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT
+    )
+    bridge = manifest["predicted_current_bridge_statistics"]["all_states"]
+    assert bridge["predicted_vs_matched_flow_reduction"] == pytest.approx(0.15)
+    assert bridge["gap_recovery_ratio"] == pytest.approx(0.30)
+    assert bridge["predicted_vs_matched_x0_reduction"] == pytest.approx(0.10)
+
+
+def test_predicted_current_bridge_exact_identity_threshold_is_strong() -> None:
+    records = make_multi_records(
+        matched_flow=1.0,
+        predicted_flow=0.70,
+        privileged_flow=0.25,
+        matched_x0=1.0,
+        predicted_x0=0.80,
+    )
+    for record in records:
+        if int(record["identity_index"]) >= 24:
+            record["metrics"]["teacher_predicted_flow_vs_exact_mse"] = 1.0
+    manifest = make_multi_manifest(records)
+    stats = manifest["predicted_current_bridge_statistics"]
+    assert stats["identity_predicted_better_than_matched_win_count"] == 24
+    assert stats["identity_predicted_better_than_matched_win_rate"] == pytest.approx(
+        0.75
+    )
+    assert stats["raw_predicted_not_worse_count"] == 4
+    assert stats["all_states"]["gap_recovery_ratio"] == pytest.approx(0.30)
+    assert manifest["primary_diagnostic_label"] == (
+        audit.STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT
+    )
+
+
+def test_predicted_current_bridge_just_below_strong_threshold_is_not_strong() -> None:
+    manifest = make_multi_manifest(
+        make_multi_records(
+            matched_flow=1.0,
+            predicted_flow=0.85,
+            privileged_flow=0.5,
+            matched_x0=1.0,
+            predicted_x0=0.900000000002,
+        )
+    )
+    assert manifest["predicted_current_bridge_statistics"]["all_states"][
+        "predicted_vs_matched_x0_reduction"
+    ] < 0.10
+    assert manifest["primary_diagnostic_label"] == audit.INCONCLUSIVE
+
+
+def test_predicted_current_bridge_one_raw_worse_is_not_strong() -> None:
+    records = make_multi_records(
+        matched_flow=1.0,
+        predicted_flow=0.60,
+        privileged_flow=0.01,
+        matched_x0=1.0,
+        predicted_x0=0.80,
+    )
+    for record in records:
+        if int(record["raw_timestep"]) == 999:
+            record["metrics"]["teacher_predicted_flow_vs_exact_mse"] = 1.01
+    manifest = make_multi_manifest(records)
+    stats = manifest["predicted_current_bridge_statistics"]
+    assert stats["raw_predicted_not_worse_count"] == 3
+    assert stats["raw_predicted_clearly_worse_than_matched_count"] == 0
+    assert manifest["primary_diagnostic_label"] == audit.INCONCLUSIVE
 
 
 def test_privileged_current_diagnostic_thresholds_remain_unchanged() -> None:

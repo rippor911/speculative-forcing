@@ -55,8 +55,14 @@ TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32 = "multi_identity_validation32"
 PREDICTED_CURRENT_ORACLE_RECHECK_SCHEMA = (
     "nf_sf_predicted_current_oracle_recheck_v1"
 )
+PREDICTED_CURRENT_ORACLE_RECHECK_ALL_RAW_SCHEMA = (
+    "nf_sf_predicted_current_oracle_recheck_validation0_all_raw_v1"
+)
 PREDICTED_CURRENT_ORACLE_RECHECK_MODE = (
     "predicted_current_oracle_recheck_only"
+)
+PREDICTED_CURRENT_ORACLE_RECHECK_ALL_RAW_MODE = (
+    "predicted_current_oracle_recheck_validation0_all_raw"
 )
 PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP = 999
 PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX = 0
@@ -584,6 +590,40 @@ def build_predicted_current_oracle_recheck_state(
     if int(state.noise_index) != PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX:
         raise RuntimeError("predicted-current oracle recheck noise index mismatch")
     return state
+
+
+def build_predicted_current_oracle_recheck_validation0_all_raw_states(
+    *,
+    source_noise: torch.Tensor,
+    teacher_target: torch.Tensor,
+    main_scheduler: Any,
+    mcp_scheduler: Any,
+    noise_seed: int = memorization.DEFAULT_NOISE_SEED,
+    state_id_prefix: str | None = None,
+    sample_identity: str | None = None,
+    validation_position: int | None = None,
+    identity_index: int | None = None,
+) -> tuple[TeacherFlowAuditState, ...]:
+    states = build_teacher_flow_audit_states(
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        noise_seed=int(noise_seed),
+        raw_timesteps=TEACHER_FLOW_AUDIT_RAW_TIMESTEPS,
+        noise_realizations_per_raw=TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW,
+        state_id_prefix=state_id_prefix,
+        sample_identity=sample_identity,
+        validation_position=validation_position,
+        identity_index=identity_index,
+    )
+    actual_plan = tuple(
+        (int(state.raw_timestep), int(state.noise_index)) for state in states
+    )
+    expected_plan = tuple((int(raw), 0) for raw in TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
+    if actual_plan != expected_plan:
+        raise RuntimeError("validation0 all-raw recheck state plan mismatch")
+    return states
 
 
 def _build_teacher_flow_audit_state(
@@ -1297,6 +1337,41 @@ def reconstruct_x0_from_flow_matching(
     return value
 
 
+def _explicit_x0_like_scheduler_step_arithmetic(
+    scheduler: Any,
+    *,
+    state: torch.Tensor,
+    flow: torch.Tensor,
+    timestep: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if tuple(state.shape) != tuple(flow.shape):
+        raise RuntimeError(f"{name} flow/state shape mismatch")
+    _require_finite_tensor(state, name=f"{name}_state")
+    _require_finite_tensor(flow, name=f"{name}_flow")
+    _require_finite_tensor(timestep, name=f"{name}_timestep")
+    original_shape = state.shape
+    state_flat = state.flatten(0, 1)
+    flow_flat = flow.flatten(0, 1)
+    timestep_flat = timestep.flatten(0, 1) if timestep.ndim == 2 else timestep
+    sigmas = scheduler.sigmas.to(flow.device)
+    timesteps = scheduler.timesteps.to(flow.device)
+    timestep_id = torch.argmin(
+        (timesteps.unsqueeze(0) - timestep_flat.unsqueeze(1)).abs(),
+        dim=1,
+    )
+    sigma = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+    sigma_final = 1 if (
+        bool(getattr(scheduler, "inverse_timesteps", False))
+        or bool(getattr(scheduler, "reverse_sigmas", False))
+    ) else 0
+    value = state_flat + flow_flat * (sigma_final - sigma)
+    value = value.unflatten(0, original_shape[:2])
+    value = value.to(device=state.device, dtype=state.dtype)
+    _require_finite_tensor(value, name=name)
+    return value
+
+
 def exact_current_flow_conversion_oracle(
     main_scheduler: Any,
     *,
@@ -1398,6 +1473,13 @@ def _exact_current_flow_oracle_diagnostic(
         timestep=timestep,
         name="teacher_flow_exact_current_x0_oracle",
     )
+    recon_same_dtype_explicit = _explicit_x0_like_scheduler_step_arithmetic(
+        scheduler,
+        state=audit_state.current_state,
+        flow=exact_flow_sched,
+        timestep=timestep,
+        name="teacher_flow_exact_current_same_dtype_formula",
+    )
     recon_formula_actual = audit_state.current_state.float() - (
         float(scheduler_sigma) * exact_flow_sched.float()
     )
@@ -1439,7 +1521,19 @@ def _exact_current_flow_oracle_diagnostic(
         timestep=timestep32,
         name="teacher_flow_current_x0_float32_reference",
     )
+    scheduler_sigma32 = flow_audit._resolved_sigma(
+        scheduler,
+        timestep32,
+        clean32,
+    )
+    recon32_explicit = state32.float() - (
+        float(scheduler_sigma32) * flow32.float()
+    )
     recon_sched_vs_clean = _tensor_error_stats(recon_sched, clean_current)
+    recon_same_dtype_explicit_vs_clean = _tensor_error_stats(
+        recon_same_dtype_explicit,
+        clean_current,
+    )
     recon_formula_actual_vs_clean = _tensor_error_stats(
         recon_formula_actual,
         clean_current,
@@ -1460,6 +1554,12 @@ def _exact_current_flow_oracle_diagnostic(
         recon_sched,
         recon_formula_actual,
     )
+    recon_sched_vs_same_dtype_explicit = _tensor_error_stats(
+        recon_sched,
+        recon_same_dtype_explicit,
+    )
+    recon32_explicit_vs_clean32 = _tensor_error_stats(recon32_explicit, clean32)
+    recon32_scheduler_vs_explicit = _tensor_error_stats(recon32, recon32_explicit)
     return {
         "schema": "teacher_flow_exact_current_oracle_diagnostic_v1",
         "identity": audit_state.provenance.get("sample_identity"),
@@ -1502,6 +1602,18 @@ def _exact_current_flow_oracle_diagnostic(
                 "main_scheduler.step(exact_current_flow, main_timestep, "
                 "current_noisy_state, to_final=True)"
             ),
+            "explicit_same_dtype_reference": (
+                "manual FlowMatchScheduler.step arithmetic with the same "
+                "state/flow/sigma dtype conversion and final state dtype cast"
+            ),
+            "explicit_float32_reference": (
+                "current_noisy_state.float() - sigma * exact_current_flow.float()"
+            ),
+        },
+        "tensor_records": {
+            "current_noise": _tensor_record(audit_state.current_noise),
+            "current_state": _tensor_record(audit_state.current_state),
+            "regenerated_state": _tensor_record(regenerated_state),
         },
         "tensor_dtypes_devices": {
             "clean": _tensor_meta(clean_current),
@@ -1509,22 +1621,52 @@ def _exact_current_flow_oracle_diagnostic(
             "state": _tensor_meta(audit_state.current_state),
             "exact_flow": _tensor_meta(exact_flow_sched),
             "reconstructed": _tensor_meta(recon_sched),
+            "same_dtype_explicit": _tensor_meta(recon_same_dtype_explicit),
+            "float32_explicit": _tensor_meta(recon_formula_actual),
             "regenerated_state": _tensor_meta(regenerated_state),
             "float32_clean": _tensor_meta(clean32),
             "float32_state": _tensor_meta(state32),
             "float32_flow": _tensor_meta(flow32),
             "float32_reconstructed": _tensor_meta(recon32),
+            "float32_explicit_reference": _tensor_meta(recon32_explicit),
         },
         "noisy_state_vs_regenerated": noisy_state_vs_regenerated,
         "recon_sched_vs_clean": recon_sched_vs_clean,
+        "recon_same_dtype_explicit_vs_clean": recon_same_dtype_explicit_vs_clean,
         "recon_formula_actual_vs_clean": recon_formula_actual_vs_clean,
         "recon_regenerated_vs_clean": recon_regenerated_vs_clean,
+        "recon_sched_vs_same_dtype_explicit": recon_sched_vs_same_dtype_explicit,
         "recon_sched_vs_formula_actual": recon_sched_vs_formula_actual,
+        "recon_sched_vs_float32_explicit": recon_sched_vs_formula_actual,
+        "explicit_same_dtype_reference": {
+            "source": (
+                "manual FlowMatchScheduler.step arithmetic, preserving scheduler "
+                "sigma lookup and final cast to current state dtype"
+            ),
+            "state_dtype": str(audit_state.current_state.dtype),
+            "flow_dtype": str(exact_flow_sched.dtype),
+            "sigma_tensor_dtype": str(scheduler.sigmas.dtype),
+            "result_dtype": str(recon_same_dtype_explicit.dtype),
+            "recon_vs_clean": recon_same_dtype_explicit_vs_clean,
+            "scheduler_vs_explicit": recon_sched_vs_same_dtype_explicit,
+        },
+        "float32_explicit_reference": {
+            "state32_source": "current_noisy_state.float()",
+            "flow32_source": "exact_current_flow.float()",
+            "sigma": float(scheduler_sigma),
+            "recon32_formula_source": "state.float() - sigma * flow.float()",
+            "recon32_formula_vs_clean": recon_formula_actual_vs_clean,
+            "scheduler_vs_explicit": recon_sched_vs_formula_actual,
+        },
         "float32_reference": {
             "state32_source": "scheduler.add_noise(clean32, noise32, timestep)",
             "flow32_source": "scheduler.training_target(clean32, noise32, timestep)",
             "recon32_source": "scheduler.step(flow32, timestep, state32, to_final=True)",
             "recon32_vs_clean32": recon32_vs_clean32,
+            "recon32_explicit_source": "state32 - sigma32 * flow32",
+            "recon32_explicit_vs_clean32": recon32_explicit_vs_clean32,
+            "recon32_scheduler_vs_explicit": recon32_scheduler_vs_explicit,
+            "resolved_sigma32": float(scheduler_sigma32),
             "passes_existing_oracle_tolerance": bool(
                 torch.allclose(
                     recon32.float(),
@@ -1537,6 +1679,7 @@ def _exact_current_flow_oracle_diagnostic(
         "tensors": {
             "exact_current_flow": exact_flow_sched,
             "reconstructed": recon_sched,
+            "recon_same_dtype_explicit": recon_same_dtype_explicit,
             "recon_formula_actual": recon_formula_actual,
         },
     }
@@ -1594,7 +1737,7 @@ def _classify_current_oracle_failure(diagnostic: Mapping[str, Any]) -> str:
     if diagnostic["noisy_state_vs_regenerated"]["torch_equal"] is not True:
         return "state_noise_timestep_provenance_bug"
     sched_formula_error = float(
-        diagnostic["recon_sched_vs_formula_actual"]["max_abs"]
+        diagnostic["recon_sched_vs_same_dtype_explicit"]["max_abs"]
     )
     if sched_formula_error > CURRENT_X0_ORACLE_ATOL:
         return "scheduler_identity_or_timestep_lookup_bug"
@@ -1707,17 +1850,48 @@ def build_predicted_current_oracle_recheck_artifact(
             keys=("mse", "max_abs", "mean_abs", "p99_abs"),
         ),
         "bf16_explicit_formula_reconstruction": _stats_subset(
-            diagnostic["recon_formula_actual_vs_clean"],
+            diagnostic["recon_same_dtype_explicit_vs_clean"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "bf16_explicit_same_dtype": _stats_subset(
+            diagnostic["recon_same_dtype_explicit_vs_clean"],
             keys=("mse", "max_abs", "mean_abs", "p99_abs"),
         ),
         "scheduler_vs_explicit": _stats_subset(
-            diagnostic["recon_sched_vs_formula_actual"],
+            diagnostic["recon_sched_vs_same_dtype_explicit"],
             keys=("mse", "max_abs", "mean_abs"),
+        ),
+        "scheduler_vs_same_dtype_explicit": _stats_subset(
+            diagnostic["recon_sched_vs_same_dtype_explicit"],
+            keys=("mse", "max_abs", "mean_abs"),
+        ),
+        "scheduler_vs_float32_explicit": _stats_subset(
+            diagnostic["recon_sched_vs_float32_explicit"],
+            keys=("mse", "max_abs", "mean_abs"),
+        ),
+        "float32_explicit_reference": _stats_subset(
+            diagnostic["float32_explicit_reference"][
+                "recon32_formula_vs_clean"
+            ],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
         ),
         "float32_reference": _stats_subset(
             diagnostic["float32_reference"]["recon32_vs_clean32"],
             keys=("mse", "max_abs", "mean_abs", "p99_abs"),
         ),
+        "precision_diagnostic": {
+            "scheduler_step_result": diagnostic["tensor_dtypes_devices"][
+                "reconstructed"
+            ],
+            "same_dtype_explicit_result": diagnostic["tensor_dtypes_devices"][
+                "same_dtype_explicit"
+            ],
+            "float32_explicit_result": diagnostic["tensor_dtypes_devices"][
+                "float32_explicit"
+            ],
+            "semantic_scheduler_gate": "scheduler_vs_same_dtype_explicit",
+            "float32_explicit_is_diagnostic_only": True,
+        },
         "oracle_atol": float(CURRENT_X0_ORACLE_ATOL),
         "oracle_rtol": float(CURRENT_X0_ORACLE_RTOL),
         "original_bf16_oracle_pass": bool(original_bf16_oracle_pass),
@@ -1767,6 +1941,190 @@ def build_predicted_current_oracle_recheck_artifact(
     }
 
 
+def build_predicted_current_oracle_recheck_state_record(
+    *,
+    diagnostic: Mapping[str, Any],
+    original_bf16_oracle_pass: bool,
+) -> dict[str, Any]:
+    classification = classify_predicted_current_oracle_recheck(
+        diagnostic,
+        original_bf16_oracle_pass=bool(original_bf16_oracle_pass),
+    )
+    tensor_records = diagnostic["tensor_records"]
+    return {
+        "state_id": str(diagnostic.get("state_id", "")),
+        "identity_index": diagnostic.get("identity_index"),
+        "validation_position": diagnostic.get("validation_position"),
+        "raw_timestep": int(diagnostic["raw_timestep"]),
+        "noise_index": int(diagnostic["noise_index"]),
+        "warped_timestep": float(diagnostic["warped_current_timestep"]),
+        "sigma": float(diagnostic["state_main_sigma"]),
+        "current_noise_sha256": str(tensor_records["current_noise"]["sha256"]),
+        "current_state_sha256": str(tensor_records["current_state"]["sha256"]),
+        "regenerated_state_sha256": str(
+            tensor_records["regenerated_state"]["sha256"]
+        ),
+        "state_vs_regenerated": _stats_subset(
+            diagnostic["noisy_state_vs_regenerated"],
+            keys=("torch_equal", "mse", "max_abs", "mean_abs"),
+        ),
+        "original_bf16_oracle_pass": bool(original_bf16_oracle_pass),
+        "bf16_scheduler_reconstruction": _stats_subset(
+            diagnostic["recon_sched_vs_clean"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "bf16_explicit_same_dtype": _stats_subset(
+            diagnostic["recon_same_dtype_explicit_vs_clean"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "bf16_or_same_dtype_scheduler_difference": _stats_subset(
+            diagnostic["recon_sched_vs_same_dtype_explicit"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "float32_explicit_reference": _stats_subset(
+            diagnostic["float32_explicit_reference"][
+                "recon32_formula_vs_clean"
+            ],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "scheduler_vs_float32_explicit": _stats_subset(
+            diagnostic["recon_sched_vs_float32_explicit"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "diagnostic_classification": classification,
+    }
+
+
+def build_predicted_current_oracle_recheck_validation0_all_raw_artifact(
+    *,
+    state_records: Sequence[Mapping[str, Any]],
+    runtime_git_sha: str,
+    sample_identity: str,
+    identity_index: int,
+    validation_position: int,
+    student_parameters_before: Mapping[str, Any],
+    student_parameters_after: Mapping[str, Any],
+    teacher_parameters_before: Mapping[str, Any],
+    teacher_parameters_after: Mapping[str, Any],
+    rng_before: str,
+    rng_after: str,
+    common_inputs_fingerprint_sha256: str | None = None,
+    artifact_identity: Mapping[str, Any] | None = None,
+    student_checkpoint_contract: Mapping[str, Any] | None = None,
+    checkpoint_summary: Mapping[str, Any] | None = None,
+    student_summary: Mapping[str, Any] | None = None,
+    teacher_summary: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    records = [dict(record) for record in state_records]
+    plan = tuple(
+        (int(record["raw_timestep"]), int(record["noise_index"]))
+        for record in records
+    )
+    expected_plan = tuple((int(raw), 0) for raw in TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
+    if plan != expected_plan:
+        raise RuntimeError("validation0 all-raw artifact state plan mismatch")
+
+    classifications = [str(record["diagnostic_classification"]) for record in records]
+    if any(value == SCHEDULER_MISMATCH for value in classifications):
+        classification = SCHEDULER_MISMATCH
+    elif any(value == STATE_PROVENANCE_MISMATCH for value in classifications):
+        classification = STATE_PROVENANCE_MISMATCH
+    elif any(value == SEMANTIC_MISMATCH for value in classifications):
+        classification = SEMANTIC_MISMATCH
+    elif any(value == BF16_QUANTIZED_STATE_CONTRACT for value in classifications):
+        classification = BF16_QUANTIZED_STATE_CONTRACT
+    else:
+        classification = EXACT_PASS
+
+    student_comparison = compare_parameter_sha256_reports(
+        student_parameters_before,
+        student_parameters_after,
+    )
+    teacher_comparison = compare_parameter_sha256_reports(
+        teacher_parameters_before,
+        teacher_parameters_after,
+    )
+    rng_unchanged = str(rng_before) == str(rng_after)
+    safety_pass = (
+        student_comparison["all_sha256_exact_match"] is True
+        and teacher_comparison["all_sha256_exact_match"] is True
+        and rng_unchanged
+    )
+    diagnostic_pass = classification in (EXACT_PASS, BF16_QUANTIZED_STATE_CONTRACT)
+    status = "PASS" if diagnostic_pass and safety_pass else "FAIL"
+    return {
+        "schema": PREDICTED_CURRENT_ORACLE_RECHECK_ALL_RAW_SCHEMA,
+        "status": status,
+        "mode": PREDICTED_CURRENT_ORACLE_RECHECK_ALL_RAW_MODE,
+        "diagnostic_classification": classification,
+        "runtime_git_sha": str(runtime_git_sha),
+        "identity_index": int(identity_index),
+        "validation_position": int(validation_position),
+        "noise_index": PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX,
+        "sample_identity": str(sample_identity),
+        "state_count": len(records),
+        "raw_timesteps": [int(raw) for raw in TEACHER_FLOW_AUDIT_RAW_TIMESTEPS],
+        "formal_identity0_state_order": [
+            {
+                "state_index": index,
+                "raw_timestep": int(record["raw_timestep"]),
+                "noise_index": int(record["noise_index"]),
+                "state_id": str(record["state_id"]),
+            }
+            for index, record in enumerate(records)
+        ],
+        "states": records,
+        "all_original_bf16_oracle_pass": all(
+            bool(record["original_bf16_oracle_pass"]) for record in records
+        ),
+        "oracle_atol": float(CURRENT_X0_ORACLE_ATOL),
+        "oracle_rtol": float(CURRENT_X0_ORACLE_RTOL),
+        "student_parameter_sha_before": str(
+            student_parameters_before["fingerprint_sha256"]
+        ),
+        "student_parameter_sha_after": str(
+            student_parameters_after["fingerprint_sha256"]
+        ),
+        "student_parameters_unchanged": bool(
+            student_comparison["all_sha256_exact_match"]
+        ),
+        "student_parameter_comparison": student_comparison,
+        "teacher_parameter_sha_before": str(
+            teacher_parameters_before["fingerprint_sha256"]
+        ),
+        "teacher_parameter_sha_after": str(
+            teacher_parameters_after["fingerprint_sha256"]
+        ),
+        "teacher_parameters_unchanged": bool(
+            teacher_comparison["all_sha256_exact_match"]
+        ),
+        "teacher_parameter_comparison": teacher_comparison,
+        "rng_before": str(rng_before),
+        "rng_after": str(rng_after),
+        "rng_unchanged": bool(rng_unchanged),
+        "backward_executed": False,
+        "optimizer_step_executed": False,
+        "checkpoint_written": False,
+        "common_inputs_fingerprint_sha256": common_inputs_fingerprint_sha256,
+        "artifact_identity": (
+            None if artifact_identity is None else dict(artifact_identity)
+        ),
+        "student_checkpoint_contract": (
+            None
+            if student_checkpoint_contract is None
+            else dict(student_checkpoint_contract)
+        ),
+        "checkpoint": None if checkpoint_summary is None else dict(checkpoint_summary),
+        "student": None if student_summary is None else dict(student_summary),
+        "teacher": None if teacher_summary is None else dict(teacher_summary),
+        "exit_code_contract": (
+            "rc=0 only when all four state classifications are exact_pass or "
+            "bf16_quantized_state_contract and parameter/RNG safety checks pass; "
+            "any scheduler/state/semantic mismatch or safety failure rc=1"
+        ),
+    }
+
+
 def _stats_subset(
     stats: Mapping[str, Any],
     *,
@@ -1811,7 +2169,7 @@ def _recheck_state_provenance_contract_ok(diagnostic: Mapping[str, Any]) -> bool
 
 def _recheck_scheduler_explicit_contract_ok(diagnostic: Mapping[str, Any]) -> bool:
     return _max_abs_leq(
-        diagnostic["recon_sched_vs_formula_actual"],
+        diagnostic["recon_sched_vs_same_dtype_explicit"],
         PREDICTED_CURRENT_ORACLE_RECHECK_SCHEDULER_ATOL,
     )
 
@@ -1837,7 +2195,7 @@ def _recheck_actual_bf16_reconstruction_only_failed(
         CURRENT_X0_ORACLE_ATOL,
     )
     formula_failed = not _max_abs_leq(
-        diagnostic["recon_formula_actual_vs_clean"],
+        diagnostic["recon_same_dtype_explicit_vs_clean"],
         CURRENT_X0_ORACLE_ATOL,
     )
     return scheduler_failed or formula_failed
@@ -4257,7 +4615,10 @@ __all__ = [
     "TeacherFlowAuditState",
     "aggregate_teacher_flow_metrics",
     "build_predicted_current_oracle_recheck_artifact",
+    "build_predicted_current_oracle_recheck_state_record",
     "build_predicted_current_oracle_recheck_state",
+    "build_predicted_current_oracle_recheck_validation0_all_raw_artifact",
+    "build_predicted_current_oracle_recheck_validation0_all_raw_states",
     "build_flow_match_scheduler",
     "build_teacher_flow_multi_identity_manifest",
     "build_teacher_flow_audit_result",

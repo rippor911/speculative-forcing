@@ -31,6 +31,9 @@ class FullSequenceNFSFModelOutputs:
     anchor_token_slices: tuple[tuple[int, int], ...]
     future_embedding_order: str = FULL_SEQUENCE_FUTURE_EMBEDDING_ORDER
     main_backbone_forward_count: int = 1
+    paper_exact_reproduction: bool = False
+    paper_fidelity_mcp1_mask: bool = False
+    mcp_path_kind: str = "canonical_target_only"
 
 
 def drop_mcp_weights(state_dict: dict) -> dict:
@@ -328,6 +331,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         mcp_anchor_inputs=(),
         aug_t: Optional[torch.Tensor] = None,
         direct_clean_context_kv: bool = False,
+        paper_fidelity_mcp1_mask: bool = False,
     ) -> FullSequenceNFSFModelOutputs:
         """Training-only full-sequence Next-Forcing route.
 
@@ -353,6 +357,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         run_mcp = bool(anchors)
         if direct_clean_context_kv and not run_mcp:
             raise ValueError("direct_clean_context_kv requires MCP anchor inputs")
+        if paper_fidelity_mcp1_mask and not run_mcp:
+            raise ValueError("paper_fidelity_mcp1_mask requires MCP anchor inputs")
+        if direct_clean_context_kv and paper_fidelity_mcp1_mask:
+            raise ValueError("direct_clean_context_kv and paper_fidelity_mcp1_mask are mutually exclusive")
         if run_mcp:
             if self.mcp is None:
                 raise ValueError("MCP anchor inputs require add_mcp_modules()")
@@ -383,7 +391,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 "return_features": self.mcp_tap_layers,
                 "mcp_patch_inputs": mcp_patch_inputs,
             }
-            if direct_clean_context_kv:
+            if direct_clean_context_kv or paper_fidelity_mcp1_mask:
                 model_kwargs["return_feature_halves"] = True
 
         out = self.model(
@@ -404,6 +412,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     anchors=anchors,
                     flat_mcp_entries=flat_mcp_entries,
                     direct_clean_context_kv=direct_clean_context_kv,
+                    paper_fidelity_mcp1_mask=paper_fidelity_mcp1_mask,
                 )
             )
         else:
@@ -417,6 +426,17 @@ class WanDiffusionWrapper(torch.nn.Module):
             mcp_flow_preds_by_depth=mcp_flow_preds_by_depth,
             tap_shapes=tap_shapes,
             anchor_token_slices=anchor_slices,
+            paper_exact_reproduction=False,
+            paper_fidelity_mcp1_mask=bool(paper_fidelity_mcp1_mask),
+            mcp_path_kind=(
+                "paper_fidelity_clean_residual_mask"
+                if paper_fidelity_mcp1_mask
+                else (
+                    "direct_clean_static_kv"
+                    if direct_clean_context_kv
+                    else "canonical_target_only"
+                )
+            ),
         )
 
     def _flatten_full_sequence_mcp_anchor_inputs(self, anchors) -> tuple[dict, ...]:
@@ -459,12 +479,13 @@ class WanDiffusionWrapper(torch.nn.Module):
         anchors,
         flat_mcp_entries,
         direct_clean_context_kv: bool = False,
+        paper_fidelity_mcp1_mask: bool = False,
     ):
         features = tuple(aux["features"])
         if len(features) != len(self.mcp_tap_layers):
             raise ValueError("MCP feature tap count mismatch")
         clean_features = None
-        if direct_clean_context_kv:
+        if direct_clean_context_kv or paper_fidelity_mcp1_mask:
             clean_features = tuple(aux["clean_features"])
             if len(clean_features) != len(self.mcp_tap_layers):
                 raise ValueError("MCP clean feature tap count mismatch")
@@ -506,6 +527,25 @@ class WanDiffusionWrapper(torch.nn.Module):
                         anchor_index,
                     ),
                     "clean_context_start_frame": 0,
+                }
+            if paper_fidelity_mcp1_mask:
+                clean_stop = token_slice.start
+                clean_frame_count = int(anchor_index) * FULL_SEQUENCE_CHUNK_FRAMES
+                mcp_kwargs = {
+                    "paper_fidelity_mcp1_mask": True,
+                    "paper_fidelity_clean_prefix_features": tuple(
+                        feature[:, :clean_stop, :] for feature in clean_features
+                    ),
+                    "paper_fidelity_clean_prefix_grid_sizes": self._full_sequence_clean_prefix_grid_sizes(
+                        future_grids[0],
+                        clean_frame_count,
+                    ),
+                    "paper_fidelity_clean_prefix_start_frame": 0,
+                    "paper_fidelity_clean_prefix_timestep": torch.zeros(
+                        (timesteps[0].shape[0], clean_frame_count),
+                        device=timesteps[0].device,
+                        dtype=timesteps[0].dtype,
+                    ),
                 }
 
             flow_preds = self.mcp(
@@ -552,6 +592,17 @@ class WanDiffusionWrapper(torch.nn.Module):
             raise ValueError("clean context requires anchor_index > 0")
         grid_sizes = target_grid_sizes.clone()
         grid_sizes[:, 0] = int(anchor_index) * FULL_SEQUENCE_CHUNK_FRAMES
+        return grid_sizes
+
+    @staticmethod
+    def _full_sequence_clean_prefix_grid_sizes(
+        target_grid_sizes: torch.Tensor,
+        clean_frame_count: int,
+    ) -> torch.Tensor:
+        if int(clean_frame_count) < 0:
+            raise ValueError("clean_frame_count must be non-negative")
+        grid_sizes = target_grid_sizes.clone()
+        grid_sizes[:, 0] = int(clean_frame_count)
         return grid_sizes
 
     @classmethod

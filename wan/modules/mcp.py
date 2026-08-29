@@ -29,7 +29,12 @@ from wan.modules.model import (
     sinusoidal_embedding_1d,
 )
 
-__all__ = ["MCPStack", "mcp_unpatchify", "MCP_INPUT_TIMESTEP"]
+__all__ = [
+    "MCPStack",
+    "mcp_unpatchify",
+    "MCP_INPUT_TIMESTEP",
+    "paper_fidelity_mcp1_mask_allows",
+]
 
 # MCP always consumes the future chunk at sigma = 1 (pure noise).
 # FlowMatchScheduler builds timesteps = sigmas * num_train_timesteps with
@@ -40,6 +45,35 @@ __all__ = ["MCPStack", "mcp_unpatchify", "MCP_INPUT_TIMESTEP"]
 # scheduler's own `training_target` (utils/scheduler.py:179). No sigma lookup,
 # no division, no argmin snapping.
 MCP_INPUT_TIMESTEP = 1000
+
+
+def paper_fidelity_mcp1_mask_allows(
+    q_idx: int,
+    kv_idx: int,
+    *,
+    clean_token_count: int,
+    target_token_count: int,
+    chunk_tokens: int,
+) -> bool:
+    """Appendix-A clean/noisy block mask for one anchor-wise MCP1 sequence."""
+    q = int(q_idx)
+    kv = int(kv_idx)
+    clean_tokens = int(clean_token_count)
+    target_tokens = int(target_token_count)
+    chunk = int(chunk_tokens)
+    total = clean_tokens + target_tokens
+    if q < 0 or kv < 0 or q >= total or kv >= total:
+        return False
+    if chunk <= 0 or target_tokens <= 0:
+        raise ValueError("target_token_count and chunk_tokens must be positive")
+    if clean_tokens % chunk != 0 or target_tokens != chunk:
+        raise ValueError("paper-fidelity MCP1 expects chunk-aligned clean/target tokens")
+
+    if q < clean_tokens:
+        # Clean rows follow chunk-causal clean-only attention.
+        return kv < clean_tokens and (kv // chunk) <= (q // chunk)
+    # Target rows attend every clean-prefix token plus the same target chunk.
+    return kv < clean_tokens or clean_tokens <= kv < total
 
 
 def mcp_unpatchify(x, grid_sizes, patch_size, out_dim):
@@ -103,12 +137,31 @@ class MCPSelfAttention(nn.Module):
         clean_context=None,
         clean_context_grid_sizes=None,
         clean_context_start_frame=0,
+        paper_fidelity_mcp1_mask=False,
+        target_token_count=None,
+        target_grid_sizes=None,
+        target_start_frame=None,
+        clean_prefix_grid_sizes=None,
+        clean_prefix_start_frame=0,
     ):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
+
+        if paper_fidelity_mcp1_mask:
+            return self._forward_paper_fidelity_mcp1(
+                q,
+                k,
+                v,
+                freqs,
+                target_token_count=target_token_count,
+                target_grid_sizes=target_grid_sizes,
+                target_start_frame=target_start_frame,
+                clean_prefix_grid_sizes=clean_prefix_grid_sizes,
+                clean_prefix_start_frame=clean_prefix_start_frame,
+            )
 
         roped_q = causal_rope_apply(q, grid_sizes, freqs, start_frame=start_frame).type_as(v)
         roped_k = causal_rope_apply(k, grid_sizes, freqs, start_frame=start_frame).type_as(v)
@@ -132,6 +185,84 @@ class MCPSelfAttention(nn.Module):
 
         x = attention(roped_q, roped_k, v)
         return self.o(x.flatten(2))
+
+    def _forward_paper_fidelity_mcp1(
+        self,
+        q,
+        k,
+        v,
+        freqs,
+        *,
+        target_token_count,
+        target_grid_sizes,
+        target_start_frame,
+        clean_prefix_grid_sizes,
+        clean_prefix_start_frame,
+    ):
+        if target_token_count is None or target_grid_sizes is None:
+            raise ValueError("paper-fidelity MCP1 requires target token metadata")
+        if target_start_frame is None:
+            raise ValueError("paper-fidelity MCP1 requires target start-frame metadata")
+        if clean_prefix_grid_sizes is None:
+            raise ValueError("paper-fidelity MCP1 requires clean prefix grid metadata")
+        target_tokens = int(target_token_count)
+        clean_tokens = int(q.shape[1]) - target_tokens
+        if clean_tokens < 0:
+            raise ValueError("target_token_count exceeds sequence length")
+        if target_tokens <= 0:
+            raise ValueError("target_token_count must be positive")
+        if clean_tokens % target_tokens != 0:
+            raise ValueError("paper-fidelity MCP1 requires chunk-aligned clean prefix")
+
+        q_clean, q_target = q[:, :clean_tokens], q[:, clean_tokens:]
+        k_clean, k_target = k[:, :clean_tokens], k[:, clean_tokens:]
+        v_clean, v_target = v[:, :clean_tokens], v[:, clean_tokens:]
+
+        outputs = []
+        if clean_tokens > 0:
+            roped_q_clean = causal_rope_apply(
+                q_clean,
+                clean_prefix_grid_sizes,
+                freqs,
+                start_frame=clean_prefix_start_frame,
+            ).type_as(v)
+            roped_k_clean = causal_rope_apply(
+                k_clean,
+                clean_prefix_grid_sizes,
+                freqs,
+                start_frame=clean_prefix_start_frame,
+            ).type_as(v)
+            for clean_stop in range(target_tokens, clean_tokens + 1, target_tokens):
+                outputs.append(
+                    attention(
+                        roped_q_clean[:, clean_stop - target_tokens:clean_stop],
+                        roped_k_clean[:, :clean_stop],
+                        v_clean[:, :clean_stop],
+                    )
+                )
+        else:
+            roped_k_clean = None
+
+        roped_q_target = causal_rope_apply(
+            q_target,
+            target_grid_sizes,
+            freqs,
+            start_frame=int(target_start_frame),
+        ).type_as(v)
+        roped_k_target = causal_rope_apply(
+            k_target,
+            target_grid_sizes,
+            freqs,
+            start_frame=int(target_start_frame),
+        ).type_as(v)
+        if clean_tokens > 0:
+            target_k = torch.cat([roped_k_clean, roped_k_target], dim=1)
+            target_v = torch.cat([v_clean, v_target], dim=1)
+        else:
+            target_k = roped_k_target
+            target_v = v_target
+        outputs.append(attention(roped_q_target, target_k, target_v))
+        return self.o(torch.cat(outputs, dim=1).flatten(2))
 
 
 class MCPBlock(nn.Module):
@@ -184,6 +315,12 @@ class MCPBlock(nn.Module):
         clean_context=None,
         clean_context_grid_sizes=None,
         clean_context_start_frame=0,
+        paper_fidelity_mcp1_mask=False,
+        target_token_count=None,
+        target_grid_sizes=None,
+        target_start_frame=None,
+        clean_prefix_grid_sizes=None,
+        clean_prefix_start_frame=0,
     ):
         r"""
         Args:
@@ -205,6 +342,12 @@ class MCPBlock(nn.Module):
             clean_context=clean_attn_context,
             clean_context_grid_sizes=clean_context_grid_sizes,
             clean_context_start_frame=clean_context_start_frame,
+            paper_fidelity_mcp1_mask=paper_fidelity_mcp1_mask,
+            target_token_count=target_token_count,
+            target_grid_sizes=target_grid_sizes,
+            target_start_frame=target_start_frame,
+            clean_prefix_grid_sizes=clean_prefix_grid_sizes,
+            clean_prefix_start_frame=clean_prefix_start_frame,
         )
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
@@ -299,6 +442,11 @@ class MCPModule(nn.Module):
         clean_context=None,
         clean_context_grid_sizes=None,
         clean_context_start_frame=0,
+        paper_fidelity_mcp1_mask=False,
+        clean_prefix=None,
+        clean_prefix_grid_sizes=None,
+        clean_prefix_start_frame=0,
+        clean_prefix_timestep=None,
     ):
         """
         Args:
@@ -320,6 +468,9 @@ class MCPModule(nn.Module):
             hidden (Tensor): [B, L, dim] this module's transformer output, to be
                 chained into the next module.
         """
+        if direct_clean_context_kv and paper_fidelity_mcp1_mask:
+            raise ValueError("direct_clean_context_kv and paper_fidelity_mcp1_mask are mutually exclusive")
+
         x = future_tokens
 
         if x.shape[1] != upstream.shape[1]:
@@ -330,13 +481,57 @@ class MCPModule(nn.Module):
             )
 
         # Concat + Linear Proj
+        target_token_count = x.shape[1]
         x = self.proj(torch.cat([x, upstream], dim=-1))
+        use_paper_fidelity = bool(
+            paper_fidelity_mcp1_mask
+            and clean_prefix is not None
+            and clean_prefix.shape[1] > 0
+        )
+        if use_paper_fidelity:
+            if clean_prefix.shape[0] != x.shape[0] or clean_prefix.shape[2] != self.dim:
+                raise ValueError("clean_prefix must have shape [B, L_clean, dim]")
+            if clean_prefix_grid_sizes is None:
+                raise ValueError("clean_prefix_grid_sizes is required for paper-fidelity MCP1")
+            clean_frames = int(clean_prefix_grid_sizes[0, 0].item())
+            if clean_frames <= 0:
+                raise ValueError("paper-fidelity clean prefix must contain at least one frame")
+            if clean_prefix_timestep is None:
+                clean_prefix_timestep = torch.zeros(
+                    (x.shape[0], clean_frames),
+                    device=timestep.device,
+                    dtype=timestep.dtype,
+                )
+            if tuple(clean_prefix_timestep.shape) != (x.shape[0], clean_frames):
+                raise ValueError("clean_prefix_timestep must have shape [B, F_clean]")
+            sequence_timestep = torch.cat(
+                [
+                    clean_prefix_timestep.to(device=timestep.device, dtype=timestep.dtype),
+                    timestep,
+                ],
+                dim=1,
+            )
+            # PAPER_UNDERSPECIFIED: Eq. 8 does not define clean-row z initialization.
+            # The paper-fidelity path uses fused clean hidden states as clean residuals.
+            x = torch.cat([clean_prefix.to(device=x.device, dtype=x.dtype), x], dim=1)
+        else:
+            sequence_timestep = timestep
 
         # Time modulation for the target chunk
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x)
         )
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=timestep.shape)
+        if use_paper_fidelity:
+            e_sequence = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, sequence_timestep.flatten()).type_as(x)
+            )
+        else:
+            e_sequence = e
+        e0 = (
+            self.time_projection(e_sequence)
+            .unflatten(1, (6, self.dim))
+            .unflatten(dim=0, sizes=sequence_timestep.shape)
+        )
 
         block_clean_context = clean_context if direct_clean_context_kv else None
         for block in self.blocks:
@@ -349,10 +544,16 @@ class MCPModule(nn.Module):
                 clean_context=block_clean_context,
                 clean_context_grid_sizes=clean_context_grid_sizes,
                 clean_context_start_frame=clean_context_start_frame,
+                paper_fidelity_mcp1_mask=use_paper_fidelity,
+                target_token_count=target_token_count,
+                target_grid_sizes=grid_sizes,
+                target_start_frame=start_frame,
+                clean_prefix_grid_sizes=clean_prefix_grid_sizes,
+                clean_prefix_start_frame=clean_prefix_start_frame,
             )
-        hidden = x
+        hidden = x[:, -target_token_count:, :] if use_paper_fidelity else x
 
-        out = self.head(x, e.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2))
+        out = self.head(hidden, e.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2))
         flow_pred = mcp_unpatchify(out, grid_sizes, self.patch_size, self.out_dim)
         return flow_pred, hidden
 
@@ -476,6 +677,11 @@ class MCPStack(nn.Module):
         clean_context_features=None,
         clean_context_grid_sizes=None,
         clean_context_start_frame=0,
+        paper_fidelity_mcp1_mask=False,
+        paper_fidelity_clean_prefix_features=None,
+        paper_fidelity_clean_prefix_grid_sizes=None,
+        paper_fidelity_clean_prefix_start_frame=0,
+        paper_fidelity_clean_prefix_timestep=None,
     ):
         """
         Args:
@@ -498,6 +704,8 @@ class MCPStack(nn.Module):
             raise ValueError(
                 f"MCPStack expected {len(self.tap_layers)} tapped features, got {len(features)}"
             )
+        if direct_clean_context_kv and paper_fidelity_mcp1_mask:
+            raise ValueError("direct_clean_context_kv and paper_fidelity_mcp1_mask are mutually exclusive")
 
         # h_prev^[0] = h_fuse  (Eq. 8)
         upstream = self.fusion(torch.cat(features, dim=-1))
@@ -510,6 +718,18 @@ class MCPStack(nn.Module):
                 )
             if clean_context_features and clean_context_features[0].shape[1] > 0:
                 clean_context = self.fusion(torch.cat(clean_context_features, dim=-1))
+        clean_prefix = None
+        if paper_fidelity_mcp1_mask and paper_fidelity_clean_prefix_features is not None:
+            if len(paper_fidelity_clean_prefix_features) != len(self.tap_layers):
+                raise ValueError(
+                    f"MCPStack expected {len(self.tap_layers)} paper-fidelity clean "
+                    f"prefix features, got {len(paper_fidelity_clean_prefix_features)}"
+                )
+            if (
+                paper_fidelity_clean_prefix_features
+                and paper_fidelity_clean_prefix_features[0].shape[1] > 0
+            ):
+                clean_prefix = self.fusion(torch.cat(paper_fidelity_clean_prefix_features, dim=-1))
 
         flow_preds = []
         for k, module in enumerate(self.mcp_modules):
@@ -526,6 +746,11 @@ class MCPStack(nn.Module):
                 clean_context=clean_context if k == 0 else None,
                 clean_context_grid_sizes=clean_context_grid_sizes if k == 0 else None,
                 clean_context_start_frame=clean_context_start_frame,
+                paper_fidelity_mcp1_mask=bool(paper_fidelity_mcp1_mask and k == 0),
+                clean_prefix=clean_prefix if k == 0 else None,
+                clean_prefix_grid_sizes=paper_fidelity_clean_prefix_grid_sizes if k == 0 else None,
+                clean_prefix_start_frame=paper_fidelity_clean_prefix_start_frame,
+                clean_prefix_timestep=paper_fidelity_clean_prefix_timestep if k == 0 else None,
             )
             flow_preds.append(flow_pred)
         return flow_preds

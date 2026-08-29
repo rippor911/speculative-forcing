@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -269,6 +270,29 @@ def oracle_failure_diagnostic(exc: BaseException) -> dict[str, Any]:
     text = str(exc)
     assert marker in text
     return json.loads(text.split(marker, 1)[1])
+
+
+def make_parameter_report(
+    *,
+    role: str = "model",
+    sha: str = TEST_SHA,
+) -> dict[str, Any]:
+    payload = {
+        "role": role,
+        "parameter_count": 1,
+        "parameters": {
+            "weight": {
+                "sha256": sha,
+                "shape": [1],
+                "dtype": "torch.float32",
+                "requires_grad": False,
+            }
+        },
+    }
+    return {
+        **payload,
+        "fingerprint_sha256": ev.canonical_json_sha256(payload),
+    }
 
 
 def make_common(source_noise: torch.Tensor, teacher_target: torch.Tensor) -> tuple[dict, str]:
@@ -793,6 +817,170 @@ def test_exact_current_oracle_bf16_failure_reports_float32_reference() -> None:
     assert diagnostic["float32_reference"]["recon32_vs_clean32"]["max_abs"] == (
         pytest.approx(0.0, abs=1e-6)
     )
+
+
+def test_predicted_current_recheck_state_matches_formal_state_construction() -> None:
+    source = make_source_noise()
+    target = make_teacher_target()
+    main_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MAIN,
+        device="cpu",
+    )
+    mcp_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MCP,
+        device="cpu",
+    )
+    recheck = audit.build_predicted_current_oracle_recheck_state(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        state_id_prefix="id00_pos000",
+        sample_identity="val000",
+        validation_position=0,
+        identity_index=0,
+    )
+    formal = audit.build_teacher_flow_audit_states(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        noise_realizations_per_raw=1,
+        state_id_prefix="id00_pos000",
+        sample_identity="val000",
+        validation_position=0,
+        identity_index=0,
+    )
+
+    assert len(formal) == len(audit.TEACHER_FLOW_AUDIT_RAW_TIMESTEPS)
+    assert recheck.state_id == "id00_pos000_raw999_noise0"
+    assert recheck.raw_timestep == audit.PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP
+    assert recheck.noise_index == audit.PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX
+    assert recheck.provenance["validation_position"] == 0
+    assert recheck.provenance["identity_index"] == 0
+    assert torch.equal(recheck.current_state, formal[0].current_state)
+    assert torch.equal(recheck.current_noise, formal[0].current_noise)
+    assert recheck.main_warped_timestep == pytest.approx(
+        formal[0].main_warped_timestep
+    )
+    assert recheck.main_sigma == pytest.approx(formal[0].main_sigma)
+
+
+def test_predicted_current_recheck_exact_pass_classification() -> None:
+    target, states, main_scheduler, _ = make_oracle_state()
+    oracle = audit.exact_current_flow_conversion_oracle(
+        main_scheduler,
+        state=states[0],
+        teacher_target=target,
+    )
+    artifact = audit.build_predicted_current_oracle_recheck_artifact(
+        diagnostic=oracle["diagnostic"],
+        original_bf16_oracle_pass=True,
+        runtime_git_sha=RUNTIME_GIT_SHA,
+        sample_identity="val000",
+        identity_index=0,
+        validation_position=0,
+        student_parameters_before=make_parameter_report(role="student"),
+        student_parameters_after=make_parameter_report(role="student"),
+        teacher_parameters_before=make_parameter_report(role="teacher"),
+        teacher_parameters_after=make_parameter_report(role="teacher"),
+        rng_before="r",
+        rng_after="r",
+    )
+
+    assert artifact["diagnostic_classification"] == audit.EXACT_PASS
+    assert artifact["status"] == "PASS"
+    assert artifact["original_bf16_oracle_pass"] is True
+    assert artifact["backward_executed"] is False
+    assert artifact["optimizer_step_executed"] is False
+    assert artifact["checkpoint_written"] is False
+
+
+def test_predicted_current_recheck_bf16_classification_requires_all_subgates() -> None:
+    source, target = make_bf16_oracle_failure_tensors()
+    main_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MAIN,
+        device="cpu",
+    )
+    mcp_scheduler = audit.build_flow_match_scheduler(
+        shift=DEFAULT_S_MCP,
+        device="cpu",
+    )
+    state = audit.build_predicted_current_oracle_recheck_state(
+        source_noise=source,
+        teacher_target=target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        sample_identity="val000",
+        validation_position=0,
+        identity_index=0,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            main_scheduler,
+            state=state,
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+
+    assert audit.classify_predicted_current_oracle_recheck(
+        diagnostic,
+        original_bf16_oracle_pass=False,
+    ) == audit.BF16_QUANTIZED_STATE_CONTRACT
+
+    state_mismatch = json.loads(json.dumps(diagnostic))
+    state_mismatch["noisy_state_vs_regenerated"]["torch_equal"] = False
+    assert audit.classify_predicted_current_oracle_recheck(
+        state_mismatch,
+        original_bf16_oracle_pass=False,
+    ) == audit.STATE_PROVENANCE_MISMATCH
+
+    scheduler_mismatch = json.loads(json.dumps(diagnostic))
+    scheduler_mismatch["recon_sched_vs_formula_actual"]["max_abs"] = 0.01
+    assert audit.classify_predicted_current_oracle_recheck(
+        scheduler_mismatch,
+        original_bf16_oracle_pass=False,
+    ) == audit.SCHEDULER_MISMATCH
+
+    semantic_mismatch = json.loads(json.dumps(diagnostic))
+    semantic_mismatch["float32_reference"]["recon32_vs_clean32"]["max_abs"] = 1e-3
+    assert audit.classify_predicted_current_oracle_recheck(
+        semantic_mismatch,
+        original_bf16_oracle_pass=False,
+    ) == audit.SEMANTIC_MISMATCH
+
+
+def test_predicted_current_recheck_scheduler_mismatch_classification() -> None:
+    target, states, _, mcp_scheduler = make_oracle_state()
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            mcp_scheduler,
+            state=states[0],
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+
+    assert audit.classify_predicted_current_oracle_recheck(
+        diagnostic,
+        original_bf16_oracle_pass=False,
+    ) == audit.SCHEDULER_MISMATCH
+
+
+def test_predicted_current_recheck_state_mismatch_classification() -> None:
+    target, states, main_scheduler, _ = make_oracle_state()
+    bad_state = replace(states[0], current_noise=states[0].current_noise + 1.0)
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            main_scheduler,
+            state=bad_state,
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+
+    assert audit.classify_predicted_current_oracle_recheck(
+        diagnostic,
+        original_bf16_oracle_pass=False,
+    ) == audit.STATE_PROVENANCE_MISMATCH
 
 
 def test_predicted_current_main_does_not_read_gt_current_or_future() -> None:
@@ -1369,8 +1557,299 @@ def test_runner_parser_fixes_validation_zero_contract_fields() -> None:
     assert args.num_samples == 1
     assert args.student_direct_clean_context_kv is False
     assert args.multi_identity_validation32 is False
+    assert args.predicted_current_oracle_recheck_only is False
     assert args.expected_training_git_sha is None
     assert runner._expected_training_git_sha(args, git_sha="a" * 40) == "a" * 40
+
+
+def test_predicted_current_oracle_recheck_flag_parsing_and_mutex() -> None:
+    base = [
+        "--full_sequence_checkpoint",
+        "checkpoint_step006500.pt",
+        "--expected_checkpoint_step",
+        "6500",
+        "--sample_plan",
+        "sample_plan.json",
+        "--teacher_manifest",
+        "teacher_manifest.json",
+        "--dataset_root",
+        "dataset",
+        "--output_dir",
+        "out",
+        "--expected_runtime_git_sha",
+        "f" * 40,
+    ]
+    args = runner.parse_args(["--predicted_current_oracle_recheck_only", *base])
+    assert args.predicted_current_oracle_recheck_only is True
+    assert args.multi_identity_validation32 is False
+    runner._validate_multi_identity_cli_contract(args)
+
+    with pytest.raises(SystemExit):
+        runner.parse_args(
+            [
+                "--multi_identity_validation32",
+                "--predicted_current_oracle_recheck_only",
+                *base,
+            ]
+        )
+
+    args.expected_checkpoint_step = 7000
+    with pytest.raises(RuntimeError, match="step6500"):
+        runner._validate_multi_identity_cli_contract(args)
+    args.expected_checkpoint_step = 6500
+    args.student_direct_clean_context_kv = True
+    with pytest.raises(RuntimeError, match="direct_clean_context_kv=false"):
+        runner._validate_multi_identity_cli_contract(args)
+
+
+def _install_fake_recheck_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_noise: torch.Tensor,
+    teacher_target: torch.Tensor,
+    oracle=None,
+) -> dict[str, Any]:
+    records: dict[str, Any] = {"acquired": [], "build_modes": [], "writes": []}
+    plan = make_validation32_plan()
+    schedule = ev.resolve_deployment_schedule()
+
+    payload = {
+        "prompt": "prompt",
+        "prompt_sha256": "d" * 64,
+        "noise_seed": 123,
+        "rollout_seed": 456,
+        "raw_denoising_steps": list(schedule.raw_schedule),
+        "warped_denoising_steps": list(schedule.main_warped_schedule),
+    }
+    metadata = {
+        "identity": "val000",
+        "sample_index": 0,
+        "split": "validation",
+        "split_index": 0,
+        "prompt_sha256": "d" * 64,
+    }
+
+    class FakeAcquire:
+        def __enter__(self):
+            return SimpleNamespace(
+                payload=dict(payload),
+                metadata=dict(metadata),
+                source_noise=source_noise,
+                target_latent=teacher_target,
+            )
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeStore:
+        def __init__(self, **kwargs):
+            records["store_kwargs"] = kwargs
+
+        def acquire(self, identity: str):
+            records["acquired"].append(str(identity))
+            return FakeAcquire()
+
+    student_checkpoint = ev.DeploymentCheckpointRecord(
+        path="checkpoint_step006500.pt",
+        sha256=TEST_SHA,
+        checkpoint_type="teacher_flow_student_step6500",
+        load_mode=audit.TEACHER_FLOW_AUDIT_STUDENT_LOAD_MODE,
+        generator_state_dict={"mcp.fusion.weight": torch.ones(1)},
+        global_step=6500,
+        training_git_sha=RUNTIME_GIT_SHA,
+        payload={
+            "schema": FULL_SEQUENCE_TRAINER_SCHEMA,
+            "global_step": 6500,
+            "sample_plan_sha256": "b" * 64,
+            "manifest_sha256": "c" * 64,
+        },
+    )
+    teacher_checkpoint = ev.DeploymentCheckpointRecord(
+        path="self_forcing_dmd.pt",
+        sha256="d" * 64,
+        checkpoint_type="official_self_forcing",
+        load_mode="official",
+        generator_state_dict={"weight": torch.zeros(1)},
+    )
+
+    def fake_build_generator(*, mode, **kwargs):
+        _ = kwargs
+        records["build_modes"].append(str(mode))
+        if mode == runner.MODE_TRAINED_MCP1:
+            generator = FakeStudentGenerator().eval().requires_grad_(False)
+            generator.weight = nn.Parameter(torch.zeros(1), requires_grad=False)
+            return generator
+        if mode == runner.MODE_OFFICIAL_MAIN:
+            generator = FakeTeacherGenerator().eval().requires_grad_(False)
+            generator.weight = nn.Parameter(torch.zeros(1), requires_grad=False)
+            return generator
+        raise AssertionError(f"unexpected build mode: {mode}")
+
+    def forbidden_branch(*args, **kwargs):
+        _ = (args, kwargs)
+        raise AssertionError("future branch must not run in recheck-only mode")
+
+    monkeypatch.setattr(runner, "current_git_head", lambda: RUNTIME_GIT_SHA)
+    monkeypatch.setattr(runner, "validate_cli_contract", lambda args, git_sha: {
+        "status": "PASS",
+        "runtime_git_sha": git_sha,
+        "output_dir": str(args.output_dir),
+    })
+    monkeypatch.setattr(
+        runner,
+        "runtime_device",
+        lambda device_arg: (torch.device("cpu"), {"device": str(device_arg)}),
+    )
+    monkeypatch.setattr(runner, "merge_config", lambda path: SimpleNamespace())
+    monkeypatch.setattr(runner, "validate_config", lambda config: None)
+    monkeypatch.setattr(runner, "load_m4_sample_plan", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(runner, "file_sha256", lambda path: "c" * 64)
+    monkeypatch.setattr(
+        runner,
+        "load_teacher_flow_student_checkpoint_record",
+        lambda *args, **kwargs: student_checkpoint,
+    )
+    monkeypatch.setattr(
+        runner,
+        "load_official_checkpoint_record",
+        lambda path: teacher_checkpoint,
+    )
+    monkeypatch.setattr(runner, "M5TeacherSampleStore", FakeStore)
+    monkeypatch.setattr(
+        runner,
+        "atomic_json_write",
+        lambda payload, path: records["writes"].append(
+            {"payload": dict(payload), "path": Path(path)}
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "build_conditioning",
+        lambda *, prompt, device, dtype: {
+            "prompt_embeds": torch.zeros((1, 2, 3), dtype=torch.float32)
+        },
+    )
+    monkeypatch.setattr(runner, "build_generator", fake_build_generator)
+    monkeypatch.setattr(
+        runner,
+        "run_student_mcp_full_sequence_predictions",
+        forbidden_branch,
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_student_predicted_current_predictions",
+        forbidden_branch,
+    )
+    monkeypatch.setattr(runner, "run_teacher_branch_predictions", forbidden_branch)
+    if oracle is not None:
+        monkeypatch.setattr(runner, "exact_current_flow_conversion_oracle", oracle)
+    return records
+
+
+def _recheck_argv(output_dir: Path) -> list[str]:
+    return [
+        "--predicted_current_oracle_recheck_only",
+        "--full_sequence_checkpoint",
+        "checkpoint_step006500.pt",
+        "--expected_checkpoint_step",
+        "6500",
+        "--sample_plan",
+        "sample_plan.json",
+        "--teacher_manifest",
+        "teacher_manifest.json",
+        "--dataset_root",
+        "dataset",
+        "--output_dir",
+        str(output_dir),
+        "--expected_runtime_git_sha",
+        RUNTIME_GIT_SHA,
+        "--device",
+        "cpu",
+    ]
+
+
+def test_predicted_current_recheck_runner_bf16_artifact_and_no_branches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, target = make_bf16_oracle_failure_tensors()
+    output_dir = Path("out")
+    records = _install_fake_recheck_runner(
+        monkeypatch,
+        source_noise=source,
+        teacher_target=target,
+    )
+
+    rc = runner.main(_recheck_argv(output_dir))
+    assert len(records["writes"]) == 1
+    artifact = records["writes"][0]["payload"]
+
+    assert rc == 0
+    assert artifact["schema"] == audit.PREDICTED_CURRENT_ORACLE_RECHECK_SCHEMA
+    assert artifact["diagnostic_classification"] == (
+        audit.BF16_QUANTIZED_STATE_CONTRACT
+    )
+    assert artifact["original_bf16_oracle_pass"] is False
+    assert artifact["identity_index"] == 0
+    assert artifact["validation_position"] == 0
+    assert artifact["raw_timestep"] == 999
+    assert artifact["noise_index"] == 0
+    assert artifact["sample_identity"] == "val000"
+    assert artifact["current_state_vs_regenerated"]["torch_equal"] is True
+    assert artifact["scheduler_vs_explicit"]["max_abs"] == pytest.approx(0.0)
+    assert artifact["float32_reference"]["max_abs"] == pytest.approx(0.0)
+    assert artifact["student_parameters_unchanged"] is True
+    assert artifact["teacher_parameters_unchanged"] is True
+    assert artifact["rng_unchanged"] is True
+    assert artifact["backward_executed"] is False
+    assert artifact["optimizer_step_executed"] is False
+    assert artifact["checkpoint_written"] is False
+    assert records["acquired"] == ["val000"]
+    assert records["writes"][0]["path"].name == (
+        "predicted_current_oracle_recheck.json"
+    )
+    assert records["build_modes"] == [
+        runner.MODE_TRAINED_MCP1,
+        runner.MODE_OFFICIAL_MAIN,
+    ]
+
+
+def test_predicted_current_recheck_artifact_before_nonzero_scheduler_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, states, _, mcp_scheduler = make_oracle_state()
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.exact_current_flow_conversion_oracle(
+            mcp_scheduler,
+            state=states[0],
+            teacher_target=target,
+        )
+    diagnostic = oracle_failure_diagnostic(excinfo.value)
+
+    def failing_oracle(*args, **kwargs):
+        _ = (args, kwargs)
+        raise RuntimeError(
+            "exact current flow-to-x0 conversion oracle failed: "
+            f"scheduler_shift_not_main; diagnostic={json.dumps(diagnostic)}"
+        )
+
+    source, target_bf16 = make_bf16_oracle_failure_tensors()
+    output_dir = Path("out")
+    records = _install_fake_recheck_runner(
+        monkeypatch,
+        source_noise=source,
+        teacher_target=target_bf16,
+        oracle=failing_oracle,
+    )
+
+    rc = runner.main(_recheck_argv(output_dir))
+    assert len(records["writes"]) == 1
+    artifact_path = records["writes"][0]["path"]
+    artifact = records["writes"][0]["payload"]
+
+    assert rc == 1
+    assert artifact_path.name == "predicted_current_oracle_recheck.json"
+    assert artifact["status"] == "FAIL"
+    assert artifact["diagnostic_classification"] == audit.SCHEDULER_MISMATCH
 
 
 def test_artifact_identity_accepts_diagnostic_resolved_config_sha() -> None:

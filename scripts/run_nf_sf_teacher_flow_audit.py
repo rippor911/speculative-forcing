@@ -30,6 +30,7 @@ from utils.nf_sf_full_sequence_eval import (
     build_common_inputs_record,
     current_git_head,
     file_sha256,
+    global_rng_state_hash,
     load_official_checkpoint_record,
 )
 from utils.nf_sf_m3 import atomic_json_write, move_tensors_to_device
@@ -38,11 +39,19 @@ from utils.nf_sf_m5_samples import M5TeacherSampleStore
 from utils.nf_sf_teacher_flow_audit import (
     TEACHER_FLOW_AUDIT_SCHEMA,
     TEACHER_FLOW_AUDIT_MULTI_NOISE_REALIZATIONS_PER_RAW,
+    BF16_QUANTIZED_STATE_CONTRACT,
+    EXACT_PASS,
+    PREDICTED_CURRENT_ORACLE_RECHECK_MODE,
+    PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX,
+    PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP,
     aggregate_teacher_flow_metrics,
+    build_predicted_current_oracle_recheck_artifact,
+    build_predicted_current_oracle_recheck_state,
     build_teacher_flow_multi_identity_manifest,
     build_flow_match_scheduler,
     build_teacher_flow_audit_result,
     build_teacher_flow_audit_states,
+    exact_current_flow_conversion_oracle,
     build_teacher_flow_state_records,
     load_teacher_flow_student_checkpoint_record,
     parameter_sha256_report,
@@ -89,12 +98,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--fps", type=int, default=16)
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--multi_identity_validation32",
         action="store_true",
         help=(
             "Run the strict 32-identity validation audit at positions "
             "0,8,16,...,248 with one deterministic noise per raw timestep."
+        ),
+    )
+    mode_group.add_argument(
+        "--predicted_current_oracle_recheck_only",
+        action="store_true",
+        help=(
+            "Run only the validation0/raw999/noise0 exact-current oracle "
+            "diagnostic and write predicted_current_oracle_recheck.json."
         ),
     )
     parser.add_argument(
@@ -123,9 +141,12 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         args.sample_plan,
         manifest_path=args.teacher_manifest,
     )
+    formal_validation_selection = bool(
+        getattr(args, "multi_identity_validation32", False)
+    ) or bool(getattr(args, "predicted_current_oracle_recheck_only", False))
     identity_selection = (
         select_validation32_identities(sample_plan)
-        if bool(args.multi_identity_validation32)
+        if formal_validation_selection
         else None
     )
     sample_identity = (
@@ -169,6 +190,22 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         reference_checkpoint_path=None,
         expected_reference_sha256=OFFICIAL_SELF_FORCING_CHECKPOINT_SHA256,
     )
+    if bool(getattr(args, "predicted_current_oracle_recheck_only", False)):
+        return _run_predicted_current_oracle_recheck_only(
+            args=args,
+            git_sha=git_sha,
+            repo_preflight=repo_preflight,
+            runtime_contract=runtime_contract,
+            device=device,
+            dtype=dtype,
+            config=config,
+            teacher_store=teacher_store,
+            student_checkpoint=student_checkpoint,
+            identity_selection=identity_selection,
+            artifact_identity=artifact_identity,
+            student_checkpoint_contract=multi_student_checkpoint_contract,
+            expected_training_git_sha=expected_training_git_sha,
+        )
     if identity_selection is not None:
         return _run_multi_identity_validation32(
             args=args,
@@ -372,6 +409,203 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     manifest["output_dir"] = str(args.output_dir.resolve())
     atomic_json_write(manifest, args.output_dir / "teacher_flow_audit.json")
     return manifest
+
+
+def _run_predicted_current_oracle_recheck_only(
+    *,
+    args: argparse.Namespace,
+    git_sha: str,
+    repo_preflight: Mapping[str, Any],
+    runtime_contract: Mapping[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+    config: Mapping[str, Any],
+    teacher_store: M5TeacherSampleStore,
+    student_checkpoint: Any,
+    identity_selection: Mapping[str, Any] | None,
+    artifact_identity: Mapping[str, Any],
+    student_checkpoint_contract: Mapping[str, Any] | None,
+    expected_training_git_sha: str,
+) -> dict[str, Any]:
+    if identity_selection is None:
+        raise RuntimeError("predicted-current oracle recheck requires identity selection")
+    if student_checkpoint_contract is None:
+        raise RuntimeError("predicted-current oracle recheck requires step6500 contract")
+    sample_identity = str(identity_selection["identity_strings"][0])
+    identity_index = 0
+    validation_position = int(identity_selection["positions"][0])
+    if validation_position != 0:
+        raise RuntimeError("predicted-current oracle recheck requires validation0")
+
+    main_scheduler = build_flow_match_scheduler(shift=DEFAULT_S_MAIN, device=device)
+    mcp_scheduler = build_flow_match_scheduler(shift=DEFAULT_S_MCP, device=device)
+
+    student_generator = build_generator(
+        config=config,
+        checkpoint=student_checkpoint,
+        mode=MODE_TRAINED_MCP1,
+        device=device,
+        dtype=dtype,
+    )
+    student_summary = validate_frozen_student_model(
+        student_generator,
+        checkpoint=student_checkpoint,
+    )
+    student_parameters_before = parameter_sha256_report(
+        student_generator,
+        role="student_main_mcp",
+    )
+    teacher_checkpoint = load_official_checkpoint_record(args.official_checkpoint)
+    teacher_generator = build_generator(
+        config=config,
+        checkpoint=teacher_checkpoint,
+        mode=MODE_OFFICIAL_MAIN,
+        device=device,
+        dtype=dtype,
+    )
+    teacher_summary = validate_frozen_teacher_model(
+        teacher_generator,
+        checkpoint=teacher_checkpoint,
+    )
+    teacher_parameters_before = parameter_sha256_report(
+        teacher_generator,
+        role="teacher_official_main",
+    )
+    try:
+        with teacher_store.acquire(sample_identity) as teacher_sample:
+            teacher_payload = dict(teacher_sample.payload)
+            teacher_metadata = dict(teacher_sample.metadata)
+            source_noise_cpu = teacher_sample.source_noise.detach().cpu()
+            teacher_target_cpu = teacher_sample.target_latent.detach().cpu()
+
+        _validate_sample_tensors(
+            source_noise=source_noise_cpu,
+            teacher_target=teacher_target_cpu,
+            dtype=dtype,
+        )
+        conditioning_cpu = build_conditioning(
+            prompt=str(teacher_payload["prompt"]),
+            device=device,
+            dtype=dtype,
+        )
+        source_noise = source_noise_cpu.to(device=device)
+        teacher_target = teacher_target_cpu.to(device=device, dtype=dtype)
+        teacher_payload["source_noise"] = source_noise
+        conditional_dict = move_tensors_to_device(
+            conditioning_cpu,
+            device=device,
+            floating_dtype=dtype,
+        )
+        common_inputs, _ = build_common_inputs_record(
+            sample_identity=sample_identity,
+            teacher_metadata=teacher_metadata,
+            teacher_payload=teacher_payload,
+            source_noise=source_noise,
+            conditioning=conditional_dict,
+            runtime_git_sha=git_sha,
+            training_checkpoint_git_sha=str(student_checkpoint.training_git_sha),
+            fps=int(args.fps),
+            sample_plan_sha256=str(artifact_identity["sample_plan_sha256"]),
+            teacher_manifest_sha256=str(artifact_identity["teacher_manifest_sha256"]),
+            selected_validation_position=validation_position,
+        )
+        common_inputs.update(
+            {
+                "audit_schema": TEACHER_FLOW_AUDIT_SCHEMA,
+                "mode": PREDICTED_CURRENT_ORACLE_RECHECK_MODE,
+                "diagnostic_only": True,
+                "non_deployable": True,
+                "runtime_contract": runtime_contract,
+                "repo_preflight": repo_preflight,
+                "artifact_identity": artifact_identity,
+                "student_checkpoint_contract": student_checkpoint_contract,
+                "config_path": str(args.config.resolve()),
+                "sample_plan_path": str(args.sample_plan.resolve()),
+                "teacher_manifest_path": str(args.teacher_manifest.resolve()),
+                "dataset_root": str(args.dataset_root.resolve()),
+                "frame_seq_length": FULL_SEQUENCE_FRAME_SEQ_LENGTH,
+                "selected_identity_policy": "validation positions 0,8,16,...,248",
+                "identity_index": identity_index,
+                "identity_selection_fingerprint_sha256": str(
+                    artifact_identity["identity_selection"][
+                        "selection_fingerprint_sha256"
+                    ]
+                ),
+                "fixed_raw_timestep": PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP,
+                "fixed_noise_index": PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX,
+                "student_direct_clean_context_kv": False,
+                "expected_student_checkpoint_git_sha": str(expected_training_git_sha),
+            }
+        )
+        common_fingerprint = assert_common_payload_fingerprint(common_inputs)
+
+        rng_before = global_rng_state_hash(device)
+        state = build_predicted_current_oracle_recheck_state(
+            source_noise=source_noise,
+            teacher_target=teacher_target,
+            main_scheduler=main_scheduler,
+            mcp_scheduler=mcp_scheduler,
+            state_id_prefix="id00_pos000",
+            sample_identity=sample_identity,
+            validation_position=validation_position,
+            identity_index=identity_index,
+        )
+        original_bf16_oracle_pass = True
+        try:
+            oracle = exact_current_flow_conversion_oracle(
+                main_scheduler,
+                state=state,
+                teacher_target=teacher_target,
+            )
+            diagnostic = dict(oracle["diagnostic"])
+        except RuntimeError as exc:
+            original_bf16_oracle_pass = False
+            diagnostic = _current_oracle_failure_diagnostic(exc)
+        rng_after = global_rng_state_hash(device)
+
+        student_parameters_after = parameter_sha256_report(
+            student_generator,
+            role="student_main_mcp",
+        )
+        teacher_parameters_after = parameter_sha256_report(
+            teacher_generator,
+            role="teacher_official_main",
+        )
+        artifact = build_predicted_current_oracle_recheck_artifact(
+            diagnostic=diagnostic,
+            original_bf16_oracle_pass=original_bf16_oracle_pass,
+            runtime_git_sha=git_sha,
+            sample_identity=sample_identity,
+            identity_index=identity_index,
+            validation_position=validation_position,
+            student_parameters_before=student_parameters_before,
+            student_parameters_after=student_parameters_after,
+            teacher_parameters_before=teacher_parameters_before,
+            teacher_parameters_after=teacher_parameters_after,
+            rng_before=rng_before,
+            rng_after=rng_after,
+            common_inputs_fingerprint_sha256=common_fingerprint,
+            artifact_identity=artifact_identity,
+            student_checkpoint_contract=student_checkpoint_contract,
+            checkpoint_summary={
+                **student_checkpoint.to_json(),
+                "expected_checkpoint_step": int(args.expected_checkpoint_step),
+            },
+            student_summary=student_summary,
+            teacher_summary=teacher_summary,
+        )
+        artifact["output_dir"] = str(args.output_dir.resolve())
+        atomic_json_write(
+            artifact,
+            args.output_dir / "predicted_current_oracle_recheck.json",
+        )
+        return artifact
+    finally:
+        student_generator.to("cpu")
+        teacher_generator.to("cpu")
+        del student_generator
+        del teacher_generator
+        gc.collect()
 
 
 def _run_multi_identity_validation32(
@@ -676,20 +910,53 @@ def _validate_sample_tensors(
         raise RuntimeError("requested dtype must match stored teacher tensors")
 
 
+def _current_oracle_failure_diagnostic(exc: BaseException) -> dict[str, Any]:
+    marker = "diagnostic="
+    text = str(exc)
+    if marker not in text:
+        raise exc
+    return json.loads(text.split(marker, 1)[1])
+
+
 def _validate_multi_identity_cli_contract(args: argparse.Namespace) -> None:
-    if not bool(args.multi_identity_validation32):
+    requires_formal_step6500 = bool(
+        getattr(args, "multi_identity_validation32", False)
+    ) or bool(getattr(args, "predicted_current_oracle_recheck_only", False))
+    if not requires_formal_step6500:
         return
+    mode_name = (
+        "multi-identity Teacher-flow audit"
+        if bool(getattr(args, "multi_identity_validation32", False))
+        else "predicted-current oracle recheck"
+    )
     if int(args.expected_checkpoint_step) != 6500:
-        raise RuntimeError("multi-identity Teacher-flow audit requires step6500")
+        raise RuntimeError(f"{mode_name} requires step6500")
     if bool(args.student_direct_clean_context_kv):
-        raise RuntimeError(
-            "multi-identity Teacher-flow audit requires direct_clean_context_kv=false"
-        )
+        raise RuntimeError(f"{mode_name} requires direct_clean_context_kv=false")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     manifest = run_audit(args)
+    if bool(getattr(args, "predicted_current_oracle_recheck_only", False)):
+        print(
+            json.dumps(
+                {
+                    "schema": manifest["schema"],
+                    "status": manifest["status"],
+                    "diagnostic_classification": manifest[
+                        "diagnostic_classification"
+                    ],
+                    "original_bf16_oracle_pass": manifest[
+                        "original_bf16_oracle_pass"
+                    ],
+                    "output_dir": manifest["output_dir"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return _predicted_current_oracle_recheck_exit_code(manifest)
     print(
         json.dumps(
             {
@@ -704,6 +971,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     return 0
+
+
+def _predicted_current_oracle_recheck_exit_code(manifest: Mapping[str, Any]) -> int:
+    if manifest.get("status") != "PASS":
+        return 1
+    if manifest.get("diagnostic_classification") in {
+        EXACT_PASS,
+        BF16_QUANTIZED_STATE_CONTRACT,
+    }:
+        return 0
+    return 1
 
 
 def _expected_training_git_sha(args: argparse.Namespace, *, git_sha: str) -> str:

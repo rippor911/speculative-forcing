@@ -52,6 +52,28 @@ TEACHER_FLOW_AUDIT_MULTI_VALIDATION_STRIDE = 8
 TEACHER_FLOW_AUDIT_MULTI_VALIDATION_COUNT = 32
 TEACHER_FLOW_AUDIT_MODE_SINGLE = "single_identity_validation0"
 TEACHER_FLOW_AUDIT_MODE_MULTI_VALIDATION32 = "multi_identity_validation32"
+PREDICTED_CURRENT_ORACLE_RECHECK_SCHEMA = (
+    "nf_sf_predicted_current_oracle_recheck_v1"
+)
+PREDICTED_CURRENT_ORACLE_RECHECK_MODE = (
+    "predicted_current_oracle_recheck_only"
+)
+PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP = 999
+PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX = 0
+EXACT_PASS = "exact_pass"
+BF16_QUANTIZED_STATE_CONTRACT = "bf16_quantized_state_contract"
+SCHEDULER_MISMATCH = "scheduler_mismatch"
+STATE_PROVENANCE_MISMATCH = "state_provenance_mismatch"
+SEMANTIC_MISMATCH = "semantic_mismatch"
+PREDICTED_CURRENT_ORACLE_RECHECK_CLASSIFICATIONS = (
+    EXACT_PASS,
+    BF16_QUANTIZED_STATE_CONTRACT,
+    SCHEDULER_MISMATCH,
+    STATE_PROVENANCE_MISMATCH,
+    SEMANTIC_MISMATCH,
+)
+PREDICTED_CURRENT_ORACLE_RECHECK_SCHEDULER_ATOL = 1.0e-6
+PREDICTED_CURRENT_ORACLE_RECHECK_FLOAT32_ATOL = 1.0e-5
 TEACHER_MATCHED_CURRENT_BRANCH = "teacher_matched_current"
 TEACHER_PREDICTED_CURRENT_BRANCH = "teacher_predicted_current"
 TEACHER_PRIVILEGED_CURRENT_BRANCH = "teacher_privileged_current"
@@ -505,139 +527,23 @@ def build_teacher_flow_audit_states(
     ):
         raise ValueError("teacher-flow audit requires one or four noises per raw")
 
-    clean_current = _chunk(teacher_target, CURRENT_CHUNK_INDEX)
-    clean_future = _chunk(teacher_target, FUTURE_CHUNK_INDEX)
-    source_current = _chunk(source_noise, CURRENT_CHUNK_INDEX)
-    source_future = _chunk(source_noise, FUTURE_CHUNK_INDEX)
-
     states: list[TeacherFlowAuditState] = []
     for raw_timestep in raw_timesteps:
         raw = int(raw_timestep)
-        main_t = memorization._warp_raw_timestep(raw, shift=DEFAULT_S_MAIN)
-        future_t = memorization._warp_raw_timestep(raw, shift=DEFAULT_S_MCP)
         for noise_index in range(noise_count):
-            current_noise, current_noise_record = memorization._noise_for_realization(
-                template=source_current,
-                source_noise=source_noise,
-                teacher_target=teacher_target,
-                raw_timestep=raw,
-                noise_index=noise_index,
-                role="current_chunk1",
-                base_seed=int(noise_seed),
-            )
-            future_noise, future_noise_record = memorization._noise_for_realization(
-                template=source_future,
-                source_noise=source_noise,
-                teacher_target=teacher_target,
-                raw_timestep=raw,
-                noise_index=noise_index,
-                role="future_chunk2",
-                base_seed=int(noise_seed),
-            )
-            main_timestep = route_eq._timestep(main_t, clean_current)
-            future_timestep = route_eq._timestep(future_t, clean_future)
-            current_state = route_eq._add_noise_chunk(
-                main_scheduler,
-                clean=clean_current,
-                noise=current_noise,
-                timestep=main_timestep,
-                name="teacher_flow_current_state",
-            )
-            future_state = route_eq._add_noise_chunk(
-                mcp_scheduler,
-                clean=clean_future,
-                noise=future_noise,
-                timestep=future_timestep,
-                name="teacher_flow_future_state",
-            )
-            exact_mcp_target = route_eq._training_target_chunk(
-                mcp_scheduler,
-                clean=clean_future,
-                noise=future_noise,
-                timestep=future_timestep,
-                name="teacher_flow_exact_mcp_target",
-            )
-            main_sigma = flow_audit._resolved_sigma(
-                main_scheduler,
-                main_timestep,
-                clean_current,
-            )
-            future_sigma = flow_audit._resolved_sigma(
-                mcp_scheduler,
-                future_timestep,
-                clean_future,
-            )
-            teacher_future_timestep = float(future_sigma) * float(
-                DEFAULT_NUM_TRAIN_TIMESTEPS
-            )
-            noisy_batch = _build_full_sequence_validation_noisy_batch(
-                source_noise=source_noise,
-                teacher_target=teacher_target,
-                main_scheduler=main_scheduler,
-                mcp_scheduler=mcp_scheduler,
-                raw_timestep=raw,
-                main_timestep_value=main_t,
-                future_timestep_value=future_t,
-                current_noise=current_noise,
-                future_noise=future_noise,
-                current_state=current_state,
-                future_state=future_state,
-                exact_mcp_target=exact_mcp_target,
-            )
-            base_state_id = f"raw{raw:03d}_noise{int(noise_index)}"
-            if state_id_prefix:
-                state_id = f"{state_id_prefix}_{base_state_id}"
-            else:
-                state_id = base_state_id
-            provenance = {
-                "state_id": state_id,
-                "base_state_id": base_state_id,
-                "raw_timestep": raw,
-                "noise_index": int(noise_index),
-                "main_shift": DEFAULT_S_MAIN,
-                "mcp_shift": DEFAULT_S_MCP,
-                "main_warped_timestep": float(main_t),
-                "future_warped_timestep": float(future_t),
-                "teacher_future_timestep": float(teacher_future_timestep),
-                "main_sigma": float(main_sigma),
-                "future_sigma": float(future_sigma),
-                "teacher_timestep_contract": "teacher_timestep = physical_sigma * 1000",
-                "current_noise": dict(current_noise_record),
-                "future_noise": dict(future_noise_record),
-                "history_chunk0": _tensor_record(
-                    _chunk(teacher_target, HISTORY_CHUNK_INDEX)
-                ),
-                "clean_current": _tensor_record(clean_current),
-                "clean_future": _tensor_record(clean_future),
-                "current_state": _tensor_record(current_state),
-                "future_state": _tensor_record(future_state),
-                "exact_mcp_target": _tensor_record(exact_mcp_target),
-                "main_timestep_sha256": tensor_sha256(main_timestep.detach().cpu()),
-                "future_timestep_sha256": tensor_sha256(future_timestep.detach().cpu()),
-            }
-            if sample_identity is not None:
-                provenance["sample_identity"] = str(sample_identity)
-            if validation_position is not None:
-                provenance["validation_position"] = int(validation_position)
-            if identity_index is not None:
-                provenance["identity_index"] = int(identity_index)
             states.append(
-                TeacherFlowAuditState(
-                    state_id=state_id,
+                _build_teacher_flow_audit_state(
+                    source_noise=source_noise,
+                    teacher_target=teacher_target,
+                    main_scheduler=main_scheduler,
+                    mcp_scheduler=mcp_scheduler,
+                    noise_seed=int(noise_seed),
                     raw_timestep=raw,
                     noise_index=int(noise_index),
-                    main_warped_timestep=float(main_t),
-                    future_warped_timestep=float(future_t),
-                    teacher_future_timestep=float(teacher_future_timestep),
-                    main_sigma=float(main_sigma),
-                    future_sigma=float(future_sigma),
-                    current_noise=current_noise,
-                    future_noise=future_noise,
-                    current_state=current_state,
-                    future_state=future_state,
-                    exact_mcp_target=exact_mcp_target,
-                    noisy_batch=noisy_batch,
-                    provenance=provenance,
+                    state_id_prefix=state_id_prefix,
+                    sample_identity=sample_identity,
+                    validation_position=validation_position,
+                    identity_index=identity_index,
                 )
             )
     _require_teacher_flow_state_contract(
@@ -645,6 +551,185 @@ def build_teacher_flow_audit_states(
         expected_noise_realizations_per_raw=noise_count,
     )
     return tuple(states)
+
+
+def build_predicted_current_oracle_recheck_state(
+    *,
+    source_noise: torch.Tensor,
+    teacher_target: torch.Tensor,
+    main_scheduler: Any,
+    mcp_scheduler: Any,
+    noise_seed: int = memorization.DEFAULT_NOISE_SEED,
+    state_id_prefix: str | None = None,
+    sample_identity: str | None = None,
+    validation_position: int | None = None,
+    identity_index: int | None = None,
+) -> TeacherFlowAuditState:
+    flow_audit._validate_source_and_teacher(source_noise, teacher_target)
+    state = _build_teacher_flow_audit_state(
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        noise_seed=int(noise_seed),
+        raw_timestep=PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP,
+        noise_index=PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX,
+        state_id_prefix=state_id_prefix,
+        sample_identity=sample_identity,
+        validation_position=validation_position,
+        identity_index=identity_index,
+    )
+    if int(state.raw_timestep) != PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP:
+        raise RuntimeError("predicted-current oracle recheck raw timestep mismatch")
+    if int(state.noise_index) != PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX:
+        raise RuntimeError("predicted-current oracle recheck noise index mismatch")
+    return state
+
+
+def _build_teacher_flow_audit_state(
+    *,
+    source_noise: torch.Tensor,
+    teacher_target: torch.Tensor,
+    main_scheduler: Any,
+    mcp_scheduler: Any,
+    noise_seed: int,
+    raw_timestep: int,
+    noise_index: int,
+    state_id_prefix: str | None,
+    sample_identity: str | None,
+    validation_position: int | None,
+    identity_index: int | None,
+) -> TeacherFlowAuditState:
+    clean_current = _chunk(teacher_target, CURRENT_CHUNK_INDEX)
+    clean_future = _chunk(teacher_target, FUTURE_CHUNK_INDEX)
+    source_current = _chunk(source_noise, CURRENT_CHUNK_INDEX)
+    source_future = _chunk(source_noise, FUTURE_CHUNK_INDEX)
+    raw = int(raw_timestep)
+    noise_idx = int(noise_index)
+    main_t = memorization._warp_raw_timestep(raw, shift=DEFAULT_S_MAIN)
+    future_t = memorization._warp_raw_timestep(raw, shift=DEFAULT_S_MCP)
+    current_noise, current_noise_record = memorization._noise_for_realization(
+        template=source_current,
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        raw_timestep=raw,
+        noise_index=noise_idx,
+        role="current_chunk1",
+        base_seed=int(noise_seed),
+    )
+    future_noise, future_noise_record = memorization._noise_for_realization(
+        template=source_future,
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        raw_timestep=raw,
+        noise_index=noise_idx,
+        role="future_chunk2",
+        base_seed=int(noise_seed),
+    )
+    main_timestep = route_eq._timestep(main_t, clean_current)
+    future_timestep = route_eq._timestep(future_t, clean_future)
+    current_state = route_eq._add_noise_chunk(
+        main_scheduler,
+        clean=clean_current,
+        noise=current_noise,
+        timestep=main_timestep,
+        name="teacher_flow_current_state",
+    )
+    future_state = route_eq._add_noise_chunk(
+        mcp_scheduler,
+        clean=clean_future,
+        noise=future_noise,
+        timestep=future_timestep,
+        name="teacher_flow_future_state",
+    )
+    exact_mcp_target = route_eq._training_target_chunk(
+        mcp_scheduler,
+        clean=clean_future,
+        noise=future_noise,
+        timestep=future_timestep,
+        name="teacher_flow_exact_mcp_target",
+    )
+    main_sigma = flow_audit._resolved_sigma(
+        main_scheduler,
+        main_timestep,
+        clean_current,
+    )
+    future_sigma = flow_audit._resolved_sigma(
+        mcp_scheduler,
+        future_timestep,
+        clean_future,
+    )
+    teacher_future_timestep = float(future_sigma) * float(
+        DEFAULT_NUM_TRAIN_TIMESTEPS
+    )
+    noisy_batch = _build_full_sequence_validation_noisy_batch(
+        source_noise=source_noise,
+        teacher_target=teacher_target,
+        main_scheduler=main_scheduler,
+        mcp_scheduler=mcp_scheduler,
+        raw_timestep=raw,
+        main_timestep_value=main_t,
+        future_timestep_value=future_t,
+        current_noise=current_noise,
+        future_noise=future_noise,
+        current_state=current_state,
+        future_state=future_state,
+        exact_mcp_target=exact_mcp_target,
+    )
+    base_state_id = f"raw{raw:03d}_noise{noise_idx}"
+    if state_id_prefix:
+        state_id = f"{state_id_prefix}_{base_state_id}"
+    else:
+        state_id = base_state_id
+    provenance = {
+        "state_id": state_id,
+        "base_state_id": base_state_id,
+        "raw_timestep": raw,
+        "noise_index": noise_idx,
+        "main_shift": DEFAULT_S_MAIN,
+        "mcp_shift": DEFAULT_S_MCP,
+        "main_warped_timestep": float(main_t),
+        "future_warped_timestep": float(future_t),
+        "teacher_future_timestep": float(teacher_future_timestep),
+        "main_sigma": float(main_sigma),
+        "future_sigma": float(future_sigma),
+        "teacher_timestep_contract": "teacher_timestep = physical_sigma * 1000",
+        "current_noise": dict(current_noise_record),
+        "future_noise": dict(future_noise_record),
+        "history_chunk0": _tensor_record(
+            _chunk(teacher_target, HISTORY_CHUNK_INDEX)
+        ),
+        "clean_current": _tensor_record(clean_current),
+        "clean_future": _tensor_record(clean_future),
+        "current_state": _tensor_record(current_state),
+        "future_state": _tensor_record(future_state),
+        "exact_mcp_target": _tensor_record(exact_mcp_target),
+        "main_timestep_sha256": tensor_sha256(main_timestep.detach().cpu()),
+        "future_timestep_sha256": tensor_sha256(future_timestep.detach().cpu()),
+    }
+    if sample_identity is not None:
+        provenance["sample_identity"] = str(sample_identity)
+    if validation_position is not None:
+        provenance["validation_position"] = int(validation_position)
+    if identity_index is not None:
+        provenance["identity_index"] = int(identity_index)
+    return TeacherFlowAuditState(
+        state_id=state_id,
+        raw_timestep=raw,
+        noise_index=noise_idx,
+        main_warped_timestep=float(main_t),
+        future_warped_timestep=float(future_t),
+        teacher_future_timestep=float(teacher_future_timestep),
+        main_sigma=float(main_sigma),
+        future_sigma=float(future_sigma),
+        current_noise=current_noise,
+        future_noise=future_noise,
+        current_state=current_state,
+        future_state=future_state,
+        exact_mcp_target=exact_mcp_target,
+        noisy_batch=noisy_batch,
+        provenance=provenance,
+    )
 
 
 def run_student_mcp_full_sequence_predictions(
@@ -1530,6 +1615,255 @@ def _raise_current_oracle_failure(
         "exact current flow-to-x0 conversion oracle failed: "
         f"{reason}; diagnostic={payload}"
     )
+
+
+def classify_predicted_current_oracle_recheck(
+    diagnostic: Mapping[str, Any],
+    *,
+    original_bf16_oracle_pass: bool,
+) -> str:
+    if not _recheck_main_scheduler_contract_ok(diagnostic):
+        return SCHEDULER_MISMATCH
+    if not _recheck_raw_warp_contract_ok(diagnostic):
+        return SCHEDULER_MISMATCH
+    if not _recheck_state_provenance_contract_ok(diagnostic):
+        return STATE_PROVENANCE_MISMATCH
+    if not _recheck_scheduler_explicit_contract_ok(diagnostic):
+        return SCHEDULER_MISMATCH
+    if not _recheck_float32_reference_ok(diagnostic):
+        return SEMANTIC_MISMATCH
+    if bool(original_bf16_oracle_pass):
+        return EXACT_PASS
+    if _recheck_actual_bf16_reconstruction_only_failed(diagnostic):
+        return BF16_QUANTIZED_STATE_CONTRACT
+    return SEMANTIC_MISMATCH
+
+
+def build_predicted_current_oracle_recheck_artifact(
+    *,
+    diagnostic: Mapping[str, Any],
+    original_bf16_oracle_pass: bool,
+    runtime_git_sha: str,
+    sample_identity: str,
+    identity_index: int,
+    validation_position: int,
+    student_parameters_before: Mapping[str, Any],
+    student_parameters_after: Mapping[str, Any],
+    teacher_parameters_before: Mapping[str, Any],
+    teacher_parameters_after: Mapping[str, Any],
+    rng_before: str,
+    rng_after: str,
+    common_inputs_fingerprint_sha256: str | None = None,
+    artifact_identity: Mapping[str, Any] | None = None,
+    student_checkpoint_contract: Mapping[str, Any] | None = None,
+    checkpoint_summary: Mapping[str, Any] | None = None,
+    student_summary: Mapping[str, Any] | None = None,
+    teacher_summary: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    classification = classify_predicted_current_oracle_recheck(
+        diagnostic,
+        original_bf16_oracle_pass=bool(original_bf16_oracle_pass),
+    )
+    student_comparison = compare_parameter_sha256_reports(
+        student_parameters_before,
+        student_parameters_after,
+    )
+    teacher_comparison = compare_parameter_sha256_reports(
+        teacher_parameters_before,
+        teacher_parameters_after,
+    )
+    rng_unchanged = str(rng_before) == str(rng_after)
+    safety_pass = (
+        student_comparison["all_sha256_exact_match"] is True
+        and teacher_comparison["all_sha256_exact_match"] is True
+        and rng_unchanged
+    )
+    diagnostic_pass = classification in (EXACT_PASS, BF16_QUANTIZED_STATE_CONTRACT)
+    status = "PASS" if diagnostic_pass and safety_pass else "FAIL"
+    scheduler_actual = diagnostic["scheduler_actually_passed"]
+    return {
+        "schema": PREDICTED_CURRENT_ORACLE_RECHECK_SCHEMA,
+        "status": status,
+        "mode": PREDICTED_CURRENT_ORACLE_RECHECK_MODE,
+        "diagnostic_classification": classification,
+        "runtime_git_sha": str(runtime_git_sha),
+        "identity_index": int(identity_index),
+        "validation_position": int(validation_position),
+        "raw_timestep": int(diagnostic["raw_timestep"]),
+        "noise_index": int(diagnostic["noise_index"]),
+        "sample_identity": str(sample_identity),
+        "state_id": str(diagnostic.get("state_id", "")),
+        "main_scheduler_class": str(scheduler_actual["class"]),
+        "main_scheduler_shift": scheduler_actual["shift"],
+        "main_warped_timestep": float(diagnostic["warped_current_timestep"]),
+        "main_sigma": float(diagnostic["state_main_sigma"]),
+        "main_scheduler_sigma": float(diagnostic["resolved_sigma"]),
+        "current_state_vs_regenerated": _stats_subset(
+            diagnostic["noisy_state_vs_regenerated"],
+            keys=("torch_equal", "mse", "max_abs", "mean_abs"),
+        ),
+        "bf16_scheduler_reconstruction": _stats_subset(
+            diagnostic["recon_sched_vs_clean"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "bf16_explicit_formula_reconstruction": _stats_subset(
+            diagnostic["recon_formula_actual_vs_clean"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "scheduler_vs_explicit": _stats_subset(
+            diagnostic["recon_sched_vs_formula_actual"],
+            keys=("mse", "max_abs", "mean_abs"),
+        ),
+        "float32_reference": _stats_subset(
+            diagnostic["float32_reference"]["recon32_vs_clean32"],
+            keys=("mse", "max_abs", "mean_abs", "p99_abs"),
+        ),
+        "oracle_atol": float(CURRENT_X0_ORACLE_ATOL),
+        "oracle_rtol": float(CURRENT_X0_ORACLE_RTOL),
+        "original_bf16_oracle_pass": bool(original_bf16_oracle_pass),
+        "diagnostic_failure_case": diagnostic.get("failure_case"),
+        "student_parameter_sha_before": str(
+            student_parameters_before["fingerprint_sha256"]
+        ),
+        "student_parameter_sha_after": str(
+            student_parameters_after["fingerprint_sha256"]
+        ),
+        "student_parameters_unchanged": bool(
+            student_comparison["all_sha256_exact_match"]
+        ),
+        "student_parameter_comparison": student_comparison,
+        "teacher_parameter_sha_before": str(
+            teacher_parameters_before["fingerprint_sha256"]
+        ),
+        "teacher_parameter_sha_after": str(
+            teacher_parameters_after["fingerprint_sha256"]
+        ),
+        "teacher_parameters_unchanged": bool(
+            teacher_comparison["all_sha256_exact_match"]
+        ),
+        "teacher_parameter_comparison": teacher_comparison,
+        "rng_before": str(rng_before),
+        "rng_after": str(rng_after),
+        "rng_unchanged": bool(rng_unchanged),
+        "backward_executed": False,
+        "optimizer_step_executed": False,
+        "checkpoint_written": False,
+        "common_inputs_fingerprint_sha256": common_inputs_fingerprint_sha256,
+        "artifact_identity": (
+            None if artifact_identity is None else dict(artifact_identity)
+        ),
+        "student_checkpoint_contract": (
+            None
+            if student_checkpoint_contract is None
+            else dict(student_checkpoint_contract)
+        ),
+        "checkpoint": None if checkpoint_summary is None else dict(checkpoint_summary),
+        "student": None if student_summary is None else dict(student_summary),
+        "teacher": None if teacher_summary is None else dict(teacher_summary),
+        "exit_code_contract": (
+            "rc=0 for exact_pass or bf16_quantized_state_contract when "
+            "parameter and RNG safety checks pass; mismatch or safety failure rc=1"
+        ),
+    }
+
+
+def _stats_subset(
+    stats: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> dict[str, Any]:
+    result = {}
+    for key in keys:
+        value = stats[key]
+        if isinstance(value, bool):
+            result[key] = bool(value)
+        elif value is None:
+            result[key] = None
+        else:
+            result[key] = float(value)
+    return result
+
+
+def _recheck_main_scheduler_contract_ok(diagnostic: Mapping[str, Any]) -> bool:
+    actual = diagnostic["scheduler_actually_passed"]
+    return (
+        str(actual.get("class")) == "FlowMatchScheduler"
+        and _near_optional(actual.get("shift"), DEFAULT_S_MAIN, atol=1.0e-9)
+    )
+
+
+def _recheck_raw_warp_contract_ok(diagnostic: Mapping[str, Any]) -> bool:
+    return _near_optional(
+        diagnostic.get("warped_current_timestep"),
+        diagnostic.get("expected_main_warped_timestep"),
+        atol=1.0e-5,
+    ) and _near_optional(
+        diagnostic.get("resolved_sigma"),
+        diagnostic.get("state_main_sigma"),
+        atol=1.0e-7,
+    )
+
+
+def _recheck_state_provenance_contract_ok(diagnostic: Mapping[str, Any]) -> bool:
+    state = diagnostic["noisy_state_vs_regenerated"]
+    return state.get("torch_equal") is True
+
+
+def _recheck_scheduler_explicit_contract_ok(diagnostic: Mapping[str, Any]) -> bool:
+    return _max_abs_leq(
+        diagnostic["recon_sched_vs_formula_actual"],
+        PREDICTED_CURRENT_ORACLE_RECHECK_SCHEDULER_ATOL,
+    )
+
+
+def _recheck_float32_reference_ok(diagnostic: Mapping[str, Any]) -> bool:
+    reference = diagnostic["float32_reference"]
+    return (
+        reference.get("passes_existing_oracle_tolerance") is True
+        and _max_abs_leq(
+            reference["recon32_vs_clean32"],
+            PREDICTED_CURRENT_ORACLE_RECHECK_FLOAT32_ATOL,
+        )
+    )
+
+
+def _recheck_actual_bf16_reconstruction_only_failed(
+    diagnostic: Mapping[str, Any],
+) -> bool:
+    if not _recheck_actual_dtype_is_bf16(diagnostic):
+        return False
+    scheduler_failed = not _max_abs_leq(
+        diagnostic["recon_sched_vs_clean"],
+        CURRENT_X0_ORACLE_ATOL,
+    )
+    formula_failed = not _max_abs_leq(
+        diagnostic["recon_formula_actual_vs_clean"],
+        CURRENT_X0_ORACLE_ATOL,
+    )
+    return scheduler_failed or formula_failed
+
+
+def _recheck_actual_dtype_is_bf16(diagnostic: Mapping[str, Any]) -> bool:
+    metadata = diagnostic.get("tensor_dtypes_devices")
+    if not isinstance(metadata, Mapping):
+        return False
+    for key in ("clean", "noise", "state", "exact_flow", "reconstructed"):
+        value = metadata.get(key)
+        if not isinstance(value, Mapping):
+            return False
+        if str(value.get("dtype")) != "torch.bfloat16":
+            return False
+    return True
+
+
+def _max_abs_leq(stats: Mapping[str, Any], threshold: float) -> bool:
+    return float(stats["max_abs"]) <= float(threshold)
+
+
+def _near_optional(left: Any, right: Any, *, atol: float) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(float(left) - float(right)) <= float(atol)
 
 
 def _tensor_meta(tensor: torch.Tensor) -> dict[str, Any]:
@@ -3885,12 +4219,22 @@ __all__ = [
     "CURRENT_CHUNK_INDEX",
     "FUTURE_CHUNK_INDEX",
     "HISTORY_CHUNK_INDEX",
+    "BF16_QUANTIZED_STATE_CONTRACT",
+    "EXACT_PASS",
     "INCONCLUSIVE",
     "MATCHED_TEACHER_TIMESTEP_DEPENDENCE",
     "NO_SUPPORT",
     "NO_PRIVILEGED_CURRENT_SUPPORT",
     "PREDICTED_CURRENT_CLEARLY_WORSE_MARGIN",
+    "PREDICTED_CURRENT_ORACLE_RECHECK_CLASSIFICATIONS",
+    "PREDICTED_CURRENT_ORACLE_RECHECK_MODE",
+    "PREDICTED_CURRENT_ORACLE_RECHECK_NOISE_INDEX",
+    "PREDICTED_CURRENT_ORACLE_RECHECK_RAW_TIMESTEP",
+    "PREDICTED_CURRENT_ORACLE_RECHECK_SCHEMA",
     "PREDICTED_CURRENT_THRESHOLD_ATOL",
+    "SCHEDULER_MISMATCH",
+    "SEMANTIC_MISMATCH",
+    "STATE_PROVENANCE_MISMATCH",
     "STUDENT_MCP_BRANCH",
     "STUDENT_PREDICTED_CURRENT_BRANCH",
     "STRONG_PREDICTED_CURRENT_BRIDGE_SUPPORT",
@@ -3912,10 +4256,13 @@ __all__ = [
     "TeacherFlowAuditResult",
     "TeacherFlowAuditState",
     "aggregate_teacher_flow_metrics",
+    "build_predicted_current_oracle_recheck_artifact",
+    "build_predicted_current_oracle_recheck_state",
     "build_flow_match_scheduler",
     "build_teacher_flow_multi_identity_manifest",
     "build_teacher_flow_audit_result",
     "build_teacher_flow_audit_states",
+    "classify_predicted_current_oracle_recheck",
     "build_teacher_flow_state_records",
     "diagnostic_label_from_metrics",
     "exact_current_flow_conversion_oracle",

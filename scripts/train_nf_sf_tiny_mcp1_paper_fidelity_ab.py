@@ -93,6 +93,8 @@ TRAINABLE_EXPECTED_NONZERO_GRAD = (
     "mcp_depth1",
 )
 EXPECTED_NO_GRAD = ("mcp_depth2", "mcp_depth3", "main_final_head")
+STATE_IDENTITY_SCHEMA = f"{TINY_AB_SCHEMA}_state_identity_v1"
+FAIRNESS_KEY_SCHEMA = f"{TINY_AB_SCHEMA}_fairness_key_v1"
 
 
 @dataclass(frozen=True)
@@ -452,6 +454,100 @@ def validate_tiny_ab_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     return {"status": "PASS"}
 
 
+def canonical_state_identity_from_spec(state_spec: Mapping[str, Any]) -> dict[str, Any]:
+    required = (
+        "state_id",
+        "state_index",
+        "split",
+        "identity",
+        "split_index",
+        "selected_split_position",
+        "selected_identity_order",
+        "raw_order",
+        "raw_timestep",
+        "noise_index",
+        "anchor_index",
+        "current_chunk_index",
+        "future_chunk_index",
+        "mcp_depth",
+    )
+    missing = [key for key in required if key not in state_spec]
+    if missing:
+        raise RuntimeError(f"tiny A/B state identity missing fields: {missing}")
+    text_fields = ("state_id", "split", "identity")
+    for key in text_fields:
+        if str(state_spec[key]).strip() == "":
+            raise RuntimeError(f"tiny A/B state identity empty field: {key}")
+    identity = {
+        "schema": STATE_IDENTITY_SCHEMA,
+        "state_id": str(state_spec["state_id"]),
+        "state_index": int(state_spec["state_index"]),
+        "split": str(state_spec["split"]),
+        "identity": str(state_spec["identity"]),
+        "split_index": int(state_spec["split_index"]),
+        "selected_split_position": int(state_spec["selected_split_position"]),
+        "selected_identity_order": int(state_spec["selected_identity_order"]),
+        "raw_order": int(state_spec["raw_order"]),
+        "raw_timestep": int(state_spec["raw_timestep"]),
+        "noise_index": int(state_spec["noise_index"]),
+        "anchor_index": int(state_spec["anchor_index"]),
+        "current_chunk_index": int(state_spec["current_chunk_index"]),
+        "future_chunk_index": int(state_spec["future_chunk_index"]),
+        "mcp_depth": int(state_spec["mcp_depth"]),
+        "sample_index": (
+            None
+            if state_spec.get("sample_index") is None
+            else int(state_spec["sample_index"])
+        ),
+        "sample_id": (
+            None
+            if state_spec.get("sample_id") is None
+            else str(state_spec["sample_id"])
+        ),
+    }
+    if identity["split"] not in ("train", "validation"):
+        raise RuntimeError("tiny A/B state identity split must be train/validation")
+    if int(identity["raw_timestep"]) not in RAW_TIMESTEPS:
+        raise RuntimeError("tiny A/B state identity raw_timestep not preregistered")
+    identity["state_identity_sha256"] = _json_sha256(identity)
+    return identity
+
+
+def validate_canonical_state_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    if identity.get("schema") != STATE_IDENTITY_SCHEMA:
+        raise RuntimeError("tiny A/B state identity schema mismatch")
+    required = (
+        "state_id",
+        "state_index",
+        "split",
+        "identity",
+        "split_index",
+        "selected_split_position",
+        "selected_identity_order",
+        "raw_order",
+        "raw_timestep",
+        "noise_index",
+        "anchor_index",
+        "current_chunk_index",
+        "future_chunk_index",
+        "mcp_depth",
+        "sample_index",
+        "sample_id",
+        "state_identity_sha256",
+    )
+    missing = [key for key in required if key not in identity]
+    if missing:
+        raise RuntimeError(f"tiny A/B state identity missing fields: {missing}")
+    for key in ("state_id", "split", "identity", "state_identity_sha256"):
+        if str(identity[key]).strip() == "":
+            raise RuntimeError(f"tiny A/B state identity empty field: {key}")
+    expected = dict(identity)
+    actual_sha = str(expected.pop("state_identity_sha256"))
+    if _json_sha256(expected) != actual_sha:
+        raise RuntimeError("tiny A/B state identity SHA mismatch")
+    return {"status": "PASS"}
+
+
 def _video_add_noise(scheduler: Any, clean: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
     flat = scheduler.add_noise(
         clean.flatten(0, 1),
@@ -606,6 +702,8 @@ def anchor1_state_proof(
     return {
         "state_id": str(state_spec["state_id"]),
         "identity": str(state_spec["identity"]),
+        "split": str(state_spec["split"]),
+        "split_index": int(state_spec["split_index"]),
         "raw_timestep": int(state_spec["raw_timestep"]),
         "noise_index": int(state_spec["noise_index"]),
         "anchor_index": ANCHOR_INDEX,
@@ -869,6 +967,7 @@ def run_tiny_update_on_batch(
     state_spec: Mapping[str, Any],
     paper_fidelity_mcp1_mask: bool,
 ) -> dict[str, Any]:
+    state_identity = canonical_state_identity_from_spec(state_spec)
     optimizer.zero_grad(set_to_none=True)
     forward = run_tiny_anchor1_forward_loss(
         generator,
@@ -879,6 +978,12 @@ def run_tiny_update_on_batch(
     )
     if not bool(torch.isfinite(forward.loss.detach().float()).all().item()):
         raise RuntimeError("tiny A/B non-finite anchor1 loss")
+    fairness_key_from_state_record(
+        {
+            "state_identity": state_identity,
+            "state_proof": forward.state_proof,
+        }
+    )
     forward.loss.backward()
     gradient_report = gradient_group_report(generator)
     gradient_gate = validate_gradient_group_report(gradient_report)
@@ -887,6 +992,7 @@ def run_tiny_update_on_batch(
     return {
         "loss": float(forward.loss.detach().float().item()),
         "finite": True,
+        "state_identity": state_identity,
         "state_proof": forward.state_proof,
         "gradient_report": gradient_report,
         "gradient_gate": gradient_gate,
@@ -940,9 +1046,12 @@ def evaluate_tiny_states(
                     )
                     records.append(
                         {
+                            "state_identity": canonical_state_identity_from_spec(state),
                             "state_id": str(state["state_id"]),
                             "state_index": int(state["state_index"]),
+                            "split": str(state["split"]),
                             "identity": str(state["identity"]),
+                            "split_index": int(state["split_index"]),
                             "raw_timestep": int(state["raw_timestep"]),
                             "noise_index": int(state["noise_index"]),
                             "mcp1_anchor1_mse": float(
@@ -1100,12 +1209,21 @@ def classify_tiny_ab_decision(
 
 
 def fairness_key_from_state_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    if "state_identity" not in record:
+        raise RuntimeError("tiny A/B record missing canonical state_identity")
+    state_identity = record["state_identity"]
+    if not isinstance(state_identity, Mapping):
+        raise RuntimeError("tiny A/B record state_identity must be a mapping")
+    validate_canonical_state_identity(state_identity)
     proof = record["state_proof"]
+    for key in ("future_noise_sha256", "future_target_sha256", "exact_fm_target_sha256"):
+        if key not in proof:
+            raise RuntimeError(f"tiny A/B state proof missing field: {key}")
+        if str(proof[key]).strip() == "":
+            raise RuntimeError(f"tiny A/B state proof empty field: {key}")
     return {
-        "state_id": str(record["state_id"]),
-        "identity": str(record["identity"]),
-        "raw_timestep": int(record["raw_timestep"]),
-        "noise_index": int(record["noise_index"]),
+        "schema": FAIRNESS_KEY_SCHEMA,
+        "state_identity": dict(state_identity),
         "future_noise_sha256": str(proof["future_noise_sha256"]),
         "future_target_sha256": str(proof["future_target_sha256"]),
         "exact_fm_target_sha256": str(proof["exact_fm_target_sha256"]),

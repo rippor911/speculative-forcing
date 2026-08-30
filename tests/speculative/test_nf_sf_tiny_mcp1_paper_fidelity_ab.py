@@ -148,28 +148,89 @@ def _synthetic_plan() -> dict:
     return plan
 
 
-def _eval_record(identity: str, raw_timestep: int, mse: float) -> dict:
+def _state_spec(
+    *,
+    split: str = "train",
+    identity: str = "identity_0000",
+    state_index: int = 0,
+    split_index: int = 0,
+    selected_split_position: int = 0,
+    selected_identity_order: int = 0,
+    raw_timestep: int = 999,
+    raw_order: int = 0,
+    noise_index: int = tiny_ab.NOISE_INDEX,
+) -> dict:
     return {
-        "state_id": f"{identity}_raw{raw_timestep}",
-        "state_index": 0,
+        "state_id": (
+            f"{split}_sel{selected_identity_order:02d}_"
+            f"pos{selected_split_position:04d}_raw{raw_timestep:03d}_"
+            f"noise{noise_index}"
+        ),
+        "state_index": int(state_index),
+        "split": split,
+        "selection_policy": "uniform_even_split_positions_identity_major_raw_order",
+        "selected_identity_order": int(selected_identity_order),
+        "selected_split_position": int(selected_split_position),
         "identity": identity,
+        "split_index": int(split_index),
+        "sample_index": int(split_index),
+        "sample_id": None,
+        "raw_order": int(raw_order),
         "raw_timestep": int(raw_timestep),
-        "noise_index": tiny_ab.NOISE_INDEX,
+        "noise_index": int(noise_index),
+        "anchor_index": tiny_ab.ANCHOR_INDEX,
+        "current_chunk_index": tiny_ab.CURRENT_CHUNK_INDEX,
+        "future_chunk_index": tiny_ab.FUTURE_CHUNK_INDEX,
+        "mcp_depth": tiny_ab.MCP_DEPTH,
+    }
+
+
+def _eval_record(state_spec: dict, mse: float) -> dict:
+    return {
+        "state_identity": tiny_ab.canonical_state_identity_from_spec(state_spec),
+        "state_id": str(state_spec["state_id"]),
+        "state_index": int(state_spec["state_index"]),
+        "split": str(state_spec["split"]),
+        "split_index": int(state_spec["split_index"]),
+        "identity": str(state_spec["identity"]),
+        "raw_timestep": int(state_spec["raw_timestep"]),
+        "noise_index": int(state_spec["noise_index"]),
         "mcp1_anchor1_mse": float(mse),
         "finite": True,
         "state_proof": {
-            "future_noise_sha256": f"noise-{identity}-{raw_timestep}",
-            "future_target_sha256": f"target-{identity}-{raw_timestep}",
-            "exact_fm_target_sha256": f"fm-{identity}-{raw_timestep}",
+            "future_noise_sha256": (
+                f"noise-{state_spec['split']}-{state_spec['identity']}-"
+                f"{state_spec['raw_timestep']}-{state_spec['noise_index']}"
+            ),
+            "future_target_sha256": (
+                f"target-{state_spec['split']}-{state_spec['identity']}-"
+                f"{state_spec['raw_timestep']}"
+            ),
+            "exact_fm_target_sha256": (
+                f"fm-{state_spec['split']}-{state_spec['identity']}-"
+                f"{state_spec['raw_timestep']}-{state_spec['noise_index']}"
+            ),
         },
     }
 
 
 def _eval_report(mse_by_identity_raw: dict[tuple[str, int], float]) -> dict:
-    records = [
-        _eval_record(identity, raw, mse)
-        for (identity, raw), mse in mse_by_identity_raw.items()
-    ]
+    records = []
+    for state_index, ((identity, raw), mse) in enumerate(mse_by_identity_raw.items()):
+        split = "validation" if str(identity).startswith("val_") else "train"
+        raw_order = tiny_ab.RAW_TIMESTEPS.index(int(raw))
+        selected_identity_order = state_index // len(tiny_ab.RAW_TIMESTEPS)
+        state = _state_spec(
+            split=split,
+            identity=identity,
+            state_index=state_index,
+            split_index=selected_identity_order,
+            selected_split_position=selected_identity_order,
+            selected_identity_order=selected_identity_order,
+            raw_timestep=raw,
+            raw_order=raw_order,
+        )
+        records.append(_eval_record(state, mse))
     return {
         "schema": tiny_ab.TINY_AB_EVAL_SCHEMA,
         "state_count": len(records),
@@ -226,6 +287,23 @@ def _arm_result(*, mse: float, paper_flag: bool = False) -> dict:
     }
 
 
+def _state_record_from_plan_state(state: dict, *, mse: float = 1.0) -> dict:
+    return _eval_record(state, mse)
+
+
+def _old_buggy_fairness_key_from_state_record(record: dict) -> dict:
+    proof = record["state_proof"]
+    return {
+        "state_id": str(record["state_id"]),
+        "identity": str(record["identity"]),
+        "raw_timestep": int(record["raw_timestep"]),
+        "noise_index": int(record["noise_index"]),
+        "future_noise_sha256": str(proof["future_noise_sha256"]),
+        "future_target_sha256": str(proof["future_target_sha256"]),
+        "exact_fm_target_sha256": str(proof["exact_fm_target_sha256"]),
+    }
+
+
 def test_tiny_state_plan_has_32_train_and_32_held_out_states() -> None:
     plan = tiny_ab.build_tiny_ab_plan(_synthetic_plan())
     state_plan = plan["state_plan"]
@@ -255,6 +333,90 @@ def test_tiny_state_plan_has_32_train_and_32_held_out_states() -> None:
     assert plan["sample_data_provenance"]["noise_source"] == (
         "formal_sample_source_noise_index0"
     )
+
+
+def test_fairness_keys_are_unique_for_all_train_and_validation_states() -> None:
+    plan = tiny_ab.build_tiny_ab_plan(_synthetic_plan())
+    train_records = [
+        _state_record_from_plan_state(state)
+        for state in plan["state_plan"]["train_states"]
+    ]
+    validation_records = [
+        _state_record_from_plan_state(state)
+        for state in plan["state_plan"]["validation_states"]
+    ]
+    train_keys = [
+        tiny_ab.fairness_key_from_state_record(record)
+        for record in train_records
+    ]
+    validation_keys = [
+        tiny_ab.fairness_key_from_state_record(record)
+        for record in validation_records
+    ]
+    train_identity_hashes = {
+        key["state_identity"]["state_identity_sha256"]
+        for key in train_keys
+    }
+    validation_identity_hashes = {
+        key["state_identity"]["state_identity_sha256"]
+        for key in validation_keys
+    }
+
+    assert len(train_keys) == 32
+    assert len(validation_keys) == 32
+    assert len(train_identity_hashes) == 32
+    assert len(validation_identity_hashes) == 32
+    assert train_identity_hashes.isdisjoint(validation_identity_hashes)
+
+
+def test_fairness_key_contract_distinguishes_state_axes_and_arm_metadata_is_ignored() -> None:
+    base = _state_spec()
+    base_record = _state_record_from_plan_state(base)
+    canonical_key = tiny_ab.fairness_key_from_state_record(
+        {**base_record, "arm": "canonical", "paper_fidelity_mcp1_mask": False}
+    )
+    paper_key = tiny_ab.fairness_key_from_state_record(
+        {**base_record, "arm": "paper_fidelity", "paper_fidelity_mcp1_mask": True}
+    )
+    assert canonical_key == paper_key
+
+    raw_changed = {**base, "raw_timestep": 750, "raw_order": 1}
+    identity_changed = {
+        **base,
+        "identity": "identity_0001",
+        "split_index": 1,
+        "selected_split_position": 1,
+        "selected_identity_order": 1,
+    }
+    noise_changed = {**base, "noise_index": 1}
+
+    assert tiny_ab.fairness_key_from_state_record(
+        _state_record_from_plan_state(raw_changed)
+    ) != canonical_key
+    assert tiny_ab.fairness_key_from_state_record(
+        _state_record_from_plan_state(identity_changed)
+    ) != canonical_key
+    assert tiny_ab.fairness_key_from_state_record(
+        _state_record_from_plan_state(noise_changed)
+    ) != canonical_key
+
+
+def test_fairness_key_fails_closed_without_state_identity_or_with_empty_fields() -> None:
+    record = _state_record_from_plan_state(_state_spec())
+    missing_identity = dict(record)
+    del missing_identity["state_identity"]
+    with pytest.raises(RuntimeError, match="missing canonical state_identity"):
+        tiny_ab.fairness_key_from_state_record(missing_identity)
+
+    bad_identity = copy.deepcopy(record)
+    bad_identity["state_identity"]["identity"] = ""
+    with pytest.raises(RuntimeError, match="empty field: identity"):
+        tiny_ab.fairness_key_from_state_record(bad_identity)
+
+    bad_proof = copy.deepcopy(record)
+    bad_proof["state_proof"]["future_noise_sha256"] = ""
+    with pytest.raises(RuntimeError, match="empty field: future_noise_sha256"):
+        tiny_ab.fairness_key_from_state_record(bad_proof)
 
 
 def test_update_schedule_is_fixed_200_step_cycle_without_early_stop() -> None:
@@ -300,12 +462,7 @@ def test_forward_sets_requested_flag_and_uses_only_anchor1_mcp1_loss() -> None:
         generator,
         conditional_dict={"prompt_embeds": torch.zeros(1, 1, 1)},
         noisy_batch=batch,
-        state_spec={
-            "state_id": "s",
-            "identity": "i",
-            "raw_timestep": 999,
-            "noise_index": 0,
-        },
+        state_spec=_state_spec(),
         paper_fidelity_mcp1_mask=True,
     )
 
@@ -349,12 +506,7 @@ def test_tiny_update_updates_backbone_patch_fusion_mcp1_only() -> None:
         optimizer=optimizer,
         conditional_dict={},
         noisy_batch=_loss_batch(anchor1_target=0.0),
-        state_spec={
-            "state_id": "s",
-            "identity": "i",
-            "raw_timestep": 999,
-            "noise_index": 0,
-        },
+        state_spec=_state_spec(),
         paper_fidelity_mcp1_mask=False,
     )
     after = tiny_ab.parameter_group_sha256_report(generator)
@@ -366,6 +518,61 @@ def test_tiny_update_updates_backbone_patch_fusion_mcp1_only() -> None:
         assert group in updates["updated_groups"]
     for group in ("mcp_depth2", "mcp_depth3", "main_final_head"):
         assert group in updates["unchanged_groups"]
+
+
+def test_real_update_record_builder_reproduces_old_state_id_bug_and_fixed_key() -> None:
+    plan = tiny_ab.build_tiny_ab_plan(_synthetic_plan())
+    state = plan["state_plan"]["train_states"][4]
+    generator = FakeTrainGenerator()
+    optimizer = torch.optim.SGD(generator.parameters(), lr=0.01)
+
+    record = tiny_ab.run_tiny_update_on_batch(
+        generator=generator,
+        optimizer=optimizer,
+        conditional_dict={},
+        noisy_batch=_loss_batch(anchor1_target=0.0),
+        state_spec=state,
+        paper_fidelity_mcp1_mask=False,
+    )
+
+    assert sorted(record.keys()) == [
+        "finite",
+        "gradient_gate",
+        "gradient_report",
+        "loss",
+        "state_identity",
+        "state_proof",
+    ]
+    assert "state_id" not in record
+    with pytest.raises(KeyError, match="state_id"):
+        _old_buggy_fairness_key_from_state_record(record)
+
+    fixed_key = tiny_ab.fairness_key_from_state_record(record)
+    assert fixed_key["schema"] == tiny_ab.FAIRNESS_KEY_SCHEMA
+    assert fixed_key["state_identity"]["state_id"] == state["state_id"]
+    assert fixed_key["state_identity"]["split"] == "train"
+    assert fixed_key["state_identity"]["raw_timestep"] == 999
+
+
+def test_state_identity_schema_failure_happens_before_optimizer_step() -> None:
+    generator = FakeTrainGenerator()
+    before = tiny_ab.parameter_group_sha256_report(generator)
+    optimizer = torch.optim.SGD(generator.parameters(), lr=0.01)
+    bad_state = _state_spec()
+    del bad_state["state_id"]
+
+    with pytest.raises(RuntimeError, match="state identity missing fields"):
+        tiny_ab.run_tiny_update_on_batch(
+            generator=generator,
+            optimizer=optimizer,
+            conditional_dict={},
+            noisy_batch=_loss_batch(anchor1_target=0.0),
+            state_spec=bad_state,
+            paper_fidelity_mcp1_mask=False,
+        )
+
+    after = tiny_ab.parameter_group_sha256_report(generator)
+    assert before["aggregate_sha256"] == after["aggregate_sha256"]
 
 
 def test_gradient_contract_rejects_mcp2_or_main_head_grad() -> None:
@@ -406,12 +613,7 @@ def test_nonfinite_loss_fails_closed() -> None:
             optimizer=torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=0.1),
             conditional_dict={},
             noisy_batch=_loss_batch(),
-            state_spec={
-                "state_id": "s",
-                "identity": "i",
-                "raw_timestep": 999,
-                "noise_index": 0,
-            },
+            state_spec=_state_spec(),
             paper_fidelity_mcp1_mask=True,
         )
 

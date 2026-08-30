@@ -282,6 +282,16 @@ def _arm_result(*, mse: float, paper_flag: bool = False) -> dict:
         "train_eval_step200": train,
         "final_state": {
             "schema": f"{tiny_ab.TINY_AB_SCHEMA}_final_state_v1",
+            "arm": "paper_fidelity" if paper_flag else "canonical",
+            "parent_checkpoint_sha256": tiny_ab.PARENT_CHECKPOINT_SHA256,
+            "parent_global_step": tiny_ab.PARENT_STEP,
+            "initial_parameter_sha256": "params",
+            "final_parameter_sha256": "final-params",
+            "initial_optimizer_fingerprint_sha256": "optim",
+            "final_optimizer_fingerprint_sha256": "final-optim",
+            "initial_rng_fingerprint_sha256": "rng",
+            "final_rng_fingerprint_sha256": "final-rng",
+            "state_plan_fingerprint_sha256": "state-plan",
             "parameter_updates": {"pass": True},
         },
     }
@@ -687,6 +697,182 @@ def test_summary_schema_and_fairness_proof_cover_parent_rng_and_paired_tensors()
     fairness = tiny_ab.compare_arm_fairness(control, broken)
     assert fairness["status"] == "FAIL"
     assert fairness["same_sample_order_and_paired_state_tensors"] is False
+
+
+def test_arm_result_payload_contract_rejects_torch_tensors() -> None:
+    result = _arm_result(mse=1.0, paper_flag=False)
+
+    assert tiny_ab.assert_json_safe_no_tensors(result, name="arm")["status"] == "PASS"
+
+    broken = copy.deepcopy(result)
+    broken["validation_step200"]["records"][0]["tensor"] = torch.zeros(())
+    with pytest.raises(RuntimeError, match="torch.Tensor"):
+        tiny_ab.assert_json_safe_no_tensors(broken, name="arm")
+
+
+def test_teardown_tiny_arm_runtime_records_boundary_and_fails_high_allocated() -> None:
+    def snapshot(label: str, device: torch.device) -> dict:
+        return {
+            "label": label,
+            "cuda": True,
+            "allocated": 0,
+            "reserved": 0,
+            "max_allocated": 123,
+            "max_reserved": 456,
+            "total": 80 * 1024**3,
+        }
+
+    report = tiny_ab.teardown_tiny_arm_runtime(
+        arm_name="canonical",
+        device=torch.device("cuda:0"),
+        output_dir=None,
+        snapshot_fn=snapshot,
+    )
+    assert report["status"] == "PASS"
+    assert report["isolation_strategy"] == "subprocess_per_arm_process_exit"
+    assert report["arm_end"]["label"] == "arm_end"
+    assert report["after_gc"]["label"] == "after_gc"
+    assert report["after_empty_cache"]["label"] == "after_empty_cache"
+
+    def high_snapshot(label: str, device: torch.device) -> dict:
+        item = snapshot(label, device)
+        if label == "after_empty_cache":
+            item["allocated"] = tiny_ab.ARM_TEARDOWN_MAX_ALLOCATED_BYTES + 1
+        return item
+
+    with pytest.raises(
+        RuntimeError,
+        match=tiny_ab.FAIL_ARM_TEARDOWN_GPU_MEMORY_NOT_RELEASED,
+    ):
+        tiny_ab.teardown_tiny_arm_runtime(
+            arm_name="canonical",
+            device=torch.device("cuda:0"),
+            output_dir=None,
+            snapshot_fn=high_snapshot,
+        )
+
+
+def test_subprocess_command_preserves_scientific_contract_and_selects_arm() -> None:
+    args = tiny_ab.parse_args(
+        [
+            "--execute_real_run",
+            "--config",
+            "configs/self_forcing_dmd_mcp.yaml",
+            "--checkpoint",
+            "checkpoints/self_forcing_dmd.pt",
+            "--parent_checkpoint",
+            str(tiny_ab.PARENT_CHECKPOINT),
+            "--expected_runtime_git_sha",
+            "a" * 40,
+            "--sample_plan",
+            "sample_plan.json",
+            "--manifest",
+            "manifest.json",
+            "--dataset_root",
+            "dataset",
+            "--conditionals_artifact",
+            "conditionals",
+            "--output_dir",
+            "/tmp/tiny_ab",
+        ]
+    )
+    canonical_cmd = tiny_ab.tiny_arm_subprocess_command(args, tiny_ab.arm_specs()[0])
+    treatment_cmd = tiny_ab.tiny_arm_subprocess_command(args, tiny_ab.arm_specs()[1])
+
+    assert "--execute_real_run" in canonical_cmd
+    assert canonical_cmd[canonical_cmd.index("--run_single_arm") + 1] == "canonical"
+    assert treatment_cmd[treatment_cmd.index("--run_single_arm") + 1] == "paper_fidelity"
+    assert canonical_cmd[canonical_cmd.index("--parent_checkpoint") + 1] == treatment_cmd[
+        treatment_cmd.index("--parent_checkpoint") + 1
+    ]
+    assert "--paper_fidelity_mcp1_mask" not in canonical_cmd
+    assert "--paper_fidelity_mcp1_mask" not in treatment_cmd
+    assert "--run_full_sequence_train_step" not in canonical_cmd
+
+
+def test_subprocess_failure_propagates_without_silent_summary() -> None:
+    def failing_run(command, cwd, text):
+        assert cwd == tiny_ab.ROOT
+        assert text is True
+        assert "--run_single_arm" in command
+        return types.SimpleNamespace(returncode=7)
+
+    with pytest.raises(RuntimeError, match="arm subprocess failed"):
+        tiny_ab.run_tiny_arm_subprocess(
+            args=tiny_ab.parse_args(
+                [
+                    "--execute_real_run",
+                    "--expected_runtime_git_sha",
+                    "a" * 40,
+                    "--sample_plan",
+                    "sample_plan.json",
+                    "--manifest",
+                    "manifest.json",
+                    "--dataset_root",
+                    "dataset",
+                    "--conditionals_artifact",
+                    "conditionals",
+                    "--output_dir",
+                    "/tmp/tiny_ab",
+                ]
+            ),
+            arm=tiny_ab.arm_specs()[0],
+            run_fn=failing_run,
+        )
+
+
+def test_load_arm_result_from_artifacts_reconstructs_json_safe_payload(monkeypatch) -> None:
+    arm = tiny_ab.arm_specs()[0]
+    arm_result = _arm_result(mse=1.0, paper_flag=False)
+    payloads = {
+        "validation_step000.json": arm_result["validation_step0"],
+        "validation_step200.json": arm_result["validation_step200"],
+        "train_eval_step000.json": arm_result["train_eval_step0"],
+        "train_eval_step200.json": arm_result["train_eval_step200"],
+        "final_state.json": arm_result["final_state"],
+    }
+    metrics = list(arm_result["train_eval_step200"]["records"])
+    while len(metrics) < tiny_ab.TARGET_TINY_STEP:
+        metrics.extend(copy.deepcopy(metrics))
+
+    monkeypatch.setattr(
+        tiny_ab,
+        "_read_json",
+        lambda path: copy.deepcopy(payloads[Path(path).name]),
+    )
+    monkeypatch.setattr(
+        tiny_ab,
+        "_read_jsonl",
+        lambda path: copy.deepcopy(tuple(metrics[: tiny_ab.TARGET_TINY_STEP])),
+    )
+
+    loaded = tiny_ab.load_tiny_arm_result_from_artifacts(
+        arm=arm,
+        output_dir=Path("/tmp/tiny_ab"),
+    )
+
+    assert loaded["arm"] == "canonical"
+    assert len(loaded["train_state_order"]) == tiny_ab.TARGET_TINY_STEP
+    assert loaded["all_loss_and_grad_finite"] is True
+    assert tiny_ab.assert_json_safe_no_tensors(loaded, name="loaded")["status"] == "PASS"
+
+
+def test_arm_boundary_report_records_canonical_boundary_fields() -> None:
+    canonical = {
+        "schema": tiny_ab.TINY_AB_ARM_BOUNDARY_MEMORY_SCHEMA,
+        "status": "PASS",
+        "arm": "canonical",
+        "arm_end": {"allocated": 11, "reserved": 22},
+        "after_gc": {"allocated": 3, "reserved": 4},
+        "after_empty_cache": {"allocated": 0, "reserved": 1},
+    }
+    report = tiny_ab.build_arm_boundary_report([canonical])
+
+    assert report["status"] == "PASS"
+    assert report["canonical_end_allocated"] == 11
+    assert report["canonical_end_reserved"] == 22
+    assert report["after_empty_cache_allocated"] == 0
+    assert report["isolation_strategy"] == "subprocess_per_arm_process_exit"
 
 
 def test_dry_run_preregisters_plan_without_real_cuda_or_data_access() -> None:

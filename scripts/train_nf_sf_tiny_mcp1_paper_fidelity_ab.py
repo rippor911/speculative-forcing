@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import hashlib
 import importlib
 import json
@@ -58,9 +59,11 @@ TINY_AB_PLAN_SCHEMA = f"{TINY_AB_SCHEMA}_plan_v1"
 TINY_AB_ARM_SCHEMA = f"{TINY_AB_SCHEMA}_arm_v1"
 TINY_AB_EVAL_SCHEMA = f"{TINY_AB_SCHEMA}_evaluation_v1"
 TINY_AB_SUMMARY_SCHEMA = f"{TINY_AB_SCHEMA}_summary_v1"
+TINY_AB_ARM_BOUNDARY_MEMORY_SCHEMA = f"{TINY_AB_SCHEMA}_arm_boundary_memory_v1"
 SUPPORT_PAPER_FIDELITY_MCP1 = "SUPPORT_PAPER_FIDELITY_MCP1"
 NO_SUPPORT = "NO_SUPPORT"
 INCONCLUSIVE = "INCONCLUSIVE"
+FAIL_ARM_TEARDOWN_GPU_MEMORY_NOT_RELEASED = "FAIL_ARM_TEARDOWN_GPU_MEMORY_NOT_RELEASED"
 
 PARENT_STEP = 6500
 TARGET_TINY_STEP = 200
@@ -95,6 +98,7 @@ TRAINABLE_EXPECTED_NONZERO_GRAD = (
 EXPECTED_NO_GRAD = ("mcp_depth2", "mcp_depth3", "main_final_head")
 STATE_IDENTITY_SCHEMA = f"{TINY_AB_SCHEMA}_state_identity_v1"
 FAIRNESS_KEY_SCHEMA = f"{TINY_AB_SCHEMA}_fairness_key_v1"
+ARM_TEARDOWN_MAX_ALLOCATED_BYTES = 1 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -168,6 +172,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--log_interval", type=int, default=25)
+    parser.add_argument("--run_single_arm", choices=("canonical", "paper_fidelity"))
     return parser.parse_args(argv)
 
 
@@ -1422,6 +1427,275 @@ def _load_store_class(module_name: str, class_name_parts: Sequence[str]) -> Any:
     return getattr(module, "".join(class_name_parts))
 
 
+def cuda_memory_snapshot(label: str, device: torch.device) -> dict[str, Any]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {
+            "label": str(label),
+            "cuda": False,
+            "allocated": 0,
+            "reserved": 0,
+            "max_allocated": 0,
+            "max_reserved": 0,
+            "total": 0,
+        }
+    return {
+        "label": str(label),
+        "cuda": True,
+        "allocated": int(torch.cuda.memory_allocated(device)),
+        "reserved": int(torch.cuda.memory_reserved(device)),
+        "max_allocated": int(torch.cuda.max_memory_allocated(device)),
+        "max_reserved": int(torch.cuda.max_memory_reserved(device)),
+        "total": int(torch.cuda.get_device_properties(device).total_memory),
+    }
+
+
+def tensor_paths_in_payload(value: Any, *, path: str = "$") -> tuple[str, ...]:
+    if torch.is_tensor(value):
+        return (path,)
+    if isinstance(value, Mapping):
+        paths: list[str] = []
+        for key, item in value.items():
+            paths.extend(tensor_paths_in_payload(item, path=f"{path}.{key}"))
+        return tuple(paths)
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(tensor_paths_in_payload(item, path=f"{path}[{index}]"))
+        return tuple(paths)
+    return ()
+
+
+def assert_json_safe_no_tensors(value: Any, *, name: str) -> dict[str, Any]:
+    tensor_paths = tensor_paths_in_payload(value)
+    if tensor_paths:
+        raise RuntimeError(
+            f"{name} unexpectedly contains torch.Tensor values: {list(tensor_paths[:8])}"
+        )
+    json.dumps(value, sort_keys=True)
+    return {"status": "PASS", "tensor_paths": []}
+
+
+def teardown_tiny_arm_runtime(
+    *,
+    arm_name: str,
+    device: torch.device,
+    output_dir: Path | None = None,
+    snapshot_fn: Any = cuda_memory_snapshot,
+) -> dict[str, Any]:
+    arm_end = snapshot_fn("arm_end", device)
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    after_gc = snapshot_fn("after_gc", device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    after_empty_cache = snapshot_fn("after_empty_cache", device)
+    report = {
+        "schema": TINY_AB_ARM_BOUNDARY_MEMORY_SCHEMA,
+        "status": "PASS",
+        "arm": str(arm_name),
+        "isolation_strategy": "subprocess_per_arm_process_exit",
+        "max_allowed_allocated_bytes_after_empty_cache": ARM_TEARDOWN_MAX_ALLOCATED_BYTES,
+        "arm_end": arm_end,
+        "after_gc": after_gc,
+        "after_empty_cache": after_empty_cache,
+        "process_exit_releases_remaining_cuda_context": True,
+    }
+    if bool(after_empty_cache.get("cuda", False)) and int(
+        after_empty_cache.get("allocated", 0)
+    ) > ARM_TEARDOWN_MAX_ALLOCATED_BYTES:
+        report["status"] = FAIL_ARM_TEARDOWN_GPU_MEMORY_NOT_RELEASED
+    if output_dir is not None:
+        arm_dir = Path(output_dir) / str(
+            next(arm["path"] for arm in arm_specs() if arm["name"] == arm_name)
+        )
+        arm_dir.mkdir(parents=True, exist_ok=True)
+        _trainer_helpers()["write_m4_json"](
+            report,
+            arm_dir / "arm_boundary_memory.json",
+        )
+    if report["status"] != "PASS":
+        raise RuntimeError(FAIL_ARM_TEARDOWN_GPU_MEMORY_NOT_RELEASED)
+    return report
+
+
+def _append_cli_arg(command: list[str], flag: str, value: Any) -> None:
+    if value is None:
+        return
+    command.extend([flag, str(value)])
+
+
+def tiny_arm_subprocess_command(
+    args: argparse.Namespace,
+    arm: Mapping[str, Any],
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--execute_real_run",
+        "--run_single_arm",
+        str(arm["name"]),
+    ]
+    for flag, value in (
+        ("--config", args.config),
+        ("--checkpoint", args.checkpoint),
+        ("--parent_checkpoint", args.parent_checkpoint),
+        (
+            "--expected_parent_checkpoint_sha256",
+            args.expected_parent_checkpoint_sha256,
+        ),
+        ("--expected_parent_global_step", args.expected_parent_global_step),
+        ("--expected_parent_checkpoint_git_sha", args.expected_parent_checkpoint_git_sha),
+        ("--expected_runtime_git_sha", args.expected_runtime_git_sha),
+        ("--sample_plan", args.sample_plan),
+        ("--manifest", args.manifest),
+        ("--dataset_root", args.dataset_root),
+        ("--conditionals_artifact", args.conditionals_artifact),
+        ("--output_dir", args.output_dir),
+        ("--device", args.device),
+        ("--dtype", args.dtype),
+        ("--log_interval", args.log_interval),
+    ):
+        _append_cli_arg(command, flag, value)
+    return command
+
+
+def run_tiny_arm_subprocess(
+    *,
+    args: argparse.Namespace,
+    arm: Mapping[str, Any],
+    run_fn: Any = subprocess.run,
+) -> dict[str, Any]:
+    command = tiny_arm_subprocess_command(args, arm)
+    completed = run_fn(command, cwd=ROOT, text=True)
+    returncode = int(getattr(completed, "returncode", 0))
+    report = {
+        "schema": f"{TINY_AB_SCHEMA}_arm_subprocess_v1",
+        "arm": str(arm["name"]),
+        "command": command,
+        "returncode": returncode,
+    }
+    if returncode != 0:
+        raise RuntimeError(
+            f"tiny A/B arm subprocess failed: arm={arm['name']} returncode={returncode}"
+        )
+    return report
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _read_jsonl(path: Path) -> tuple[dict[str, Any], ...]:
+    records = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return tuple(records)
+
+
+def load_tiny_arm_result_from_artifacts(
+    *,
+    arm: Mapping[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    arm_dir = Path(output_dir) / str(arm["path"])
+    validation_step0 = _read_json(arm_dir / "validation_step000.json")
+    validation_step200 = _read_json(arm_dir / "validation_step200.json")
+    train_eval_step0 = _read_json(arm_dir / "train_eval_step000.json")
+    train_eval_step200 = _read_json(arm_dir / "train_eval_step200.json")
+    final_state = _read_json(arm_dir / "final_state.json")
+    metrics = _read_jsonl(arm_dir / "metrics.jsonl")
+    if len(metrics) != TARGET_TINY_STEP:
+        raise RuntimeError("tiny A/B arm metrics must contain exactly 200 records")
+    result = {
+        "schema": TINY_AB_ARM_SCHEMA,
+        "arm": str(arm["name"]),
+        "mcp_path_kind": str(arm["mcp_path_kind"]),
+        "paper_fidelity_mcp1_mask": bool(arm["paper_fidelity_mcp1_mask"]),
+        "parent_checkpoint_sha256": str(final_state["parent_checkpoint_sha256"]),
+        "parent_global_step": int(final_state["parent_global_step"]),
+        "initial_parameter_sha256": str(final_state["initial_parameter_sha256"]),
+        "initial_optimizer_fingerprint_sha256": str(
+            final_state["initial_optimizer_fingerprint_sha256"]
+        ),
+        "initial_rng_fingerprint_sha256": str(
+            final_state["initial_rng_fingerprint_sha256"]
+        ),
+        "state_plan_fingerprint_sha256": str(
+            final_state["state_plan_fingerprint_sha256"]
+        ),
+        "train_state_order": [
+            fairness_key_from_state_record(record)
+            for record in metrics
+        ],
+        "all_loss_and_grad_finite": all(
+            bool(record.get("finite", False)) for record in metrics
+        ),
+        "validation_step0": validation_step0,
+        "validation_step200": validation_step200,
+        "train_eval_step0": train_eval_step0,
+        "train_eval_step200": train_eval_step200,
+        "final_state": final_state,
+    }
+    assert_json_safe_no_tensors(result, name=f"{arm['name']} arm result")
+    return result
+
+
+def load_arm_boundary_memory(
+    *,
+    arm: Mapping[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    return _read_json(Path(output_dir) / str(arm["path"]) / "arm_boundary_memory.json")
+
+
+def build_arm_boundary_report(
+    boundary_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    by_arm = {str(record["arm"]): dict(record) for record in boundary_records}
+    canonical = by_arm.get("canonical")
+    report = {
+        "schema": TINY_AB_ARM_BOUNDARY_MEMORY_SCHEMA,
+        "status": (
+            "PASS"
+            if all(record.get("status") == "PASS" for record in boundary_records)
+            else FAIL_ARM_TEARDOWN_GPU_MEMORY_NOT_RELEASED
+        ),
+        "isolation_strategy": "subprocess_per_arm_process_exit",
+        "arms": by_arm,
+    }
+    if canonical is not None:
+        report.update(
+            {
+                "canonical_end_allocated": int(canonical["arm_end"]["allocated"]),
+                "canonical_end_reserved": int(canonical["arm_end"]["reserved"]),
+                "after_gc_allocated": int(canonical["after_gc"]["allocated"]),
+                "after_gc_reserved": int(canonical["after_gc"]["reserved"]),
+                "after_empty_cache_allocated": int(
+                    canonical["after_empty_cache"]["allocated"]
+                ),
+                "after_empty_cache_reserved": int(
+                    canonical["after_empty_cache"]["reserved"]
+                ),
+            }
+        )
+    return report
+
+
+def write_arm_boundary_report(
+    *,
+    output_dir: Path,
+    boundary_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    report = build_arm_boundary_report(boundary_records)
+    _trainer_helpers()["write_m4_json"](report, Path(output_dir) / "arm_boundary_memory.json")
+    return report
+
+
 def run_tiny_arm(
     *,
     helpers: Mapping[str, Any],
@@ -1651,22 +1925,14 @@ def run_tiny_arm(
     }
 
 
-def run_tiny_ab(args: argparse.Namespace) -> dict[str, Any]:
+def _load_and_validate_real_plan(
+    *,
+    args: argparse.Namespace,
+    helpers: Mapping[str, Any],
+) -> tuple[Any, dict[str, Any], dict[str, Any], str]:
     if int(args.log_interval) <= 0:
         raise ValueError("--log_interval must be positive")
-    if not args.execute_real_run:
-        sample_plan = _synthetic_plan_for_dry_run()
-        plan = build_tiny_ab_plan(sample_plan)
-        return {
-            "schema": TINY_AB_SUMMARY_SCHEMA,
-            "status": "DRY_RUN",
-            "dry_run": True,
-            "plan": plan,
-            "decision_thresholds_preregistered": decision_thresholds(),
-        }
-
     _require_real_paths(args)
-    helpers = _trainer_helpers()
     config = helpers["merge_config"](args.config)
     _validate_real_static_contract(args, config)
     if not _path_is_outside_repo(args.output_dir, repo_root=ROOT):
@@ -1681,12 +1947,30 @@ def run_tiny_ab(args: argparse.Namespace) -> dict[str, Any]:
     )
     if runtime_git_sha != expected_runtime_git:
         raise RuntimeError("runtime git SHA mismatch")
-    helpers["prepare_output_dir"](args.output_dir, resume=False)
-
     sample_plan = load_m4_sample_plan(args.sample_plan, manifest_path=args.manifest)
     helpers["validate_sample_plan_contract"](sample_plan)
     plan = build_tiny_ab_plan(sample_plan)
-    helpers["write_m4_json"](plan, args.output_dir / "tiny_ab_plan.json")
+    return config, sample_plan, plan, runtime_git_sha
+
+
+def run_tiny_single_arm_real(args: argparse.Namespace) -> dict[str, Any]:
+    helpers = _trainer_helpers()
+    config, sample_plan, plan, runtime_git_sha = _load_and_validate_real_plan(
+        args=args,
+        helpers=helpers,
+    )
+    arm = next(item for item in arm_specs() if item["name"] == args.run_single_arm)
+    plan_path = Path(args.output_dir) / "tiny_ab_plan.json"
+    if plan_path.is_file():
+        saved_plan = _read_json(plan_path)
+        if str(saved_plan.get("plan_fingerprint_sha256")) != str(
+            plan["plan_fingerprint_sha256"]
+        ):
+            raise RuntimeError("tiny A/B child plan fingerprint mismatch")
+        plan = saved_plan
+    else:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        helpers["write_m4_json"](plan, plan_path)
 
     ConditionalStore = _load_store_class(
         "utils.nf_sf_m5_conditionals",
@@ -1730,29 +2014,93 @@ def run_tiny_ab(args: argparse.Namespace) -> dict[str, Any]:
     )
     device = torch.device(args.device)
     dtype = helpers["dtype_from_arg"](args.dtype)
+    arm_result = run_tiny_arm(
+        helpers=helpers,
+        arm=arm,
+        parent=parent,
+        plan=plan,
+        sample_store=sample_store,
+        conditional_store=conditional_store,
+        config=config,
+        args=args,
+        device=device,
+        dtype=dtype,
+        output_dir=args.output_dir,
+        runtime_git_sha=runtime_git_sha,
+    )
+    json_safe = assert_json_safe_no_tensors(
+        arm_result,
+        name=f"{arm['name']} arm result",
+    )
+    boundary_memory = teardown_tiny_arm_runtime(
+        arm_name=str(arm["name"]),
+        device=device,
+        output_dir=args.output_dir,
+    )
+    return {
+        "schema": f"{TINY_AB_SCHEMA}_single_arm_child_v1",
+        "status": "PASS",
+        "arm": str(arm["name"]),
+        "isolation_strategy": "subprocess_per_arm_process_exit",
+        "arm_result_json_safe": json_safe,
+        "boundary_memory": boundary_memory,
+    }
+
+
+def run_tiny_ab_real_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
+    helpers = _trainer_helpers()
+    _config, sample_plan, plan, _runtime_git_sha = _load_and_validate_real_plan(
+        args=args,
+        helpers=helpers,
+    )
+    helpers["prepare_output_dir"](args.output_dir, resume=False)
+    helpers["write_m4_json"](plan, Path(args.output_dir) / "tiny_ab_plan.json")
+    subprocess_reports = []
+    boundary_records = []
     arm_results = {}
     for arm in arm_specs():
-        arm_results[str(arm["name"])] = run_tiny_arm(
-            helpers=helpers,
-            arm=arm,
-            parent=parent,
-            plan=plan,
-            sample_store=sample_store,
-            conditional_store=conditional_store,
-            config=config,
-            args=args,
-            device=device,
-            dtype=dtype,
+        subprocess_reports.append(run_tiny_arm_subprocess(args=args, arm=arm))
+        boundary_records.append(
+            load_arm_boundary_memory(arm=arm, output_dir=args.output_dir)
+        )
+        write_arm_boundary_report(
             output_dir=args.output_dir,
-            runtime_git_sha=runtime_git_sha,
+            boundary_records=boundary_records,
+        )
+        arm_results[str(arm["name"])] = load_tiny_arm_result_from_artifacts(
+            arm=arm,
+            output_dir=args.output_dir,
         )
     summary = build_summary(
         plan=plan,
         control=arm_results["canonical"],
         treatment=arm_results["paper_fidelity"],
     )
-    helpers["write_m4_json"](summary, args.output_dir / "tiny_ab_summary.json")
+    summary["arm_isolation"] = build_arm_boundary_report(boundary_records)
+    summary["arm_subprocess_reports"] = subprocess_reports
+    validate_summary_schema(summary)
+    helpers["write_m4_json"](summary, Path(args.output_dir) / "tiny_ab_summary.json")
     return summary
+
+
+def run_tiny_ab(args: argparse.Namespace) -> dict[str, Any]:
+    if int(args.log_interval) <= 0:
+        raise ValueError("--log_interval must be positive")
+    if not args.execute_real_run:
+        if args.run_single_arm is not None:
+            raise ValueError("--run_single_arm requires --execute_real_run")
+        sample_plan = _synthetic_plan_for_dry_run()
+        plan = build_tiny_ab_plan(sample_plan)
+        return {
+            "schema": TINY_AB_SUMMARY_SCHEMA,
+            "status": "DRY_RUN",
+            "dry_run": True,
+            "plan": plan,
+            "decision_thresholds_preregistered": decision_thresholds(),
+        }
+    if args.run_single_arm is not None:
+        return run_tiny_single_arm_real(args)
+    return run_tiny_ab_real_orchestrator(args)
 
 
 def _synthetic_plan_for_dry_run() -> dict[str, Any]:

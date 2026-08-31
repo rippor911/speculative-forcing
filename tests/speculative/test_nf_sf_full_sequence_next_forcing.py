@@ -112,6 +112,7 @@ from utils.nf_sf_training import (
     FULL_SEQUENCE_TARGET_GLOBAL_STEP,
     NFSFFullSequenceNoisyBatch,
     NFSFSelectedState,
+    audit_nf_sf_full_sequence_gradients,
     build_full_sequence_mcp_anchor_inputs,
     build_full_sequence_mcp_anchor_specs,
     build_nf_sf_full_sequence_provenance,
@@ -507,6 +508,7 @@ class FakeBackboneForRoute(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.patch_embedding = nn.Conv3d(1, 1, kernel_size=1, bias=False)
+        self.head = nn.Linear(2, 1, bias=False)
         self.backbone_weight = nn.Parameter(torch.tensor(1.0))
         self.num_frame_per_block = 3
         self.gradient_checkpointing = True
@@ -548,6 +550,8 @@ class FakeMCPForRoute(nn.Module):
         future_start_frames,
         timesteps,
         freqs,
+        official_shared_mcp_output_head=False,
+        main_output_head=None,
     ):
         self.calls.append(
             {
@@ -555,6 +559,12 @@ class FakeMCPForRoute(nn.Module):
                 "depth_count": len(future_embeds),
                 "future_start_frames": list(future_start_frames),
                 "timesteps": [t.detach().clone() for t in timesteps],
+                "official_shared_mcp_output_head": bool(
+                    official_shared_mcp_output_head
+                ),
+                "main_output_head_id": None
+                if main_output_head is None
+                else id(main_output_head),
             }
         )
         preds = []
@@ -614,6 +624,11 @@ def test_wrapper_full_route_runs_main_backbone_once_and_anchor_mcp_micro_loop() 
         (28080, 32760),
     )
     assert len(wrapper.mcp.calls) == 6
+    assert all(
+        call["official_shared_mcp_output_head"] is False
+        and call["main_output_head_id"] is None
+        for call in wrapper.mcp.calls
+    )
     assert [call["depth_count"] for call in wrapper.mcp.calls] == [3, 3, 3, 3, 2, 1]
     assert [call["future_start_frames"] for call in wrapper.mcp.calls] == [
         [3, 6, 9],
@@ -627,6 +642,55 @@ def test_wrapper_full_route_runs_main_backbone_once_and_anchor_mcp_micro_loop() 
         shape == (1, 4680, 2)
         for call in wrapper.mcp.calls
         for shape in call["feature_shapes"]
+    )
+
+
+def test_wrapper_shared_mcp_head_routes_model_head_and_keeps_main_forward() -> None:
+    clean = torch.ones((1, 21, 1, 1, 1))
+    batch = prepare_nf_sf_full_sequence_noisy_batch(
+        clean,
+        scheduler_main=_scheduler(DEFAULT_S_MAIN),
+        scheduler_mcp=_scheduler(DEFAULT_S_MCP),
+        rng=make_cpu_generator(7),
+    )
+    anchors = build_full_sequence_mcp_anchor_inputs(batch)
+    control = FakeFullRouteWrapper()
+    treatment = FakeFullRouteWrapper()
+
+    control_outputs = control.forward_full_sequence_next_forcing(
+        noisy_image_or_video=batch.noisy_main,
+        clean_x=batch.clean_target,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        timestep_main=batch.timestep_main,
+        mcp_anchor_inputs=anchors,
+        official_shared_mcp_output_head=False,
+    )
+    treatment_outputs = treatment.forward_full_sequence_next_forcing(
+        noisy_image_or_video=batch.noisy_main,
+        clean_x=batch.clean_target,
+        conditional_dict={"prompt_embeds": torch.zeros((1, 1, 1))},
+        timestep_main=batch.timestep_main,
+        mcp_anchor_inputs=anchors,
+        official_shared_mcp_output_head=True,
+    )
+
+    torch.testing.assert_close(
+        treatment_outputs.main_flow_pred,
+        control_outputs.main_flow_pred,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert treatment_outputs.official_shared_mcp_output_head is True
+    assert treatment_outputs.mcp_path_kind == "official_shared_output_head"
+    assert all(
+        call["official_shared_mcp_output_head"] is True
+        and call["main_output_head_id"] == id(treatment.model.head)
+        for call in treatment.mcp.calls
+    )
+    assert all(
+        call["official_shared_mcp_output_head"] is False
+        and call["main_output_head_id"] is None
+        for call in control.mcp.calls
     )
 
 
@@ -679,11 +743,31 @@ class FakeMCPForOptimizer(nn.Module):
         )
 
 
-class FakeGeneratorForOptimizer(nn.Module):
+class FakeMCPDepthWithDormantHead(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.proj = nn.Linear(1, 1, bias=False)
+        self.block = nn.Linear(1, 1, bias=False)
+        self.head = nn.Linear(1, 1, bias=False)
+
+
+class FakeMCPWithDormantHeads(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fusion = nn.Linear(1, 1, bias=False)
+        self.mcp_modules = nn.ModuleList(
+            [FakeMCPDepthWithDormantHead() for _ in range(3)]
+        )
+
+
+class FakeGeneratorForOptimizer(nn.Module):
+    def __init__(self, *, dormant_heads: bool = False) -> None:
+        super().__init__()
         self.model = FakeBackboneForOptimizer()
-        self.mcp = FakeMCPForOptimizer()
+        self.mcp = (
+            FakeMCPWithDormantHeads() if dormant_heads else FakeMCPForOptimizer()
+        )
+        self.official_shared_mcp_output_head = False
 
 
 def test_shared_patch_embedding_reused_and_optimizer_control_contract() -> None:
@@ -734,11 +818,55 @@ def test_shared_patch_embedding_reused_and_optimizer_control_contract() -> None:
     )
 
 
+def test_shared_mcp_head_gradient_audit_allows_only_dormant_head_missing_grads() -> None:
+    generator = FakeGeneratorForOptimizer(dormant_heads=True)
+    configure_nf_sf_full_sequence_optimizer_plan(
+        generator,
+        objective_mode="next_forcing_full",
+        group_lrs={
+            "backbone": 1.0,
+            "patch_embedding": 2.0,
+            "mcp": 3.0,
+            "mcp_fusion": 3.0,
+        },
+    )
+    for name, param in generator.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("mcp.mcp_modules.") and ".head." in name:
+            param.grad = None
+        else:
+            param.grad = torch.ones_like(param)
+
+    generator.official_shared_mcp_output_head = False
+    control = audit_nf_sf_full_sequence_gradients(
+        generator,
+        objective_mode="next_forcing_full",
+    )
+    assert control["mcp_depth1"]["missing_grad_tensors"] == 1
+    assert control["mcp_depth1"]["pass"] is False
+
+    generator.official_shared_mcp_output_head = True
+    treatment = audit_nf_sf_full_sequence_gradients(
+        generator,
+        objective_mode="next_forcing_full",
+    )
+    assert treatment["mcp_depth1"]["missing_grad_tensors"] == 0
+    assert treatment["mcp_depth1"]["allowed_missing_grad_tensors"] == 1
+    assert treatment["mcp_depth1"]["aggregate_grad_norm"] > 0.0
+    assert treatment["mcp_depth1"]["pass"] is True
+
+
 def test_old_wrapper_forward_signature_and_fixed_window_api_remain_available() -> None:
     signature = inspect.signature(WanDiffusionWrapper.forward)
     assert "clean_x" in signature.parameters
     assert "mcp_future_noises" in signature.parameters
     assert "mcp_timesteps" in signature.parameters
+    assert "official_shared_mcp_output_head" in signature.parameters
+    full_signature = inspect.signature(
+        WanDiffusionWrapper.forward_full_sequence_next_forcing
+    )
+    assert "official_shared_mcp_output_head" in full_signature.parameters
 
     current = torch.zeros((1, 3, 1, 1, 1))
     state = NFSFSelectedState(
@@ -904,8 +1032,34 @@ def test_resolved_config_has_full_schema_and_no_formal_stage_metadata() -> None:
     assert resolved["adam_eps"] == pytest.approx(1.0e-8)
     assert resolved["device"] == "cuda:0"
     assert resolved["dtype"] == "bf16"
+    assert resolved["official_shared_mcp_output_head"] is False
     assert resolved["production_target_global_step"] == 5000
     assert "m5_formal" not in jsonish_keys(resolved)
+
+
+def test_shared_mcp_output_head_flag_records_in_resolved_config() -> None:
+    config = types.SimpleNamespace(num_frame_per_block=3, gradient_checkpointing=True)
+    args = _checkpoint_args(trainer.ROOT, objective_mode="next_forcing_full")
+    args.official_shared_mcp_output_head = True
+
+    resolved = trainer.full_sequence_resolved_config(
+        config,
+        args,
+        preflight_report=_preflight_report(),
+    )
+
+    assert resolved["official_shared_mcp_output_head"] is True
+
+
+def test_common_parameter_fingerprint_excludes_dormant_mcp_heads() -> None:
+    generator = FakeGeneratorForOptimizer(dormant_heads=True)
+    fingerprint = trainer.mcp_output_routing_common_parameter_fingerprint(generator)
+
+    assert fingerprint["schema"] == "nf_sf_mcp_output_routing_common_parameters_v1"
+    assert fingerprint["fingerprint_kind"] == "name_shape_dtype_requires_grad"
+    assert fingerprint["common_parameter_count"] > 0
+    assert fingerprint["excluded_dormant_independent_mcp_head_parameter_count"] == 3
+    assert len(fingerprint["sha256"]) == 64
 
 
 def test_sample_plan_contract_requires_2048_train_and_256_validation() -> None:

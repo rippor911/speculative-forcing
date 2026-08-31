@@ -105,6 +105,14 @@ def _parameter_count(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters())
 
 
+def _grad_l1(parameters) -> float:
+    total = 0.0
+    for parameter in parameters:
+        if parameter.grad is not None:
+            total += float(parameter.grad.detach().abs().sum().item())
+    return total
+
+
 def _tiny_case_tensors(mcp, *, num_layers: int = 1, seed: int = 11):
     torch.manual_seed(seed)
     module = mcp.MCPModule(
@@ -814,6 +822,108 @@ def test_paper_fidelity_anchor0_parity_and_no_new_trainable_parameters() -> None
         )[0]
 
         torch.testing.assert_close(treatment, control, rtol=0.0, atol=0.0)
+        assert _parameter_key_tuple(stack) == before_keys
+        assert _parameter_count(stack) == before_count
+
+
+def test_official_shared_mcp_output_head_false_keeps_independent_head_route() -> None:
+    with _load_mcp_with_stubs() as mcp:
+        torch.manual_seed(15)
+        stack = mcp.MCPStack(
+            dim=4,
+            ffn_dim=8,
+            num_heads=2,
+            out_dim=1,
+            patch_size=(1, 1, 1),
+            freq_dim=4,
+            num_modules=1,
+            num_layers=1,
+            tap_layers=(0, 1),
+            qk_norm=False,
+        )
+        shared_head = mcp.CausalHead(4, 1, (1, 1, 1), 1.0e-6)
+        before_keys = _parameter_key_tuple(stack)
+        before_count = _parameter_count(stack)
+        features = (torch.randn(1, 2, 4), torch.randn(1, 2, 4))
+        future = [torch.randn(1, 2, 4)]
+        grid = [torch.tensor([[1, 1, 2]], dtype=torch.long)]
+        timestep = [torch.full((1, 1), 1000.0)]
+        kwargs = {
+            "features": features,
+            "future_embeds": future,
+            "future_grid_sizes": grid,
+            "future_start_frames": [3],
+            "timesteps": timestep,
+            "freqs": torch.ones(8, 2),
+        }
+
+        default = stack(**kwargs)[0]
+        explicit_false = stack(
+            **kwargs,
+            official_shared_mcp_output_head=False,
+            main_output_head=shared_head,
+        )[0]
+        torch.testing.assert_close(explicit_false, default, rtol=0.0, atol=0.0)
+
+        stack.zero_grad(set_to_none=True)
+        shared_head.zero_grad(set_to_none=True)
+        control = stack(
+            **kwargs,
+            official_shared_mcp_output_head=False,
+            main_output_head=shared_head,
+        )[0]
+        control.sum().backward()
+        assert stack.mcp_modules[0].head.head.weight.grad is not None
+        assert stack.mcp_modules[0].head.head.weight.grad.abs().sum().item() > 0.0
+        assert shared_head.head.weight.grad is None
+        assert _parameter_key_tuple(stack) == before_keys
+        assert _parameter_count(stack) == before_count
+
+
+def test_official_shared_mcp_output_head_gradients_and_dormant_head() -> None:
+    with _load_mcp_with_stubs() as mcp:
+        torch.manual_seed(16)
+        stack = mcp.MCPStack(
+            dim=4,
+            ffn_dim=8,
+            num_heads=2,
+            out_dim=1,
+            patch_size=(1, 1, 1),
+            freq_dim=4,
+            num_modules=1,
+            num_layers=1,
+            tap_layers=(0, 1),
+            qk_norm=False,
+        )
+        shared_head = mcp.CausalHead(4, 1, (1, 1, 1), 1.0e-6)
+        before_keys = _parameter_key_tuple(stack)
+        before_count = _parameter_count(stack)
+        shared_head_weight_id = id(shared_head.head.weight)
+        features = (
+            torch.randn(1, 2, 4, requires_grad=True),
+            torch.randn(1, 2, 4, requires_grad=True),
+        )
+        future = [torch.randn(1, 2, 4, requires_grad=True)]
+
+        pred = stack(
+            features=features,
+            future_embeds=future,
+            future_grid_sizes=[torch.tensor([[1, 1, 2]], dtype=torch.long)],
+            future_start_frames=[3],
+            timesteps=[torch.full((1, 1), 1000.0)],
+            freqs=torch.ones(8, 2),
+            official_shared_mcp_output_head=True,
+            main_output_head=shared_head,
+        )[0]
+        pred.square().mean().backward()
+
+        assert id(shared_head.head.weight) == shared_head_weight_id
+        assert shared_head.head.weight.grad is not None
+        assert shared_head.head.weight.grad.abs().sum().item() > 0.0
+        assert _grad_l1(stack.mcp_modules[0].blocks[0].parameters()) > 0.0
+        assert stack.fusion[0].weight.grad.abs().sum().item() > 0.0
+        assert stack.mcp_modules[0].proj.weight.grad.abs().sum().item() > 0.0
+        assert _grad_l1(stack.mcp_modules[0].head.parameters()) == 0.0
         assert _parameter_key_tuple(stack) == before_keys
         assert _parameter_count(stack) == before_count
 

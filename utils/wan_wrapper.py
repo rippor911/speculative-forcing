@@ -33,6 +33,7 @@ class FullSequenceNFSFModelOutputs:
     main_backbone_forward_count: int = 1
     paper_exact_reproduction: bool = False
     paper_fidelity_mcp1_mask: bool = False
+    official_shared_mcp_output_head: bool = False
     mcp_path_kind: str = "canonical_target_only"
 
 
@@ -184,6 +185,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.mcp = None
         self.mcp_tap_layers = None
         self.mcp_initialized_from_backbone = False
+        self.official_shared_mcp_output_head = False
 
         self.post_init()
 
@@ -195,6 +197,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         num_modules: int = 1,
         num_layers: int = 3,
         tap_layers=(3, 11, 19, 29),
+        official_shared_mcp_output_head: bool = False,
     ) -> None:
         """Attach Next-Forcing style Multi-Chunk Prediction heads to this generator.
 
@@ -226,6 +229,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # as it goes), so the fusion always sees features sorted by depth. Sort here too,
         # otherwise an unsorted tuple would silently permute the fusion's concat.
         tap_layers = tuple(sorted(set(tap_layers)))
+        self.official_shared_mcp_output_head = bool(official_shared_mcp_output_head)
 
         m = self.model
         self.mcp = MCPStack(
@@ -332,6 +336,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         aug_t: Optional[torch.Tensor] = None,
         direct_clean_context_kv: bool = False,
         paper_fidelity_mcp1_mask: bool = False,
+        official_shared_mcp_output_head: Optional[bool] = None,
     ) -> FullSequenceNFSFModelOutputs:
         """Training-only full-sequence Next-Forcing route.
 
@@ -355,6 +360,9 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         anchors = tuple(mcp_anchor_inputs or ())
         run_mcp = bool(anchors)
+        use_shared_mcp_head = self._use_official_shared_mcp_output_head(
+            official_shared_mcp_output_head
+        )
         if direct_clean_context_kv and not run_mcp:
             raise ValueError("direct_clean_context_kv requires MCP anchor inputs")
         if paper_fidelity_mcp1_mask and not run_mcp:
@@ -413,6 +421,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flat_mcp_entries=flat_mcp_entries,
                     direct_clean_context_kv=direct_clean_context_kv,
                     paper_fidelity_mcp1_mask=paper_fidelity_mcp1_mask,
+                    official_shared_mcp_output_head=use_shared_mcp_head,
                 )
             )
         else:
@@ -428,13 +437,18 @@ class WanDiffusionWrapper(torch.nn.Module):
             anchor_token_slices=anchor_slices,
             paper_exact_reproduction=False,
             paper_fidelity_mcp1_mask=bool(paper_fidelity_mcp1_mask),
+            official_shared_mcp_output_head=use_shared_mcp_head,
             mcp_path_kind=(
                 "paper_fidelity_clean_residual_mask"
                 if paper_fidelity_mcp1_mask
                 else (
                     "direct_clean_static_kv"
                     if direct_clean_context_kv
-                    else "canonical_target_only"
+                    else (
+                        "official_shared_output_head"
+                        if use_shared_mcp_head
+                        else "canonical_target_only"
+                    )
                 )
             ),
         )
@@ -480,6 +494,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         flat_mcp_entries,
         direct_clean_context_kv: bool = False,
         paper_fidelity_mcp1_mask: bool = False,
+        official_shared_mcp_output_head: bool = False,
     ):
         features = tuple(aux["features"])
         if len(features) != len(self.mcp_tap_layers):
@@ -555,6 +570,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 future_start_frames=list(starts),
                 timesteps=list(timesteps),
                 freqs=self.model.freqs,
+                official_shared_mcp_output_head=bool(official_shared_mcp_output_head),
+                main_output_head=(
+                    self.model.head if official_shared_mcp_output_head else None
+                ),
                 **mcp_kwargs,
             )
             if len(flow_preds) != len(depths):
@@ -634,7 +653,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None,
         mcp_future_noises: Optional[List[Optional[torch.Tensor]]] = None,
         mcp_future_start_frames: Optional[List[int]] = None,
-        mcp_timesteps: Optional[List[torch.Tensor]] = None
+        mcp_timesteps: Optional[List[torch.Tensor]] = None,
+        official_shared_mcp_output_head: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         MCP (opt-in): pass `mcp_future_noises` (a list of [B, F, C, H, W] noisy target
@@ -655,6 +675,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         prompt_embeds = conditional_dict["prompt_embeds"]
 
         run_mcp = mcp_future_noises is not None
+        use_shared_mcp_head = self._use_official_shared_mcp_output_head(
+            official_shared_mcp_output_head
+        )
         if run_mcp:
             if self.mcp is None:
                 raise ValueError("mcp_future_noises given but add_mcp_modules() was never called.")
@@ -709,7 +732,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                     aux=aux,
                     mcp_future_noises=mcp_future_noises,
                     mcp_future_start_frames=mcp_future_start_frames,
-                    mcp_timesteps=mcp_timesteps
+                    mcp_timesteps=mcp_timesteps,
+                    official_shared_mcp_output_head=use_shared_mcp_head,
                 )
             else:
                 flow_pred = out.permute(0, 2, 1, 3, 4)
@@ -731,7 +755,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                         aux=aux,
                         mcp_future_noises=mcp_future_noises,
                         mcp_future_start_frames=mcp_future_start_frames,
-                        mcp_timesteps=mcp_timesteps
+                        mcp_timesteps=mcp_timesteps,
+                        official_shared_mcp_output_head=use_shared_mcp_head,
                     )
                 else:
                     flow_pred = out.permute(0, 2, 1, 3, 4)
@@ -764,7 +789,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                             aux=aux,
                             mcp_future_noises=mcp_future_noises,
                             mcp_future_start_frames=mcp_future_start_frames,
-                            mcp_timesteps=mcp_timesteps
+                            mcp_timesteps=mcp_timesteps,
+                            official_shared_mcp_output_head=use_shared_mcp_head,
                         )
                     else:
                         flow_pred = out.permute(0, 2, 1, 3, 4)
@@ -783,7 +809,20 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         return flow_pred, pred_x0
 
-    def _run_mcp(self, aux, mcp_future_noises, mcp_future_start_frames, mcp_timesteps=None):
+    def _use_official_shared_mcp_output_head(self, override: Optional[bool]) -> bool:
+        if override is None:
+            return bool(getattr(self, "official_shared_mcp_output_head", False))
+        return bool(override)
+
+    def _run_mcp(
+        self,
+        aux,
+        mcp_future_noises,
+        mcp_future_start_frames,
+        mcp_timesteps=None,
+        *,
+        official_shared_mcp_output_head: bool = False,
+    ):
         """Run the MCP chain on the backbone's tapped features.
 
         Must be called from inside `forward` so it executes within the FSDP root's
@@ -831,6 +870,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             future_start_frames=starts,
             timesteps=timesteps,
             freqs=self.model.freqs,
+            official_shared_mcp_output_head=bool(official_shared_mcp_output_head),
+            main_output_head=(
+                self.model.head if official_shared_mcp_output_head else None
+            ),
         )
         # [B, C, F, H, W] -> [B, F, C, H, W]
         return [p.permute(0, 2, 1, 3, 4) for p in flow_preds]

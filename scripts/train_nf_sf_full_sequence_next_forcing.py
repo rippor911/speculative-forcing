@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -138,6 +139,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory_log_interval", type=int, default=100)
     parser.add_argument("--dtype", choices=("bf16", "float32"), default="bf16")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--official_shared_mcp_output_head", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -410,6 +412,7 @@ def build_fresh_generator(
     checkpoint_path: Path,
     device: torch.device,
     dtype: torch.dtype,
+    official_shared_mcp_output_head: bool = False,
 ) -> WanDiffusionWrapper:
     model_kwargs = dict(getattr(config, "model_kwargs", {}) or {})
     reset_before = bool(model_kwargs.pop("reset_before_init", False))
@@ -435,6 +438,7 @@ def build_fresh_generator(
         num_modules=MCP_NUM_MODULES,
         num_layers=MCP_NUM_LAYERS,
         tap_layers=TAP_LAYERS,
+        official_shared_mcp_output_head=bool(official_shared_mcp_output_head),
     )
     if not bool(getattr(generator, "mcp_initialized_from_backbone", False)):
         raise RuntimeError("MCP init_from_backbone flag was not set")
@@ -494,6 +498,44 @@ def optimizer_plan_summary(plan) -> dict[str, Any]:
     }
 
 
+def is_dormant_mcp_output_head_parameter_name(name: str) -> bool:
+    return name.startswith("mcp.mcp_modules.") and ".head." in name
+
+
+def mcp_output_routing_common_parameter_fingerprint(
+    generator: WanDiffusionWrapper,
+) -> dict[str, Any]:
+    common = []
+    excluded = []
+    for name, param in generator.named_parameters():
+        record = {
+            "name": str(name),
+            "shape": [int(dim) for dim in param.shape],
+            "dtype": str(param.dtype),
+            "requires_grad": bool(param.requires_grad),
+        }
+        if is_dormant_mcp_output_head_parameter_name(str(name)):
+            excluded.append(record)
+        else:
+            common.append(record)
+    payload = {
+        "schema": "nf_sf_mcp_output_routing_common_parameters_v1",
+        "fingerprint_kind": "name_shape_dtype_requires_grad",
+        "common_parameters": common,
+        "excluded_dormant_independent_mcp_heads": excluded,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema": payload["schema"],
+        "fingerprint_kind": payload["fingerprint_kind"],
+        "sha256": digest,
+        "common_parameter_count": len(common),
+        "excluded_dormant_independent_mcp_head_parameter_count": len(excluded),
+    }
+
+
 def full_sequence_resolved_config(
     config: Any,
     args: argparse.Namespace,
@@ -541,6 +583,9 @@ def full_sequence_resolved_config(
         "main_shift": DEFAULT_S_MAIN,
         "mcp_shift": DEFAULT_S_MCP,
         "depth_weights": list(FULL_SEQUENCE_DEPTH_WEIGHTS),
+        "official_shared_mcp_output_head": bool(
+            getattr(args, "official_shared_mcp_output_head", False)
+        ),
         "tap_layers": list(TAP_LAYERS),
         "mcp_blocks_per_depth": MCP_NUM_LAYERS,
         "rng_draw_order_version": FULL_SEQUENCE_RNG_DRAW_ORDER_VERSION,
@@ -1807,6 +1852,9 @@ def build_step0_metadata(
     provenance["objective"]["first_step_fusion_zero_grad_expected"] = (
         args.objective_mode == "next_forcing_full"
     )
+    provenance["objective"]["official_shared_mcp_output_head"] = bool(
+        getattr(args, "official_shared_mcp_output_head", False)
+    )
     return {
         "resolved_config": full_sequence_resolved_config(
             config,
@@ -1876,6 +1924,9 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint_path=args.checkpoint,
         device=device,
         dtype=dtype,
+        official_shared_mcp_output_head=bool(
+            getattr(args, "official_shared_mcp_output_head", False)
+        ),
     )
     require_nf_sf_full_sequence_runtime(
         config=config,
@@ -1900,6 +1951,9 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         preflight_report=preflight_report,
     )
     metadata["optimizer"] = optimizer_summary
+    metadata["mcp_output_routing_common_parameter_fingerprint"] = (
+        mcp_output_routing_common_parameter_fingerprint(generator)
+    )
 
     scheduler_main = make_flow_scheduler(DEFAULT_S_MAIN)
     scheduler_mcp = make_flow_scheduler(DEFAULT_S_MCP)

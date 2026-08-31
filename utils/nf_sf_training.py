@@ -938,10 +938,37 @@ def audit_nf_sf_full_sequence_gradients(
     if objective_mode == "next_forcing_full":
         expected.update({"mcp_fusion", "mcp_depth1", "mcp_depth2", "mcp_depth3"})
     groups = collect_nf_sf_parameter_groups(generator)
+    use_shared_mcp_head = bool(
+        getattr(generator, "official_shared_mcp_output_head", False)
+    )
     report: dict[str, dict[str, int | float | bool]] = {}
     for name, named_params in groups.items():
-        trainable_params = [param for _, param in named_params if param.requires_grad]
-        missing = [param for param in trainable_params if param.grad is None]
+        trainable_named_params = [
+            (param_name, param)
+            for param_name, param in named_params
+            if param.requires_grad
+        ]
+        trainable_params = [param for _, param in trainable_named_params]
+        allowed_missing = [
+            param
+            for param_name, param in trainable_named_params
+            if (
+                use_shared_mcp_head
+                and name.startswith("mcp_depth")
+                and ".head." in param_name
+                and param.grad is None
+            )
+        ]
+        missing = [
+            param
+            for param_name, param in trainable_named_params
+            if param.grad is None
+            and not (
+                use_shared_mcp_head
+                and name.startswith("mcp_depth")
+                and ".head." in param_name
+            )
+        ]
         finite = True
         norm_sq = 0.0
         grad_tensors = 0
@@ -958,6 +985,7 @@ def audit_nf_sf_full_sequence_gradients(
             "trainable_tensors": len(trainable_params),
             "grad_tensors": grad_tensors,
             "missing_grad_tensors": len(missing),
+            "allowed_missing_grad_tensors": len(allowed_missing),
             "all_finite": finite,
             "aggregate_grad_norm": norm,
             "pass": (

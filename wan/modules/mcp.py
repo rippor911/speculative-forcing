@@ -447,6 +447,8 @@ class MCPModule(nn.Module):
         clean_prefix_grid_sizes=None,
         clean_prefix_start_frame=0,
         clean_prefix_timestep=None,
+        official_shared_mcp_output_head=False,
+        main_output_head=None,
     ):
         """
         Args:
@@ -553,7 +555,15 @@ class MCPModule(nn.Module):
             )
         hidden = x[:, -target_token_count:, :] if use_paper_fidelity else x
 
-        out = self.head(hidden, e.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2))
+        head_e = e.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
+        if official_shared_mcp_output_head:
+            if main_output_head is None:
+                raise ValueError(
+                    "main_output_head is required for official shared MCP output head"
+                )
+            out = main_output_head(hidden, head_e)
+        else:
+            out = self.head(hidden, head_e)
         flow_pred = mcp_unpatchify(out, grid_sizes, self.patch_size, self.out_dim)
         return flow_pred, hidden
 
@@ -682,6 +692,8 @@ class MCPStack(nn.Module):
         paper_fidelity_clean_prefix_grid_sizes=None,
         paper_fidelity_clean_prefix_start_frame=0,
         paper_fidelity_clean_prefix_timestep=None,
+        official_shared_mcp_output_head=False,
+        main_output_head=None,
     ):
         """
         Args:
@@ -751,6 +763,8 @@ class MCPStack(nn.Module):
                 clean_prefix_grid_sizes=paper_fidelity_clean_prefix_grid_sizes if k == 0 else None,
                 clean_prefix_start_frame=paper_fidelity_clean_prefix_start_frame,
                 clean_prefix_timestep=paper_fidelity_clean_prefix_timestep if k == 0 else None,
+                official_shared_mcp_output_head=bool(official_shared_mcp_output_head),
+                main_output_head=main_output_head,
             )
             flow_preds.append(flow_pred)
         return flow_preds
